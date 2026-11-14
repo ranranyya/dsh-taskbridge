@@ -12,16 +12,72 @@ const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/gi;
 const KEYLIKE_PATTERN = /\b(sk|pk|ak)-[A-Za-z0-9_-]{16,}\b/g;
 const ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_]*(?:API_?KEY|SECRET|TOKEN|PASSWORD)[A-Za-z0-9_]*)\s*=\s*("[^"]*"|'[^']*'|\S+)/gi;
 /**
- * A profile key embedded in a *directory* name, the shape this repository's own
- * workspace has (`…/Local/Temp/dsh-SoexNz/…`, which held the local user id). It is
- * masked because it identifies an account; only a path-shaped key is matched, so
- * an ordinary hyphenated word in prose is untouched.
+ * A per-user profile directory under the OPERATING SYSTEM'S temporary root.
+ *
+ * The observed shape is `%TEMP%\dsh-VG1MVl\dsh-delegate-test-…` (and on some hosts
+ * `~/.cache/dsh-SoexNz/…`): the platform points `TEMP` at a per-profile directory
+ * whose six-character suffix is the account key. That suffix is exactly what is
+ * masked, and the marker is `dsh-`/`profile-` plus six characters plus digits —
+ * nothing more.
+ *
+ * Two earlier versions were wrong in opposite directions, so the rule is stated
+ * around what is PROVABLE instead of around what looks unusual:
+ *
+ *  * the first masked every `dsh-`/`profile-` segment with six alphanumerics, so an
+ *    ordinary repository or package name — this product's own `dsh-delegate` and its
+ *    installed `dsh-taskbridge` — was rewritten in every published path;
+ *  * the second tried to tell a profile key from a word by case and digit shape. That
+ *    is a guess: a repository may be `v2-tools`, a package `dsh-Bridge2`. A masked
+ *    path proves nothing, so a guess that fires wrongly disables continuation.
+ *
+ * A profile key is only recognised where it actually lives: directly under a
+ * temporary root ({@link TEMPORARY_ROOT}), or anywhere in such a path. An ordinary
+ * segment elsewhere, whatever its case or digits, keeps its readable path.
  *
  * The preceding separator is captured and re-emitted so a Windows path keeps its
- * backslash. A single combined character class would normalise `\` to `/` and
- * change a path an operator is trying to recognise.
+ * backslash; a combined character class would normalise `\` to `/`.
  */
-const PATH_KEY_PATTERN = /([\\/])(?:dsh|profile)-[A-Za-z0-9]{6,}(?=[\\/]|$)/g;
+const PROFILE_SEGMENT = String.raw`(?:dsh|profile)-[A-Za-z0-9]{6}(?![A-Za-z0-9])`;
+
+/**
+ * The directory names the platform's temporary root is reached through.
+ *
+ * `temp` is the Windows/POSIX temporary root; `tmp` and `.cache` cover the POSIX and
+ * per-user-cache spellings. They are matched as complete, case-insensitive segment
+ * names, so they anchor WHERE a profile key may appear rather than being redacted.
+ */
+const TEMPORARY_ROOT = String.raw`(?:temp|tmp|\.cache)`;
+
+/**
+ * Mask a profile key only where it is provably one: as a segment directly under a
+ * temporary root. Both the separator and the temp-root segment are kept; only the key
+ * is replaced, so `…\Temp\dsh-VG1MVl\work` becomes `…\Temp\<mask>\work` and the
+ * platform's own separator survives (`/home/u/.cache/<mask>/x`).
+ *
+ * Two anchored forms, because a stored path may start at the root or continue through
+ * it:
+ *
+ *  1. `…<sep><temp><sep><key>…` — separators are captured and re-emitted verbatim;
+ *  2. `^<temp><sep><key>…` — the path begins with the root, e.g. `temp\dsh-abc123\x`.
+ */
+const PATH_KEY_PATTERN = new RegExp(
+  [
+    String.raw`([\\/])`,
+    `(${TEMPORARY_ROOT})`,
+    String.raw`([\\/])`,
+    // The placeholder itself is never rewritten again, so redaction is idempotent.
+    String.raw`(?!(?:dsh|profile)-mask)`,
+    PROFILE_SEGMENT,
+    String.raw`(?=[\\/]|$)`,
+  ].join(''),
+  'gi',
+);
+
+/** The same rule for a path that STARTS with the temporary root (`temp\dsh-abc123\x`). */
+const LEADING_TEMP_KEY_PATTERN = new RegExp(
+  [`^(${TEMPORARY_ROOT})`, String.raw`([\\/])`, PROFILE_SEGMENT, String.raw`(?=[\\/]|$)`].join(''),
+  'i',
+);
 
 /** What {@link PATH_KEY_PATTERN} replaces the identifying segment with. */
 const PATH_KEY_SEGMENT = 'masks-user-profile-segment';
@@ -100,10 +156,15 @@ export function redactText(text) {
     .replace(BEARER_PATTERN, `Bearer ${MASK}`)
     .replace(KEYLIKE_PATTERN, MASK)
     .replace(ASSIGNMENT_PATTERN, (_match, name) => `${name}=${MASK}`)
-    // Last, and path-anchored: a workspace path reported by a preflight is shown
-    // so an operator can recognise the repository, but the per-profile segment of
-    // the platform temp path is not theirs to see.
-    .replace(PATH_KEY_PATTERN, (_match, separator) => `${separator}${PATH_KEY_SEGMENT}`);
+    // Last, and path-anchored: an ordinary workspace path is shown so an operator can
+    // recognise the repository; only a profile key under a temporary root is masked.
+    // The leading-root form runs first. Each pass re-emits every separator and the
+    // temp-root segment it matched, so a POSIX `.cache` path keeps its `/`.
+    .replace(LEADING_TEMP_KEY_PATTERN, (_match, root, separator) => `${root}${separator}${PATH_KEY_SEGMENT}`)
+    .replace(
+      PATH_KEY_PATTERN,
+      (_match, before, root, separator) => `${before}${root}${separator}${PATH_KEY_SEGMENT}`,
+    );
 }
 
 /**

@@ -21,6 +21,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, realpath } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -52,6 +53,9 @@ import {
 } from './helpers/fakes.js';
 
 const TOKEN = 'connection-token-value-never-echoed-abc123';
+
+/** The manifest this build ships with; the reported version comes from it. */
+const MANIFEST = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
 /**
  * Build a server over a recording `callExecution`.
@@ -89,8 +93,12 @@ function fixture(options = {}) {
  */
 const EXPECTED_TOOLS = [
   'delegate_cancel',
+  'delegate_metrics',
   'delegate_permission_decide',
   'delegate_preflight',
+  // Answers an ordinary question a worker asked. It is not an approval and grants
+  // nothing (see the dedicated assertions below).
+  'delegate_question_answer',
   'delegate_result',
   'delegate_review',
   'delegate_status',
@@ -102,9 +110,9 @@ const EXPECTED_TOOLS = [
 // 1. The exposed surface cannot authorize, configure or touch credentials
 // ---------------------------------------------------------------------------
 
-test('the MCP surface exposes exactly eight bounded tools and no control-plane tool', () => {
+test('the MCP surface exposes exactly ten bounded tools and no control-plane tool', () => {
   assert.deepEqual(TOOLS.map((tool) => tool.name).sort(), EXPECTED_TOOLS);
-  assert.equal(TOOLS.length, 8);
+  assert.equal(TOOLS.length, 10);
   // Named explicitly so the reason is in the failure message, not only in a diff.
   for (const forbidden of ['connection', 'grant', 'settings', 'credential', 'secret', 'authorize']) {
     for (const tool of TOOLS) {
@@ -113,13 +121,43 @@ test('the MCP surface exposes exactly eight bounded tools and no control-plane t
   }
   // The one tool whose job is to answer a question must be readable as exactly
   // that: it decides a PENDING PER-CALL request, and its schema accepts nothing
-  // that could widen anything (no mode, no policy, no isolation, no grant).
+  // that could widen anything (no mode, no policy, no isolation, no grant). The one
+  // addition is the optional `waitAfterDecision` control flag: it tells THIS server to
+  // keep following the task, is stripped before the plane, and cannot widen an allow.
   const decide = TOOLS.find((tool) => tool.name === 'delegate_permission_decide');
   assert.ok(decide !== undefined);
-  assert.deepEqual(Object.keys(decide.inputSchema.properties).sort(), ['decision', 'fingerprint', 'reason', 'requestId', 'taskId']);
+  assert.deepEqual(
+    Object.keys(decide.inputSchema.properties).sort(),
+    ['decision', 'fingerprint', 'reason', 'requestId', 'taskId', 'waitAfterDecision'],
+  );
+  assert.equal(decide.inputSchema.properties.waitAfterDecision.type, 'boolean');
   assert.deepEqual(decide.inputSchema.properties.decision.enum, ['allow-once', 'reject']);
   assert.deepEqual(decide.inputSchema.required, ['taskId', 'requestId', 'decision']);
   assert.equal(decide.inputSchema.additionalProperties, false);
+  // The QUESTION answer's schema is equally closed, and it deliberately has no field
+  // that could grant anything: no decision verb, no sandbox mode, no grant, no policy.
+  const answer = TOOLS.find((tool) => tool.name === 'delegate_question_answer');
+  assert.ok(answer !== undefined);
+  assert.deepEqual(
+    Object.keys(answer.inputSchema.properties).sort(),
+    ['answers', 'requestId', 'taskId', 'waitAfterAnswer'],
+  );
+  assert.equal(answer.inputSchema.properties.waitAfterAnswer.type, 'boolean');
+  assert.deepEqual(answer.inputSchema.required, ['taskId', 'requestId', 'answers']);
+  assert.equal(answer.inputSchema.additionalProperties, false);
+  // A question answer item may only name a question, its labels and its free text.
+  assert.deepEqual(
+    Object.keys(answer.inputSchema.properties.answers.items.properties).sort(),
+    ['custom', 'id', 'selected'],
+  );
+  assert.equal(answer.inputSchema.properties.answers.items.additionalProperties, false);
+  // The census tool reads this process and nothing else: no argument can name a task,
+  // a connection or a route, and it hands out no control-plane write.
+  const metrics = TOOLS.find((tool) => tool.name === 'delegate_metrics');
+  assert.ok(metrics !== undefined);
+  assert.deepEqual(Object.keys(metrics.inputSchema.properties), []);
+  assert.equal(metrics.inputSchema.additionalProperties, false);
+  assert.equal(metrics.annotations.readOnlyHint, true);
 });
 
 test('no tool argument can carry a connection token, a credential value or a settings document', () => {
@@ -164,6 +202,14 @@ test('every tool carries accurate MCP annotations, and the long wait is marked r
   assert.equal(byName.get('delegate_cancel').destructiveHint, true);
   assert.equal(byName.get('delegate_permission_decide').readOnlyHint, false);
   assert.equal(byName.get('delegate_permission_decide').idempotentHint, false, 'a decision is single-use');
+  // Answering a question settles one paused call and is single-use, and it is NOT
+  // destructive: nothing is stopped, and no grant is revoked or created.
+  assert.equal(byName.get('delegate_question_answer').readOnlyHint, false);
+  assert.equal(byName.get('delegate_question_answer').destructiveHint, false);
+  assert.equal(byName.get('delegate_question_answer').idempotentHint, false, 'an answer is single-use');
+  // The census is a pure read of THIS process: it changes nothing and names no task.
+  assert.equal(byName.get('delegate_metrics').readOnlyHint, true);
+  assert.equal(byName.get('delegate_metrics').destructiveHint, false);
   // The catalog published over the protocol carries them through unchanged.
   assert.deepEqual(
     TOOLS.map((tool) => [tool.name, tool.annotations.readOnlyHint]),
@@ -174,14 +220,27 @@ test('every tool carries accurate MCP annotations, and the long wait is marked r
       ['delegate_wait', true],
       ['delegate_cancel', false],
       ['delegate_permission_decide', false],
+      ['delegate_question_answer', false],
       ['delegate_review', false],
       ['delegate_preflight', true],
+      ['delegate_metrics', true],
     ],
   );
 });
 
 test('each tool reaches exactly its own execution-plane route', async () => {
-  const { server, seen } = fixture();
+  // The question answer answers a route reply with its own receipt, so this fixture
+  // echoes the request id the way the real route does. Every other tool ignores the
+  // extra field, so one fixture serves the whole table.
+  const seen = [];
+  const server = createMcpServer({
+    async callExecution(route, payload) {
+      seen.push({ route, payload });
+      const base = { ok: true, route };
+      if (route !== 'question') return base;
+      return { ...base, answer: { requestId: payload?.requestId ?? null, taskId: payload?.taskId ?? null, answers: payload?.answers ?? [], answeredAt: 1 } };
+    },
+  });
   await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: LATEST_PROTOCOL_VERSION } });
   const cases = [
     ['delegate_status', {}, 'status', {}],
@@ -196,6 +255,17 @@ test('each tool reaches exactly its own execution-plane route', async () => {
     { taskId: 't1', requestId: 'permission-t1-1', decision: 'reject', reason: 'no', fingerprint: 'sha256:abc' }],
     ['delegate_review', { taskId: 't1', decision: 'accepted', note: 'reviewed' }, 'review',
       { taskId: 't1', decision: 'accepted', note: 'reviewed' }],
+    // The question answer reaches its own route and forwards only the answer body; the
+    // MCP-only flag is stripped at this boundary.
+    ['delegate_question_answer', {
+      taskId: 't1', requestId: 'question-t1-1',
+      answers: [{ id: 'q1', selected: ['yes'] }],
+    }, 'question', { taskId: 't1', requestId: 'question-t1-1', answers: [{ id: 'q1', selected: ['yes'] }] }],
+    ['delegate_question_answer', {
+      taskId: 't1', requestId: 'question-t1-1',
+      answers: [{ id: 'q1', selected: [], custom: 'my own' }],
+      waitAfterAnswer: false,
+    }, 'question', { taskId: 't1', requestId: 'question-t1-1', answers: [{ id: 'q1', selected: [], custom: 'my own' }] }],
     ['delegate_preflight', { workspacePath: 'C:\\w' }, 'preflight', { workspacePath: 'C:\\w' }],
     ['delegate_preflight', { workspacePath: 'C:\\w', allowShared: true }, 'preflight',
       { workspacePath: 'C:\\w', allowShared: true }],
@@ -286,7 +356,10 @@ test('initialize answers with a protocol version this server can actually speak'
   const known = await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26' } });
   assert.equal(known.result.protocolVersion, '2025-03-26');
   assert.deepEqual(known.result.capabilities, { tools: { listChanged: false } });
-  assert.equal(known.result.serverInfo.name, 'dsh-delegate');
+  // The server name is the package's own; the VERSION comes from the manifest beside
+  // this build (see `tests/version.test.js`), not from a literal in the source.
+  assert.equal(known.result.serverInfo.name, MANIFEST.name);
+  assert.equal(known.result.serverInfo.version, MANIFEST.version);
 
   // An unknown revision is answered with this server's latest, which is what the
   // protocol requires: the client decides whether it can proceed.
@@ -1042,7 +1115,8 @@ test('the stdio loop answers one message per line and survives a malformed line'
 
   const lines = chunks.join('').trim().split('\n').map((line) => JSON.parse(line));
   assert.equal(lines.length, 3);
-  assert.equal(lines[0].result.serverInfo.name, 'dsh-delegate');
+  assert.equal(lines[0].result.serverInfo.name, MANIFEST.name);
+  assert.equal(lines[0].result.serverInfo.version, MANIFEST.version);
   assert.equal(lines[1].error.code, RPC_ERRORS.parse);
   // The catalog over the wire is the same closed set the module exports: nothing
   // is filtered out of `tools/list` and nothing is added to it.

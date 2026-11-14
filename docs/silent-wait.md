@@ -188,6 +188,68 @@ node bin/dsh-delegate-control.js cancel <taskId>   # 只停止这一个任务
 - 不会被报告成"长时间没进展"；
 - 授权决定只对**那一次调用**有效，不构成常规权限，也不会被后续调用复用。
 
+### 5.1 决定之后直接续等（`waitAfterDecision`）
+
+`delegate_permission_decide` 有一个可选参数 `waitAfterDecision: boolean`，默认 `false`。
+
+- **省略或 `false`**：行为与之前完全一致——只做决定，返回权限路由自己的原样答复
+  （`ok`/`task`/`permission`/`hostAcceptance`），不额外增加任何字段。旧客户端不受影响。
+- **`true`**：在同一次 MCP 调用内，决定被后端确认生效后，**复用同一个等待循环**
+  （`delegate_wait` 的那一套：25 秒一次的受限观察、默认一小时的截止时间、心跳处理、
+  `interrupted` 分类）继续等同一个 `taskId`，直到出现真正需要判断的事件。
+
+答复形状是**扁平的 `delegate_wait` 形状 + `decisionReceipt`**：`reason`/`state`/
+`actionable`/`terminal`/`permission`/`task` 在顶层，新申请仍带完整的脱敏操作、
+`completeness` 与 `fingerprint`。不嵌套 `followUpWait` 这样的子块，因此已有的
+`boundedJson` 权限保护照旧生效：答复过大时，**回执和当前待定申请都会保留**，
+被截短的操作会明确标记为不可放行（`permissionDecidable: false`），不会被当成完整操作。
+
+`decisionReceipt` 说明决定本身的结果，例如
+`{ taskId, requestId, decision, fingerprint, applied, confirmation, outcome?, verified? }`：
+
+| 情形 | 回执 | 含义 |
+| --- | --- | --- |
+| 后端确认生效 | `applied: true`、`confirmation: "applied"` | 决定已生效，后续等待失败或取消都不会撤销它 |
+| 后端明确拒绝 | 抛出原有拒绝码，无回执 | 决定未生效，也不会有任何等待开始 |
+| 传输失败、超时、畸形答复 | `applied: null`、`confirmation: "unknown"` | **不知道**是否已生效；先读任务真实状态，不要直接重送 |
+| 答复与所决定的不一致 | `applied: null`、`confirmation: "unknown"`，附 `reason`/`evidence` | 答复中的 task、request 或 operation 与实际不符，或缺少 `state`/`outcome` 等必要证据 |
+| 答复 `ok: false` 或缺证据 | 同上 | `applied` 只可能来自**匹配的真实证据**，不会因为"有答复"就置真 |
+| 答复过大被裁剪 | 最小回执：身份 + `applied` + `confirmation`（`evidenceOmitted: true`） | 大块 `grant`/`verified` 证据被丢弃并可另读，但回执身份不丢 |
+
+确认"已生效"要求同时满足：`ok: true`、同一 task、同一 request、同一 operation fingerprint、
+`state` 为已结算、`outcome` 与本次决定一致（`allow-once` 对应 `allowed-once`，
+`reject` 对应 `rejected`）。`allow-once` 还需要 `verified` 证据，`reject` 不需要。
+真实后端记录的 `decision` 字段可能为 `null`，因此不把它当作必要条件；判定依据是
+`outcome` 与实际证据。**引用的 fingerprint 不会被后端值静默替换**：不一致就是矛盾。
+
+几条固定规则：
+
+- **已经决定的申请不会被再次询问**：等待循环按 `requestId` + `fingerprint` 完整匹配跳过
+  旧记录；**新 `requestId`，或同一 id 但操作变了，都是新问题**，不会继承上一次的允许。
+- **决定被拒绝时不会进入等待**；决定是本次调用的第一次请求，所以被拒时不会留下任何观察。
+- **决定已生效而后续等待失败/被取消/抛错时，本次仍是成功答复**：`decisionReceipt.applied`
+  保持 `true`，`reason` 为 `null`（没有观察到任何任务状态，就不编造），并附
+  `waitError`（含 `phase: "follow-up-wait"`）与"不要重送决定、执行未被停止"的明确指引。
+  回执只保证在**真实已生效**这一分支不丢；它不意味着任何答复都能恢复任意失败的决定。
+- **无法确认的决定不会进入等待**：拒绝码为 `MCP_DECISION_UNCONFIRMED`（或传输失败时保留
+  后端码），`error.details.decisionReceipt` 带 `applied: null` 与原始身份。
+- 同一请求重复提交仍由现有引擎拒绝；恢复时先读真实状态，不伪造幂等批准。
+
+## 5.2 计量（`delegate_metrics`）
+
+`delegate_metrics` 是**本 MCP 进程**的只读计数，不需要任务 id：
+
+- 每个工具被调用了多少次；每次等待返回的原因、耗时、内部观察次数；
+- 交给宿主的**工具文本字节数**——在最终脱敏、裁剪后的文本上，用
+  `Buffer.byteLength(..., 'utf8')` 计量，不是字符数，也不是答复里自报的自身长度。
+  它表示"交给传输层的数据量"，**不等于**宿主确认收到；
+- 已生效的决定次数，以及每次决定之后那次等待的关联 id。
+
+它**不**记录工具参数、思考正文、答复正文、密钥或任务内容。宿主模型自己的轮次、
+token 用量和费用在这个进程里**不可见**，因此报告为 `not-integrated`，而不是填 `0`。
+这里的数字是**程序**等待了多少，不是"叫醒了模型多少次"，本插件也没有任何
+跨客户端的零唤醒承诺。
+
 ## 6. 集中审查：什么时候读证据
 
 插件不会把对话内容、推理过程或工具输出塞进状态报告。派工方在**执行结束之后**
@@ -264,5 +326,27 @@ node bin/dsh-delegate-control.js cancel <taskId>   # 只停止这一个任务
   字段是判断依据，不要只看原因名字。
 - 串行宿主下没有通用的“并发”承诺：插件传输支持并发，独立控制程序只提供 `status` 与
   `cancel` 两个动作，也不能改变宿主的调度方式。
+- **四类"结束"不是一回事**，不要混用：(a) `wait-limit` 是**这次调用自己**的等待预算用完，
+  任务本身没变，继续等同一个 `taskId`；(b) 外层宿主工具/执行时限把调用提前交回，是
+  **外层事件**，观察没结束、执行也没停；(c) `attention` 是**真的没有活动**超过阈值
+  （默认 10 分钟）；(d) 任务的**总执行超时**是执行方自己的预算，以终态报告，既不是
+  `wait-limit` 也不是 `attention`，更不是客户端事件。
+- 插件**不能**创建后台等待者、不能唤醒宿主模型，也**不**承诺跨客户端的零唤醒。宿主有
+  自动续接时，一次长等待只占一个续接窗口；没有时，每个 yield 窗口要花一次续接。这一点
+  必须如实说明，不能编造后台唤醒。
+- 2026-11-14 的候选验收使用真实 Codex 外层调用、独立 stdio MCP 进程、本机 HTTP 通道与生产活动监控器，
+  持续等待 1200 秒：内部观察 48 次、消化心跳 47 次，仅返回 1 次交付事件，期间没有读取中间结果。
+  活动由脚本按真实事件格式模拟，包含持续思考流；这证明该客户端能够维持这次 20 分钟等待，
+  **不等于**真实提供方连续执行 20 分钟、所有客户端零续接或固定比例的 token／费用节省。
 - 设置页的自动刷新只在"任务记录"标签页可见、且存在进行中的任务时运行；
   终端状态的任务不会触发刷新。
+
+## 1.5.0：原生提问、拒绝理由与真实验收
+
+- 原生 `ask_user_question` 通过 `reason: question` 即时返回，问题处于 `awaiting-question`，不等十分钟停滞提醒。`delegate_question_answer` 回答一次；使用 `waitAfterAnswer: true` 可在同次调用继续等待原任务。
+- 问题与选项完整传送；超过整体界限或含必须脱敏的内容时明确拒绝。若返回 `questionsOmitted: true` 或 `questionAnswerable: false`，不得依据残缺内容作答。
+- `answerReceipt` 和 `decisionReceipt` 的身份、`applied`、`confirmation` 在结果裁剪或后续等待失败时仍保留。大批答案可标明省略，不反复回传全文；收到已应用回执后不要重送。
+- 题目默认十分钟到期，最多三十分钟；DSH 原生调用若更早撤销，也立即失效。题目绑定同一 Agent、Session 和原工具调用，不会移交给新回合的同名调用。
+- 审批拒绝理由注入同一个执行 Agent。`rejectionFeedback.delivered` 表示注入是否成功，不等于模型已理解；原操作仍被拒绝，后续申请独立判断。问题回答始终不授予任何权限。
+
+2026-11-15，本地 test.2 候选通过实际 DSH Desktop 重启续接，以及真实模型12轮串行100秒工具等待/只读校验，整轮约21分23秒。1次 MCP 等待、1次ready返回、0次中间结果读取；外层客户端20分钟时仍需续接同一个exec。账单实测见[1.5.0等待阶段对照](releases/1.5.0-token-benchmark.zh.md)，不承诺跨客户端零唤醒或所有任务固定节省率。

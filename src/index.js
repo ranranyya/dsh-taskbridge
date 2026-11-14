@@ -59,7 +59,10 @@ import { resolveCodexActionSeam } from './codex/seam.js';
 import { ReviewPreset } from './review/preset.js';
 import { configureDelegatedSession, policyServicesOf } from './runtime/sandbox.js';
 import { PermissionBridge, PERMISSION_DEFAULT_TIMEOUT_MS } from './runtime/permissions.js';
+import { QuestionBridge } from './runtime/questions.js';
 import { redactText, isSecretKey } from './config/redact.js';
+import { approvalFeedbackMessage } from './runtime/agent-runner.js';
+import { reportedVersion } from './version.js';
 
 /** Stable Cordis plugin name; also the settings/document namespace. */
 export const name = 'dsh-taskbridge';
@@ -254,6 +257,15 @@ export async function apply(ctx, config = {}) {
     // plugin must never install an `ask` it cannot answer.
     permissionBridge: createPermissionBridgeFactory({
       getApprovalService: () => readOptionalApprovalService(ctx),
+      logger,
+    }),
+    // The ordinary-question bridge factory. It does NOT depend on the approval service:
+    // asking a question is not granting anything, so a run keeps its fail-closed `never`
+    // approval stance and may still ask. A question is only surfaced when the harness
+    // actually composes the native `userQuestions` seam; otherwise the factory returns
+    // null and nothing is registered, which is the safe default.
+    questionBridge: createQuestionBridgeFactory({
+      hasQuestionService: () => hasQuestionService(ctx),
       logger,
     }),
   };
@@ -510,8 +522,14 @@ export async function apply(ctx, config = {}) {
   });
 }
 
-/** Version reported by the runtime facts block. Mirrors `package.json`. */
-const PLUGIN_VERSION = '1.4.2';
+/**
+ * Version reported by the runtime facts block.
+ *
+ * Read from the package manifest this build ships in, never written as a literal: two
+ * copies of one fact drift, and a host asking a pre-release build which version it is
+ * must not be told the last released number.
+ */
+const PLUGIN_VERSION = reportedVersion().version;
 
 /**
  * Read the native approval service without turning absence into a throw.
@@ -570,12 +588,64 @@ function createPermissionBridgeFactory(options) {
         // because that secret carries no credential-shaped TEXT at all.
         redact: (text) => redactText(text),
         isSecretKey,
+        // The REAL native message factory. Without it the bridge would fall back to a
+        // locally built object, and the note reaching the worker would be a look-alike
+        // rather than a message the native inbox normalised.
+        createUserMessage: approvalFeedbackMessage,
         onPending: request?.onPending,
         onSettled: request?.onSettled,
         logger: options?.logger ?? null,
       });
     } catch (error) {
       options?.logger?.warn?.('dsh-delegate: the permission bridge could not be constructed', String(error?.code ?? ''));
+      return null;
+    }
+  };
+}
+
+/**
+ * Whether this harness composes the native user-questions seam.
+ *
+ * Read live, per run, through the non-strict accessor: DSH may compose
+ * `ctx.userQuestions` after this plugin activated, and a missing seam is a fact (the
+ * worker's tool surface then simply has no `ask_user_question`), not a failure.
+ * @param {object} ctx - plugin context.
+ * @returns {boolean} true when the native service is present.
+ */
+function hasQuestionService(ctx) {
+  if (ctx === null || ctx === undefined || typeof ctx.get !== 'function') return false;
+  try {
+    return ctx.get('userQuestions', false) !== undefined && ctx.get('userQuestions', false) !== null;
+  } catch {
+    // A service whose read is refused is treated as absent, never as present.
+    return false;
+  }
+}
+
+/**
+ * Build the ordinary-question bridge factory.
+ *
+ * A bridge is produced only when the harness composes the native question seam AND the
+ * Agent-scoped answerer can be registered, which is decided per run by the runner. The
+ * factory itself holds no task state: the observers belong to the engine, which is what
+ * records the phase and accounts the paused budget.
+ * @param {object} options - `hasQuestionService` (live predicate), `logger`.
+ * @returns {(request: object) => object | null} factory.
+ */
+function createQuestionBridgeFactory(options) {
+  return function questionBridge(request) {
+    const present = typeof options?.hasQuestionService === 'function' ? options.hasQuestionService() : false;
+    if (present !== true) return null;
+    try {
+      return new QuestionBridge({
+        taskId: request?.taskId,
+        connectionId: request?.connectionId,
+        onPending: request?.onPending,
+        onSettled: request?.onSettled,
+        logger: options?.logger ?? null,
+      });
+    } catch (error) {
+      options?.logger?.warn?.('dsh-delegate: the question bridge could not be constructed', String(error?.code ?? ''));
       return null;
     }
   };

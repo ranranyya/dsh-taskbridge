@@ -39,9 +39,9 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
  * The package version this build must declare everywhere a human writes it.
  *
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
- * so asserting itself would pass for any value. `1.4.2` removes the DSH version gate.
+ * so asserting itself would pass for any value. `1.5.0` adds question handling and combined waits.
  */
-const DELIVERABLE_VERSION = '1.4.2';
+const DELIVERABLE_VERSION = '1.5.0';
 
 /**
  * The published build this release upgrades *from*.
@@ -558,14 +558,26 @@ test('the release metadata is one version everywhere it is written by hand', () 
   // The version appears in several places that no tool keeps in sync for us. A release
   // that disagrees with itself produces an artifact whose reported version is wrong,
   // so the duplication is asserted rather than trusted.
+  //
+  // Two of the surfaces used to DUPLICATE the number as a source literal. They now
+  // READ the manifest instead (`src/version.js`), which is the one thing that cannot
+  // drift: a pre-release build answers with its own prerelease version rather than the
+  // last released number. So those two surfaces are asserted to have NO literal, and
+  // the version module is asserted to be the single definition.
   const runtimeFacts = readFileSync(join(ROOT, 'src', 'index.js'), 'utf8');
   const mcpServer = readFileSync(join(ROOT, 'src', 'mcp', 'server.js'), 'utf8');
+  const versionModule = readFileSync(join(ROOT, 'src', 'version.js'), 'utf8');
   const discovery = readFileSync(join(ROOT, 'src', 'runtime', 'endpoint-discovery.js'), 'utf8');
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
   const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 
-  assert.match(runtimeFacts, new RegExp(`const PLUGIN_VERSION = '${escape(MANIFEST.version)}';`, 'u'));
-  assert.match(mcpServer, new RegExp(`version: '${escape(MANIFEST.version)}'`, 'u'));
+  // The runtime facts and the MCP handshake take their version from the manifest.
+  assert.match(runtimeFacts, /const PLUGIN_VERSION = reportedVersion\(\)\.version;/u);
+  assert.equal(/const PLUGIN_VERSION = '/u.test(runtimeFacts), false, 'src/index.js must not hard-code the version');
+  assert.match(mcpServer, /version: REPORTED\.version/u);
+  assert.equal(new RegExp(`version:\\s*'${escape(MANIFEST.version)}'`, 'u').test(mcpServer), false,
+    'src/mcp/server.js must not hard-code the version');
+  assert.match(versionModule, /MANIFEST_PATH = join\(PACKAGE_ROOT, 'package\.json'\)/u);
   // The discovery refusal deliberately does *not* restate a release version: it names
   // the plugin and the recovery path instead. That is asserted below and in the
   // dedicated message tests, so it is not turned back into a version literal here.
@@ -574,7 +586,7 @@ test('the release metadata is one version everywhere it is written by hand', () 
   assert.match(readme, new RegExp(`dsh-taskbridge-${escape(MANIFEST.version)}\\.tgz`, 'u'));
   // Every *release* literal in the package is this version. The 0.2.x references are
   // DSH runtime versions quoted in comments, not this package's own version.
-  for (const path of ['src/index.js', 'src/mcp/server.js', 'src/runtime/endpoint-discovery.js']) {
+  for (const path of ['src/index.js', 'src/mcp/server.js', 'src/version.js', 'src/runtime/endpoint-discovery.js']) {
     const text = readFileSync(join(ROOT, path), 'utf8');
     const literals = (text.match(/\b0\.1\.\d+\b/gu) ?? []);
     for (const literal of literals) {
@@ -786,7 +798,12 @@ test('the packed size stays bounded and contains no single-file outlier', () => 
   // means a bundle, a lockfile or a fixture slipped in. The bound tracks the real
   // contents (the generated `lib/client.js` dominates it) rather than a round number,
   // so a NEW multi-hundred-kilobyte file still fails loudly.
-  assert.ok(total < 2_500_000, `unpacked size grew unexpectedly: ${total} bytes`);
+  //
+  // Raised from 2,500,000 when the ordinary-question channel added
+  // `src/runtime/questions.js` and its execution-plane route (~87 KB of source with
+  // documentation). The bound still fails on anything that could hide a bundle, a
+  // lockfile or a fixture, which is what it exists for.
+  assert.ok(total < 2_700_000, `unpacked size grew unexpectedly: ${total} bytes`);
   const largest = PACKED.map((path) => ({ path, size: statSync(join(ROOT, path)).size }))
     .sort((left, right) => right.size - left.size)[0];
   assert.ok(largest.size < 500_000, `unexpectedly large packed file: ${largest.path}`);

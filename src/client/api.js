@@ -552,6 +552,9 @@ export const TASK_PHASE_LABELS = Object.freeze({
   'before-create': '即将创建执行器',
   execute: '执行中',
   'awaiting-permission': '等待本次调用授权决定',
+  // A question is a DIFFERENT wait from an approval: answering it grants nothing, so the
+  // label must not read as an authorization either.
+  'awaiting-question': '等待回答问题',
   review: '附加审查中',
   'awaiting-host-review': '等待宿主审查',
   failed: '已失败',
@@ -1127,6 +1130,29 @@ export function isAwaitingPermission(task) {
  */
 export function pendingPermission(task) {
   const pending = task?.permission?.pending ?? null;
+  return pending !== null && typeof pending === 'object' ? pending : null;
+}
+
+/**
+ * Whether the worker is waiting for an ORDINARY QUESTION answer.
+ *
+ * Kept separate from {@link isAwaitingPermission}: answering a question authorizes
+ * nothing, so a UI must not present it as an approval card.
+ * @param {object} task - task view.
+ * @returns {boolean} true when a question is outstanding.
+ */
+export function isAwaitingQuestion(task) {
+  if (task?.question?.waiting === true) return true;
+  return task?.phase === 'awaiting-question';
+}
+
+/**
+ * The pending ordinary question set of one task, or `null`.
+ * @param {object} task - task view.
+ * @returns {object | null} the pending question.
+ */
+export function pendingQuestion(task) {
+  const pending = task?.question?.pending ?? null;
   return pending !== null && typeof pending === 'object' ? pending : null;
 }
 

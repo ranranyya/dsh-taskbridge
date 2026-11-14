@@ -172,6 +172,8 @@ export interface DelegatePendingPermission {
   grant: { kind: 'allowed-once'; appliesTo: 'this-call-only'; callId: string; reusable: false } | null;
   /** Always true: a decision never changes the Session's standing mode. */
   standingModeUnchanged: true;
+  /** Present after a commander rejection; delivery is independent of the rejection outcome. */
+  rejectionFeedback?: { delivered: boolean; reason: string | null; text?: string } | null;
 }
 
 /** The per-call permission block every task view carries. */
@@ -194,6 +196,122 @@ export interface DelegateTaskPermission {
    * pending, so it was rewritten as history and can never be decided or replayed.
    */
   interrupted?: true;
+}
+
+/**
+ * One option a question offers.
+ */
+export interface DelegateQuestionOption {
+  /** The label an answer selects. */
+  label: string;
+  /** Optional extra context for the option. */
+  description: string | null;
+}
+
+/**
+ * One question a delegated worker asked, as the task view publishes it.
+ *
+ * Nothing here is model output: these are the questions the worker composed with the
+ * native `ask_user_question` tool. No reasoning, transcript or tool argument has a field.
+ */
+export interface DelegateQuestion {
+  /** Stable caller-provided id, echoed in the answer. */
+  id: string;
+  /** The question text. */
+  question: string;
+  /** Optional short heading. */
+  header: string | null;
+  /** Optional supporting detail, kept out of the option labels. */
+  detail: string | null;
+  /** Choices the question offered; empty when it expects free text. */
+  options: DelegateQuestionOption[];
+  /** Whether more than one option may be selected. */
+  multiSelect: boolean;
+  /**
+   * The caller's presentation intent, when it declared one.
+   *
+   * `'approval'` questions are REFUSED on this channel: a permission decision belongs to
+   * `delegate_permission_decide`, which binds one exact tool call. `'plan-review'` is an
+   * information answer and grants nothing either.
+   */
+  intent: 'plan-review' | 'approval' | null;
+}
+
+/** One pending ordinary question set. */
+export interface DelegatePendingQuestion {
+  requestId: string;
+  taskId: string;
+  sessionId: string | null;
+  /** The native tool call the question is keyed by, when the harness supplied one. */
+  callId: string | null;
+  state: 'pending' | 'answered' | 'expired' | 'cancelled' | 'refused';
+  createdAt: number;
+  /** Finite absolute deadline; defaults to ten minutes after the question was published. */
+  deadlineAt: number;
+  questions: DelegateQuestion[];
+  /** An omitted question must never be answered using partial text. */
+  questionsOmitted?: boolean;
+  questionAnswerable?: boolean;
+  questionCount?: number;
+  /** Always `false`: answering a question never grants access. */
+  grantsAccess: false;
+}
+
+/** One answer the commander gave. */
+export interface DelegateQuestionAnswerItem {
+  id: string;
+  /** Labels this question actually offered. */
+  selected: string[];
+  /** Optional free text; required when the question offered no options. */
+  custom?: string;
+}
+
+/** The ordinary-question block every task view carries. */
+export interface DelegateTaskQuestion {
+  /** Whether this run was offered a question bridge at all. */
+  bridged: boolean;
+  /** Whether a question is outstanding right now. */
+  waiting: boolean;
+  pending: DelegatePendingQuestion | null;
+  /** Bounded settled trail, oldest first. */
+  evidence: {
+    requestId: string;
+    taskId: string;
+    callId: string | null;
+    state: string;
+    questions: { id: string; question: string }[];
+    answers: DelegateQuestionAnswerItem[] | null;
+    reason: string | null;
+    createdAt: number;
+    settledAt: number | null;
+    answeredAt: number | null;
+  }[];
+  /** Time the run spent waiting for an answer, NOT charged to the execution budget. */
+  pausedExecutionMs: number;
+  /** Always `false`, stated so no reader mistakes a question answer for a grant. */
+  grantsAccess: false;
+}
+
+/**
+ * The receipt of ONE question answer.
+ *
+ * `applied: true` is claimed only when the route confirmed the SAME task and request.
+ * `applied: null` with `confirmation: "unknown"` means nothing was established — read the
+ * task before answering again, and never resend automatically.
+ */
+export interface DelegateAnswerReceipt {
+  receiptId: string;
+  taskId: string | null;
+  requestId: string | null;
+  answers?: DelegateQuestionAnswerItem[];
+  answersOmitted?: true;
+  answerCount?: number;
+  evidenceOmitted?: true;
+  applied: boolean | null;
+  confirmation: 'confirmed' | 'unknown' | 'refused';
+  /** Always `false`: an answer is not an authorization. */
+  grantsAccess: false;
+  reason?: string | null;
 }
 
 /**
@@ -292,6 +410,13 @@ export type DelegateObserveReason =
   | 'heartbeat'
   | 'attention'
   | 'permission'
+  /**
+   * The worker asked an ordinary question and is paused until it is answered.
+   *
+   * Reported IMMEDIATELY, not after a silence threshold, and it grants nothing: any
+   * widening still needs its own `permission` request.
+   */
+  | 'question'
   | 'ready'
   | 'failed'
   | 'cancelled'
@@ -430,6 +555,154 @@ export interface DelegateHostAcceptance {
   note: string;
 }
 
+/**
+ * The receipt of ONE per-call permission decision.
+ *
+ * `applied` is the only field that answers "did this take effect", and it is deliberately
+ * three-valued: `null` with `confirmation: 'unknown'` means the decision could not be
+ * confirmed — the call failed before the harness answered, OR the answer lacked the identity
+ * and outcome evidence, OR it CONTRADICTED the request that was decided. Such a decision must
+ * never be resent without reading the task's real state first.
+ *
+ * `applied: true` is claimed ONLY from a permission answer that names the SAME task, the SAME
+ * request and the SAME operation fingerprint the decision was bound to, reports a settled
+ * `state`, and carries the outcome this decision asked for (`allowed-once` for an allow,
+ * `rejected` for a reject). An allow additionally needs its `verified` evidence; a reject
+ * needs none. The quoted fingerprint is never replaced by a conflicting backend value.
+ */
+export interface DelegateDecisionReceipt {
+  taskId: string | null;
+  requestId: string | null;
+  decision: 'allow-once' | 'reject' | null;
+  /** The exact operation the decision was bound to; `null` when none could be proven. */
+  fingerprint: string | null;
+  /** `true` only for a confirmed decision; `false` for a harness refusal; `null` if unknown. */
+  applied: boolean | null;
+  confirmation: 'applied' | 'unknown' | 'refused';
+  /** The closed native outcome, when the harness reported one. */
+  outcome?: DelegatePendingPermission['outcome'];
+  /** Which checks an `allowed-once` actually passed. Absent for a reject. */
+  verified?: DelegatePendingPermission['verified'];
+  decidedAt?: number;
+  grant?: DelegatePendingPermission['grant'];
+  /** Whether the rejection reason reached the executor; the note itself is not repeated. */
+  rejectionFeedback?: { delivered: boolean; reason: string | null } | null;
+  /** Why the decision is not confirmed. Present only when `confirmation` is not `applied`. */
+  reason?: string;
+  /**
+   * The contradicting evidence, when the answer disagreed with what was decided. Present only
+   * for an `unknown` outcome, and bounded.
+   */
+  evidence?: Record<string, unknown>;
+  /** Present only when a bound forced the bulky evidence out of a rescued receipt. */
+  evidenceOmitted?: true;
+  /** Present only for an unconfirmed decision: the failure that prevented confirmation. */
+  error?: { code: string; message: string };
+}
+
+/**
+ * The answer of `delegate_permission_decide({ waitAfterDecision: true })`.
+ *
+ * It is the SAME flat shape {@link DelegateObservation} publishes for a wait — a plain
+ * `delegate_wait` answer plus `decisionReceipt` — so a host reads one vocabulary for both.
+ * There is no nested follow-up block: the top-level `permission` is the live pending
+ * operation, and `boundedJson` keeps it (and the receipt) even when the answer must be cut.
+ *
+ * When the decision WAS applied but the following wait failed, was interrupted or was
+ * cancelled, this is still a SUCCESS carrying `decisionReceipt` (`applied: true`) plus
+ * `reason: null`, `actionable: false` and a `waitError` block: the decision stands, only the
+ * waiting ended, and the execution was not stopped. The receipt is never swallowed.
+ */
+export interface DelegateDecisionWithWait extends DelegateObservation {
+  decisionReceipt: DelegateDecisionReceipt;
+  /** Present only when the applied decision's follow-up wait ended in a refusal. */
+  waitError?: { code: string; message: string; phase: 'follow-up-wait' };
+}
+
+/**
+ * The refusal of a decision whose outcome nobody established or confirmed.
+ *
+ * `applied` is `null`, `confirmation` is `'unknown'`, and the caller must read the task with
+ * `delegate_result` before deciding whether to send the decision again. Nothing is retried
+ * automatically and no wait is started.
+ */
+export interface DelegateUnconfirmedDecisionFacts {
+  decisionReceipt: DelegateDecisionReceipt;
+}
+
+/**
+ * One bounded accounting census of an MCP process.
+ *
+ * These are counts of the PROGRAM — the tool calls a host made and the waits it ran — never
+ * of the host model. The host's own turns, token usage and cost are not observable from this
+ * process and are reported as `'not-integrated'`, never as zero.
+ */
+export interface DelegateMcpMetrics {
+  schemaVersion: 1;
+  definitions: Record<string, string>;
+  hostObservability: {
+    hostModelResponses: 'not-integrated';
+    hostTokenUsage: 'not-integrated';
+    hostCost: 'not-integrated';
+    reason: string;
+  };
+  tools: Record<string, number>;
+  returnedText: {
+    count: number;
+    /** UTF-8 bytes of the final bounded, redacted tool text. Not a delivery receipt. */
+    bytes: number;
+    /** Returns whose size could not be measured (no text, or unencodable). */
+    unmeasured: number;
+    unit: 'utf8-bytes-of-serialized-tool-text';
+  };
+  waits: {
+    count: number;
+    totalMs: number;
+    observations: number;
+    reasons: Record<string, number>;
+  };
+  decisions: {
+    count: number;
+    applied: number;
+    unknown: number;
+    refused: number;
+    allowed: number;
+    rejected: number;
+  };
+  questionAnswers: { count: number; applied: number; unknown: number; refused: number };
+  correlation: {
+    waitsAfterDecisions: number;
+    waitQuestionsAnswered: number;
+    recentWaits: Array<{
+      waitId: string | null;
+      afterDecisionId: string | null;
+      taskId: string | null;
+      reason: string;
+      durationMs: number;
+      observationRequests: number;
+      heartbeatsConsumed: number;
+      settledRequestObservations: number;
+      waitReturns: number;
+      at: number;
+    }>;
+    recentDecisions: Array<{
+      receiptId: string | null;
+      taskId: string | null;
+      requestId: string | null;
+      decision: 'allow-once' | 'reject' | 'question-answer' | null;
+      fingerprint: string | null;
+      /**
+       * The same three-valued fact the permission receipt publishes: `true` for `applied`,
+       * `false` for `refused`, `null` for `unknown`. An unconfirmed attempt is `null`, never
+       * `false`, so a reader cannot mistake it for an established refusal.
+       */
+      applied: boolean | null;
+      state: 'applied' | 'unknown' | 'refused';
+      at: number;
+    }>;
+  };
+}
+
 /** Result of one bounded observation of a delegated task. */
 export interface DelegateObservation {
   task: DelegateObservationSummary;
@@ -440,6 +713,18 @@ export interface DelegateObservation {
    * never shortened into an undecidable summary.
    */
   permission: DelegatePendingPermission | null;
+  /**
+   * The FULL pending question set, present only for `reason: 'question'`.
+   *
+   * Carries the questions, their options, and the identity an answer is bound to, so one
+   * reply is enough to answer — exactly like the permission block. It never carries
+   * model text.
+   */
+  question: DelegatePendingQuestion | null;
+  /** Present only on a `question` answer: derived from the operation as published. */
+  questionAnswerable?: boolean;
+  /** Present only on a `question` answer: always `false`, restated where it matters. */
+  grantsAccess?: false;
   /**
    * Present only when `reason` is `attention` AND the reminder is about repeated
    * failures rather than silence. `null`/absent for an ordinary silence report, which

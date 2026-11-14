@@ -28,6 +28,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { apply } from '../src/index.js';
+import { redactText } from '../src/config/redact.js';
 import { SESSION_CODES, SessionPlacementError, liveControllerAccessor } from '../src/runtime/session-placement.js';
 import { runAgent } from '../src/runtime/agent-runner.js';
 import {
@@ -44,6 +45,22 @@ import {
 const DIRECTORY = process.platform === 'win32' ? 'C:\\work\\placement' : '/work/placement';
 const OTHER_DIRECTORY = process.platform === 'win32' ? 'C:\\work\\elsewhere' : '/work/elsewhere';
 const SELECTION = { providerRoute: 'relay', model: 'deepseek-chat', reasoningEffort: 'medium' };
+
+/**
+ * Whether a published path names one real directory, allowing for redaction.
+ *
+ * The comparison is EXACT after the documented projection: `redactText(expectedPath)`
+ * must equal the published value. A mask is never treated as a wildcard here — an
+ * earlier version of this helper let any segment match the placeholder, which would
+ * have hidden a published value naming a DIFFERENT directory behind a mask. Shorter or
+ * longer paths, and a differing real segment, all fail.
+ * @param {string} expectedPath - the real directory.
+ * @param {unknown} publishedPath - the value from a public view.
+ * @returns {boolean} true when the view is the documented projection of that directory.
+ */
+function redactedPathIs(expectedPath, publishedPath) {
+  return typeof publishedPath === 'string' && publishedPath === redactText(expectedPath);
+}
 
 /**
  * Mount the real plugin entry against a context that composes NO placement
@@ -639,13 +656,18 @@ test('a worktree follow-up reuses the parent tree and its uncommitted changes', 
 
     const parent = await runTask('create the first isolated change');
     assert.equal(parent.state, 'awaiting-host-review');
-    assert.equal(parent.execution.workspacePath, treePath);
+    // `treePath` lives under this session's platform temp root, which is itself an
+    // id-shaped profile directory on some hosts, so the PUBLIC view may carry the
+    // redaction placeholder where that segment was. The tree identity is what matters
+    // here, and it is asserted on the raw path via the worktree block below.
+    assert.equal(redactedPathIs(treePath, parent.execution.workspacePath), true,
+      `the view must name this tree (view: ${parent.execution.workspacePath})`);
     assert.equal(parent.execution.conversation.kind, 'new');
     assert.equal(parent.conversationSaved, true);
 
     const followUp = await runTask('improve that same change', { continueFromTaskId: parent.taskId });
     assert.equal(followUp.state, 'awaiting-host-review');
-    assert.equal(followUp.execution.workspacePath, treePath, 'the follow-up mutates the original tree');
+    assert.equal(redactedPathIs(treePath, followUp.execution.workspacePath), true, 'the follow-up mutates the original tree');
     assert.equal(followUp.execution.conversation.kind, 'continuation');
     assert.equal(followUp.execution.conversation.sessionId, parent.execution.conversation.sessionId);
     assert.equal(followUp.execution.conversation.workspaceId, parent.execution.conversation.workspaceId);

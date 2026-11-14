@@ -1404,6 +1404,8 @@ test('the worker prompt forbids self-approval and history rewriting', () => {
   assert.match(prompt, /Do not commit, push, tag, or rewrite git history/);
   assert.match(prompt, /You cannot approve your own work/);
   assert.match(prompt, /Do not claim checks you did not run/);
+  // The execution habits are pinned in `mcp-permission-continue.test.js`, which runs without
+  // the DSH runtime packages this file needs: see "the worker prompt states how to read logs".
 });
 
 test('evidence rendering discloses sensitive paths without their content', () => {

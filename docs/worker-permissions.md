@@ -1,17 +1,10 @@
-# Worker session permissions (1.0.0; unchanged in 1.1.0 and 1.2.0)
+# Worker session permissions (1.5.0; historical 1.0.0–1.2.0 audits retained)
 
-This document states what a delegated **worker** run is allowed to do on the machine
-it runs on, how that is established, which connection may continue an existing
-thread, when a single tool call may ask the commander for permission, and what is
-*not* verified. It describes this build (`1.0.0`) only; the runtime-facing changes
-in DSH 0.2.2 are stated in `docs/runtime-compatibility.md`, and the runtime
-implementation itself is reviewed separately.
+This document describes the worker sandbox, per-call approval and ordinary-question boundaries. The standing worker sandbox remains `workspace-write`; a question answer never grants access. A single approved operation does not authorize another call.
 
-**Production status:** the per-call decision feature is exercised by this repository's
-tests, not yet by a real production run. The production Desktop profile still runs
-the previous plugin build, where this sixth tool is absent; exposing it needs a Desktop plugin upgrade and
-an MCP reconnect or new session, and the end-to-end provider → commander → resume
-acceptance run remains pending.
+**1.5.0 acceptance status:** the verified test.2 candidate was installed through native DSH Desktop plugin management. Real provider runs exercised both rejection and a separately approved call, delivery of the rejection reason, native question forwarding, answer-and-wait, and decision-and-wait. An actual Desktop restart retained the source identity, Session and saved host acceptance. A subsequent real-model, twelve-round timing/read-only exercise lasted over twenty minutes with one MCP wait and no intermediate result reads. See [1.5.0 release notes](releases/1.5.0.zh.md).
+
+Historical validation sections below describe their own older builds and do not override this current acceptance statement. These checks do not prove every host/platform combination or turn the same-user loopback switch into per-process authentication.
 
 ## The policy
 
@@ -87,11 +80,36 @@ An `allow-once` is accepted only when ALL of these hold at the moment of the dec
 | the turn that asked for the call has not ended | `PERMISSION_REQUEST_CHANGED` |
 | the request is still pending and inside its deadline | `PERMISSION_REQUEST_NOT_PENDING` / `PERMISSION_REQUEST_EXPIRED` |
 
-A projection that was shortened by a bound (a long `bash.command` whose tail was cut, a
+A projection that was shortened by a bound (a `bash.command` whose tail was cut, a
 large `write` body) is reported as `permission.pending.completeness: "truncated"` and
 **cannot be allowed** — an allow would grant a call whose executable material the
 commander never saw. `reject` needs no fingerprint and no completeness, because refusing
 is always safe.
+
+### The evidence bounds are sized from real commands
+
+| Bound | Value | What it holds |
+| --- | --- | --- |
+| one redacted argument scalar (`argumentValueChars`) | 8 192 | a complete PowerShell/`bash` command, including a long Windows path |
+| the whole redacted argument object (`argumentsChars`) | 16 384 | that command plus its other fields (`sandbox_permissions`, `justification`, …) |
+| `McpPermissionRequest.arguments` at the MCP layer | the engine's own `argumentsChars` | the published operation, never a smaller second cap |
+
+They are finite, and the rule above is what makes them safe: a request past either cap is
+still cut, still says so, and still cannot be allowed. The correction was to the **size**,
+not to the gate. Two refusals motivated it:
+
+- the per-scalar cap was 400 characters, so a real Windows path plus a write-back command
+  (~403 characters) was cut, marking the request `truncated` and unapprovable — a
+  reviewable request was turned into an un-reviewable one;
+- the MCP text layer separately capped `permission.pending.arguments` at 4 000 characters,
+  *below* the engine's own cap, so an operation the engine published whole could be cut
+  again at the last layer before the host saw it and forced back to `argumentsComplete:
+  false`.
+
+`tests/permission-evidence-bounds.test.js` pins both: a ~403, ~1000 and ~8000 character
+command is published whole and decidable, a command past the cap is cut and refused for
+`allow-once`, the fingerprint still covers the complete real arguments, and neither the
+MCP projection nor the history projection re-cuts an operation the engine kept whole.
 
 A decision is refused when the request is unknown, already settled, past its
 deadline, or carries a fingerprint that does not match the pending operation; and
@@ -170,8 +188,127 @@ inheriting an older, possibly interactive policy. Nothing here touches the
 operator's ordinary DSH sessions: the policy is installed only for a delegated
 worker session.
 
-## Reviews: the sandbox policy and the bridge do not apply
+## Ordinary questions: a separate channel that grants nothing
 
+A delegated worker may also ask a HUMAN something with the native `ask_user_question`
+tool — an ambiguity it must not resolve itself, a choice it must not invent. That is a
+different situation from a permission request, and it gets a different channel.
+
+**The seam.** `ask_user_question` dispatches the Agent-scoped Cordis waterfall
+`'user-questions/request'` (`@deepseek-ai/dsh-user-questions`):
+
+```js
+ctx.on('user-questions/request', (request, next) => …, { prepend: true })
+// request = { questions: [{ id, question, header?, detail?, options?, multiSelect?, intent? }],
+//             agent?, signal?, wait?: { callId, timed? } }
+// → { answers: [{ id, selected: string[], custom?: string }] }
+```
+
+Each run registers its own answerer on its own Agent's scoped context, with
+`prepend: true` for the same reason the approval answerer needs it: the waterfall gives
+the request to the FIRST answerer that returns a value, and this run exists so the
+**commander** sees the question. Without it a UI answerer composed earlier would claim
+the request and the commander would never learn the worker was asking — which is exactly
+what happened in the acceptance run, where the task sat in `execute` for ten minutes
+until the silence threshold.
+
+**What the commander sees, and when.** A pending question makes an observation answer
+`reason: 'question'` **immediately** — not after a silence threshold — carrying the whole
+`question` block: `requestId`, `taskId`, `sessionId`, `callId` and `questions[]` with each
+question's text, options and detail. The task stays `running` with phase
+`awaiting-question`, keeps its lock, its concurrency slot and its provider lease, and the
+wait is charged to the question's own deadline instead of the execution budget.
+
+The timing matters and is enforced in the MONITOR, not only in the engine: an observation
+that is already inside its bounded wait polls for a pending question on every slice, so a
+question raised mid-wait returns at once instead of after the 25-second bound. A pending
+permission request still outranks a question, because that is the one wait that can grant
+something.
+
+**Answering.** `delegate_question_answer({ taskId, requestId, answers })`, or
+`POST /dsh-delegate/x/tasks/question` on the execution plane. Each asked question is
+answered **exactly once**; every selected label must be one of that question's own
+options; a single-select question takes exactly one label (a selection AND custom text
+together is legal, matching the native tool); a question with no options needs `custom`
+text. A refused batch leaves the question **pending**, so a correct answer can still be
+made. An answer applies **once**: a repeat is `QUESTION_ALREADY_ANSWERED`, and an expired
+or cancelled question cannot be answered.
+
+**Published whole, or refused.** A question set is accepted only if its EXACT serialised
+form — every question, header, detail, option label and description, with all JSON
+escapes counted — fits `QUESTION_BOUNDS.wireChars` (12 000, deliberately below the
+20 000-character tool-text bound so the block, the task summary and a receipt travel
+together). A set that does not fit is refused with `QUESTION_PAYLOAD_TOO_LARGE` **before**
+anything is published, so the commander is never shown a shortened menu it could answer
+from. The id is used verbatim (no trimming, no generated substitute), a duplicate id or a
+duplicate option label is refused, and the id is bounded.
+
+**Bound to a real call, with a finite life.** The answer resumes the paused native call, so
+the bridge binds that call: `request.wait.callId` is verified against the Session log (it
+must be an `ask_user_question` call in the OPEN turn with no recorded result), and a
+legacy request that names none is bound only when the open turn holds exactly one such
+call — two candidates are an ambiguity, which is a refusal rather than a guess. The call is
+re-checked BEFORE the answer is applied: once it has returned or its turn closed, the answer
+is refused with `QUESTION_CALL_GONE` and the set is closed instead of left answerable.
+
+A pending question has its own **finite** deadline — ten minutes by default, capped at
+thirty — because it pauses the execution budget. An unanswered question therefore ends with
+the native `ASK_TIMED_OUT`; cancellation, switch-off and disposal end it with `ASK_ABORTED`.
+
+**It is not an approval, and it cannot become one.**
+
+- A question whose `intent.kind` is `'approval'` is **refused** here with
+  `QUESTION_APPROVAL_INTENT`. A permission decision must go through
+  `delegate_permission_decide`, which binds one exact tool call and one fingerprint;
+  answering it on the question channel would grant access with none of that.
+- A `'plan-review'` question is an information answer: the decision text goes back to the
+  worker, and any widening it then wants still needs its own approval.
+- The published block states `grantsAccess: false`, so no reader has to infer it.
+
+**Lifecycle.** Cancellation, switch-off, revocation, agent disposal, plugin teardown and
+the question's own deadline all settle the outstanding wait with the native refusal
+(`ASK_ABORTED` / `ASK_TIMED_OUT`) and release the record, so a paused worker is never left
+waiting for a commander that can no longer answer. A restart begins with no bridge and no
+question, so an interrupted question is history only and is never replayed as an answer.
+A harness without the `userQuestions` seam simply gets no answerer: the native call then
+fails at once with `NO_PROVIDER` instead of hanging.
+
+## Rejection reasons reach the worker
+
+The native approval protocol cannot carry prose: `ApprovalService.request()` resolves one
+of four closed outcomes (`allowed-once`, `rejected`, `cancelled`, `unavailable`). So a
+commander's reason used to be recorded in history and nowhere else — the worker saw a bare
+`rejected` and could not know that shortening its command would let it ask again.
+
+The reason is now sent into the **same Agent** through the channel that does carry prose
+into its next model step: `agent.inject(createUserMessage(...))`, the call the native
+approval service itself uses for its policy notices. The note states, in one message:
+
+- **why** that one call was rejected, quoted from the decision (redacted and bounded);
+- that the rejection **stands** and the call did not run;
+- that nothing was widened — not the sandbox, the switch, the policy or the standing mode;
+- that this is **not** a new authorization and grants nothing by itself;
+- what to do: change the operation to fit the reason and request approval again.
+
+Delivery is tracked per request id, so a repeated reject, a retried decision or a restart
+cannot deliver the same note twice. The note names the task, the request and the call so
+the worker can place exactly which operation was refused. The settled evidence records
+`rejectionFeedback: { delivered, reason, requestId, callId, messageId, text }` —
+`delivered: true` only after an actual injection on the bound Agent — and that record is
+carried into durable history, so "the worker was told why" survives a restart and can be
+checked instead of claimed. A failed injection is reported as **not delivered** and never
+un-rejects the call or claims the worker was told.
+
+The message is built by the REAL native `createUserMessage`, injected by the plugin's own
+composition (`src/index.js`); the locally built default exists only for a harness-free
+import and uses the same `user-approval` source the native approval service itself emits, so
+it is a stand-in rather than a different protocol.
+
+**Metrics.** `delegate_metrics` counts question waits under their own `question` reason and
+question answers on their own `questionAnswers` axis. A question answer is **never** counted
+as a permission decision or a refusal: it authorizes nothing.
+
+## Reviews: the sandbox policy and the bridge do not apply
 The optional read-only review agent uses its own composition (its own provider,
 model and effort, read-only tools and its own workspace). It does **not** run through
 the worker sandbox path, it gets **no permission bridge**, and this release does not

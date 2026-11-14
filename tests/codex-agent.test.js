@@ -295,3 +295,39 @@ test('the shipped companion states the normal wait contract: omit waitSeconds, s
   assert.match(template, /INDEPENDENT of the delegated task/u);
   assert.match(template, /an inspection the operator explicitly asked\s+for/u);
 });
+
+test('the shipped companion prefers waitAfterDecision and forbids inheriting the previous allow', () => {
+  const shipped = shippedAgentText();
+  // The one-call path is named, with the fallback for clients that lack the flag.
+  assert.match(shipped, /`waitAfterDecision: true`/u);
+  assert.match(shipped, /decide first and then call `delegate_wait` on the SAME task/u);
+  // The receipt states WHICH evidence makes an allow applied, and never claims more than that.
+  assert.match(shipped, /`applied: true` is claimed ONLY when the harness confirmed\s+the SAME task/u);
+  // An applied decision whose FOLLOW-UP WAIT failed is a success with a waitError, not a failure.
+  assert.match(shipped, /which means the DECISION SUCCEEDED and only the FOLLOWING WAIT\s+failed/u);
+  assert.match(shipped, /never send the decision\s+again/u);
+  assert.match(shipped, /never cancel or reassign the task/u);
+  // An unconfirmed decision is never retried, and the refusal names where its identity is.
+  assert.match(shipped, /`applied: null` with `confirmation: "unknown"` means nothing was\s+established/u);
+  assert.match(shipped, /error\.details\.decisionReceipt/u);
+  assert.match(shipped, /read the task\s+with `delegate_result` before sending anything again/u);
+  assert.match(shipped, /never resend automatically/u);
+  // A new request is a new question, and the one just decided is never re-asked.
+  assert.match(shipped, /the request you just decided is never re-asked/u);
+});
+
+test('the shipped companion names the four different expiry kinds, and never promises a wake-up', () => {
+  const shipped = shippedAgentText();
+  assert.match(shipped, /FOUR DIFFERENT THINGS, never conflated/u);
+  // (a) this call's own deadline; (b) the client's outer limit; (c) real inactivity;
+  // (d) the task's total execution budget.
+  assert.match(shipped, /`wait-limit` — THIS call's own wait budget ran out/u);
+  assert.match(shipped, /An OUTER limit — your client handed the call back/u);
+  assert.match(shipped, /`attention` — genuine inactivity/u);
+  assert.match(shipped, /The task's TOTAL execution timeout/u);
+  // An ordinary single failing test belongs to the worker, not to the host.
+  assert.match(shipped, /An ordinary\s+single failing test inside the worker is the WORKER's job/u);
+  // Honest boundary: no invented background wake-up, and no zero-wake claim.
+  assert.match(shipped, /never promise the plugin will wake you or achieve zero wake-ups\s+across clients/u);
+  assert.match(shipped, /never claim the plugin will notify\s+you in the background/u);
+});

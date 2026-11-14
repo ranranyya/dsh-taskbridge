@@ -75,8 +75,17 @@ import { resolveRoute } from '../model/routing.js';
 import { PROVIDER_SET_CODES, managedProvidersOf } from '../model/providers.js';
 import { RUN_OUTCOMES, RunError, SessionPlacementRefusal, diagnostic, runAgent } from '../runtime/agent-runner.js';
 import { PermissionBridge, PermissionError, PERMISSION_CODES } from '../runtime/permissions.js';
+import { QuestionBridge, QuestionError, QUESTION_CODES } from '../runtime/questions.js';
 import { DELEGATE_SANDBOX_MODE } from '../runtime/sandbox.js';
 import { rememberSession, SESSION_CODES } from '../runtime/session-placement.js';
+import {
+  continuationIdentityOf,
+  isPathDigest,
+  pathDigest,
+  recordedDirectoryIs,
+  recordedPathIsMasked,
+  sameRecordedDirectory,
+} from './continuation-identity.js';
 import { taskTitle } from './title.js';
 import { REVIEW_STATES, reviewWork } from '../review/reviewer.js';
 import { buildReviewPrompt, buildWorkerPrompt } from '../review/prompts.js';
@@ -261,6 +270,10 @@ const HOST_REVIEW_BY = 'host-commander';
  * new lifecycle.
  */
 const PHASE_AWAITING_PERMISSION = 'awaiting-permission';
+// A distinct phase for a waiting QUESTION, because the two waits need different
+// answers and only one of them can grant anything. The task state stays `running`
+// either way, so no existing reader has to learn a new lifecycle value.
+const PHASE_AWAITING_QUESTION = 'awaiting-question';
 const PHASE_EXECUTE = 'execute';
 
 /**
@@ -294,6 +307,10 @@ export const OBSERVE_TASK_REASONS = Object.freeze({
   heartbeat: 'heartbeat',
   attention: 'attention',
   permission: 'permission',
+  // The worker asked a human a question through the native question channel. It is a
+  // distinct reason from `permission` because answering it grants NOTHING: the
+  // commander answers, and any widening still needs its own approval request.
+  question: 'question',
   ready: 'ready',
   failed: 'failed',
   cancelled: 'cancelled',
@@ -652,6 +669,12 @@ export class JobEngine {
       // timer when the request settles, so an approval wait can never be charged
       // to the execution timeout.
       permission: { bridge: null, pending: null, evidence: [], pausedAt: null, pausedExecutionMs: 0 },
+      // The ordinary-question surface of this run, deliberately SEPARATE from the
+      // permission block: a question can never grant access, so it must not be readable
+      // as an approval. `pending` is the one question set the worker is waiting on,
+      // `evidence` is the bounded settled trail, and `pausedExecutionMs` is the same
+      // account the approval wait keeps: time spent waiting for a human is not work.
+      question: { bridge: null, pending: null, evidence: [], pausedAt: null, pausedExecutionMs: 0 },
       // The activity monitor for this run. Created with the task, fed from the
       // runner's `onEvent` hook, and disposed with the task: its counters describe
       // THIS run and must not outlive it. It holds metadata only (counts,
@@ -1596,6 +1619,10 @@ export class JobEngine {
         state: parent.state,
         sourcePath: parent.sourcePath,
         executionWorkspacePath: parent.executionPath,
+        // A live record keeps its own exact paths and their digests, so the same
+        // proof a durable row carries is available without a projection.
+        sourcePathDigest: pathDigest(parent.sourcePath),
+        executionPathDigest: pathDigest(parent.executionPath),
         isolation: parent.effective?.worker?.isolation ?? null,
         conversation: parent.execution?.conversation ?? null,
       };
@@ -1606,6 +1633,8 @@ export class JobEngine {
         state: durable.state ?? null,
         sourcePath: durable.sourcePath ?? null,
         executionWorkspacePath: durable.executionWorkspacePath ?? null,
+        sourcePathDigest: durable.sourcePathDigest ?? null,
+        executionPathDigest: durable.executionPathDigest ?? null,
         isolation: durable.isolation ?? null,
         conversation: durable.execution?.conversation ?? null,
       };
@@ -1731,17 +1760,23 @@ export class JobEngine {
         SESSION_CODES.continuationState, typeof state === 'string' ? state : 'no recorded end state');
     }
     // Paths are proof, not a hint: a value written through a projection that rewrote it
-    // (a mask) cannot say which directory it named, so it is refused exactly like a
-    // missing one. No path, connection or isolation value is ever a wildcard.
-    for (const [field, session] of [
-      ['sourcePath', SESSION_CODES.continuationWorkspaceMismatch],
-      ['executionWorkspacePath', SESSION_CODES.continuationUnavailable],
+    // (a mask) can no longer say which directory it named, so it has to be backed by the
+    // digest the same row recorded. Neither a path nor a digest is ever a wildcard, and a
+    // row that proves neither is refused exactly like one with no path at all. This is
+    // only reached for a path that REALLY was shortened: the redaction pattern itself is
+    // narrow (see `config/redact.js`), so an ordinary checkout such as this one keeps its
+    // readable path and is compared directly.
+    for (const [field, digestField, session] of [
+      ['sourcePath', 'sourcePathDigest', SESSION_CODES.continuationWorkspaceMismatch],
+      ['executionWorkspacePath', 'executionPathDigest', SESSION_CODES.continuationUnavailable],
     ]) {
-      if (typeof row[field] !== 'string' || row[field].trim() === '' || recordedPathIsMasked(row[field])) {
+      const value = row[field];
+      if (typeof value !== 'string' || value.trim() === ''
+        || (recordedPathIsMasked(value) && !isPathDigest(row[digestField]))) {
         throw refuse('the named task has no reliably recorded path, so its conversation cannot be continued', session, `unusable recorded ${field}`);
       }
     }
-    if (!samePath(row.sourcePath, sourcePath)) {
+    if (!recordedDirectoryIs({ path: row.sourcePath, digest: row.sourcePathDigest }, sourcePath)) {
       throw refuse('the named task belongs to another source repository, so its conversation was not continued',
         SESSION_CODES.continuationWorkspaceMismatch, 'different source repository');
     }
@@ -1763,11 +1798,11 @@ export class JobEngine {
         SESSION_CODES.continuationUnavailable, 'no recorded session');
     }
     if (typeof identity.executionPath !== 'string' || identity.executionPath.trim() === ''
-      || recordedPathIsMasked(identity.executionPath)) {
+      || (recordedPathIsMasked(identity.executionPath) && !isPathDigest(identity.executionPathDigest))) {
       throw refuse('the named task has no usable execution-path identity, so its conversation cannot be continued',
         SESSION_CODES.continuationUnavailable, 'unusable recorded execution path');
     }
-    if (!samePath(identity.sourcePath, sourcePath)) {
+    if (!recordedDirectoryIs({ path: identity.sourcePath, digest: identity.sourcePathDigest }, sourcePath)) {
       throw refuse('the named task belongs to another source repository, so its conversation was not continued',
         SESSION_CODES.continuationWorkspaceMismatch, 'identity source repository differs');
     }
@@ -1780,11 +1815,27 @@ export class JobEngine {
     // is masked cannot say which directory that was, and one that names a different
     // execution directory than the identity resolves is another directory's thread —
     // the Workspace id alone is not proof, so the Session is never resolved for either.
-    if (recordedPathIsMasked(conversation.workspacePath) || !samePath(conversation.workspacePath, identity.executionPath)) {
+    //
+    // The conversation lives in the ROW, so the digest it may fall back on is the row's
+    // own execution digest: that digest is the digest of the same directory this path
+    // was written for, so agreement here is a comparison of one fact recorded twice, not
+    // a borrowed proof.
+    const recordedConversation = {
+      path: conversation.workspacePath,
+      digest: row.executionPathDigest,
+    };
+    if (!recordedDirectoryIs(recordedConversation, identity.executionPath)) {
       throw refuse('the recorded conversation path does not match its execution directory',
         SESSION_CODES.continuationUnavailable, 'conversation workspace path differs');
     }
-    if (!samePath(identity.executionPath, row.executionWorkspacePath)) {
+    // The identity's execution directory and the snapshot's must be one directory. The
+    // two documents are written from the same live value, so their digests are the
+    // second proof for a path either projection may have shortened — and two digests
+    // that disagree are a real disagreement, refused like two readable paths that differ.
+    if (!sameRecordedDirectory(
+      { path: identity.executionPath, digest: identity.executionPathDigest },
+      { path: row.executionWorkspacePath, digest: row.executionPathDigest },
+    )) {
       throw refuse('the recorded conversation identity does not match the named task',
         SESSION_CODES.continuationUnavailable, 'identity execution path differs');
     }
@@ -2078,6 +2129,83 @@ export class JobEngine {
   }
 
   /**
+   * Create the ordinary-question bridge for one task, or null when the deployment
+   * cannot offer one.
+   *
+   * The factory is the same shape as the permission factory: the engine owns the task
+   * lifecycle, so it hands the bridge the two observer hooks that keep the task view and
+   * the durable record honest. A deployment without the factory simply cannot surface
+   * questions, which is the safe default.
+   * @param {object} task - the running task.
+   * @returns {object | null} a bridge to arm, or null when unavailable.
+   */
+  createQuestionBridge(task) {
+    const factory = this.deps?.questionBridge;
+    if (typeof factory !== 'function') return null;
+    let bridge;
+    try {
+      bridge = factory({
+        taskId: task.taskId,
+        connectionId: task.connectionId,
+        onPending: (view) => this.onQuestionPending(task, view),
+        onSettled: (entry) => this.onQuestionSettled(task, entry),
+      });
+    } catch (error) {
+      this.deps?.logger?.warn?.('dsh-delegate: the question bridge could not be created', String(error?.code ?? ''));
+      return null;
+    }
+    if (bridge === null || bridge === undefined || typeof bridge !== 'object'
+      || typeof bridge.arm !== 'function' || typeof bridge.answer !== 'function') {
+      return null;
+    }
+    return bridge;
+  }
+
+  /**
+   * Record one question set the worker is now waiting on.
+   *
+   * The task stays `running` and only its PHASE changes to `awaiting-question`, so
+   * nothing that reads the state contract learns a new lifecycle value. The reason an
+   * observation reports is `question` — immediately, not after a silence threshold.
+   * @param {object} task - the running task.
+   * @param {object} view - the bridge's bounded pending view.
+   * @returns {void}
+   */
+  onQuestionPending(task, view) {
+    if (TERMINAL.has(task.state)) return;
+    task.question.pending = view;
+    task.question.pausedAt = Date.now();
+    if (task.state === TASK_STATES.running) task.phase = PHASE_AWAITING_QUESTION;
+    this.checkpointHistory(task);
+  }
+
+  /**
+   * Record one settled question set and account for the time spent waiting.
+   * @param {object} task - the task the question belonged to.
+   * @param {object} entry - the bridge's bounded settled view.
+   * @returns {void}
+   */
+  onQuestionSettled(task, entry) {
+    if (task.question.pending !== null && entry?.requestId === task.question.pending.requestId) {
+      task.question.pending = null;
+    }
+    if (task.question.pausedAt !== null) {
+      task.question.pausedExecutionMs += Math.max(0, Date.now() - task.question.pausedAt);
+      task.question.pausedAt = null;
+    }
+    if (entry !== null && entry !== undefined) {
+      task.question.evidence.push(entry);
+      if (task.question.evidence.length > 8) task.question.evidence.shift();
+    }
+    // Back to execution, never to a new state: an answered question and an abandoned one
+    // both leave the task `running` until the run itself reaches an outcome.
+    if (task.state === TASK_STATES.running && task.phase === PHASE_AWAITING_QUESTION) {
+      task.phase = PHASE_EXECUTE;
+    }
+    this.checkpointHistory(task);
+  }
+
+  /**
    * Record one request the worker is now waiting on.
    *
    * The task state stays `running` and only its PHASE changes, so nothing that
@@ -2276,6 +2404,66 @@ export class JobEngine {
       throw error;
     }
     return { task: this.view(task), permission: settled, hostAcceptance: null };
+  }
+
+  /**
+   * Answer one pending QUESTION for one task.
+   *
+   * The checks are the permission decision's, in the same order, because the identity
+   * rule is the same: a task this caller cannot prove is answered as absent, a sentinel
+   * task has no pending question, and the authorization is re-checked at the answer so
+   * a switch turned off or a revoked grant cannot be bypassed by answering late.
+   *
+   * What is DIFFERENT is what the answer can do: nothing here grants access. The bridge
+   * validates the batch against the questions the worker actually asked and settles the
+   * paused tool call with the native answer shape. Any widening the worker then wants
+   * still goes through {@link decidePermission}.
+   * @param {object} request - `taskId`, `requestId`, `answers`, and the authenticated
+   *   `connectionId` (supplied by the plane, never by the caller's body).
+   * @returns {object} bounded result: `{ task, question, answer: receipt, hostAcceptance: null }`.
+   * @throws {JobError} on any refusal.
+   */
+  decideQuestion(request) {
+    const connectionId = typeof request?.connectionId === 'string' ? request.connectionId : null;
+    if (connectionId === null) {
+      throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', {});
+    }
+    const taskId = typeof request?.taskId === 'string' ? request.taskId.trim() : '';
+    if (taskId === '') {
+      throw new JobError(QUESTION_CODES.questionNotFound, 'taskId is required', { field: 'taskId' });
+    }
+    const task = this.tasks.get(taskId);
+    if (task === undefined || task.connectionId !== connectionId) {
+      throw new JobError(JOB_CODES.taskNotFound, 'no such task for this connection', { taskId });
+    }
+    if (TERMINAL.has(task.state)) {
+      throw new JobError(QUESTION_CODES.questionSettled,
+        'this task has already ended; its pending question is history only', { taskId, state: task.state });
+    }
+    if (this.posture().authorized !== true) {
+      throw new JobError(JOB_CODES.notAuthorized, 'delegation is no longer authorized, so no answer may be applied', {});
+    }
+    this.assertLive(task, 'question-decide');
+    const bridge = task.question?.bridge ?? null;
+    if (bridge === null || bridge === undefined || typeof bridge.decide !== 'function') {
+      throw new JobError(QUESTION_CODES.notPending, 'this task has no pending question', { taskId });
+    }
+    let receipt;
+    try {
+      receipt = bridge.decide({ requestId: request?.requestId, answers: request?.answers });
+    } catch (error) {
+      if (error instanceof QuestionError) {
+        throw new JobError(error.code, error.message, error.details);
+      }
+      throw error;
+    }
+    return {
+      task: this.view(task),
+      question: task.question.pending === null ? this.questionView(task) : redactDeep(task.question.pending),
+      answer: receipt,
+      // Explicit: answering a question is never an approval of anything.
+      hostAcceptance: null,
+    };
   }
 
   /**
@@ -2659,6 +2847,53 @@ export class JobEngine {
   }
 
   /**
+   * Stop every outstanding QUESTION of one task and disarm its bridge.
+   *
+   * Same lifecycle as {@link releasePermissionBridge} and called from the same paths,
+   * for the same reason: a worker paused on a question must be released with a native
+   * refusal when the run is cancelled, switched off, revoked or disposed, instead of
+   * waiting for an answer nobody will give.
+   * @param {object} task - task record.
+   * @param {string} [cause] - `stop` (default) or `dispose`.
+   * @returns {void}
+   */
+  releaseQuestionBridge(task, cause = 'stop') {
+    const bridge = task.question?.bridge ?? null;
+    if (bridge === null || bridge === undefined) return;
+    try {
+      if (cause === 'dispose') bridge.dispose?.();
+      else bridge.stop?.();
+    } catch (error) {
+      this.deps?.logger?.warn?.('dsh-delegate: the question bridge could not be stopped', String(error?.code ?? ''));
+    }
+    if (task.question.pending !== null) task.question.pending = null;
+    task.question.pausedAt = null;
+    if (cause === 'dispose') task.question.bridge = null;
+  }
+
+  /**
+   * The bounded, public QUESTION block of one task.
+   *
+   * It is separate from {@link permissionView} on purpose and says so: `grantsAccess`
+   * is always false, so no reader can mistake an answered question for an authorization.
+   * `pending` carries the questions actually asked — text, options, and whether the
+   * caller declared an intent — and never a reasoning stream or transcript.
+   * @param {object} task - task record.
+   * @returns {object} bounded question view.
+   */
+  questionView(task) {
+    const pending = task.question?.pending ?? null;
+    return {
+      bridged: task.question?.bridge !== null && task.question?.bridge !== undefined,
+      waiting: pending !== null,
+      pending: pending === null ? null : redactDeep(pending),
+      evidence: (task.question?.evidence ?? []).map((entry) => redactDeep(entry)),
+      pausedExecutionMs: task.question?.pausedExecutionMs ?? 0,
+      grantsAccess: false,
+    };
+  }
+
+  /**
    * The bounded, public permission block of one task.
    *
    * `pending` is the request the commander has to decide (or `null`), `evidence` is
@@ -2705,6 +2940,7 @@ export class JobEngine {
     // `releasePermissionBridge(task, 'dispose')` is idempotent, so disposing here
     // does not double-settle.
     this.releasePermissionBridge(task, reason === 'dispose' ? 'dispose' : 'stop');
+    this.releaseQuestionBridge(task, reason === 'dispose' ? 'dispose' : 'stop');
     task.cancelRequested = true;
     task.cancelledBy = task.cancelledBy ?? reason;
     try {
@@ -2761,6 +2997,7 @@ export class JobEngine {
     // Admission never created an executor, so any bridge it did create (it is
     // created just before the runner call, so normally none) is disposed here too.
     this.releasePermissionBridge(task, 'dispose');
+    this.releaseQuestionBridge(task, 'dispose');
     task.endedAt = task.endedAt ?? Date.now();
     // A preflight that ran out of budget is a timeout, not a cancellation: it is
     // the same budget the run itself would have failed on, and reporting it as
@@ -2930,6 +3167,11 @@ export class JobEngine {
       // the run keeps the fail-closed `never` stance and nothing about it changes.
       const bridge = this.createPermissionBridge(task);
       task.permission.bridge = bridge;
+      // The question bridge is its own surface, created the same way and for the same
+      // reason: the runner arms it in the run's setup so the native answerer exists
+      // before the prompt, and the engine records the wait here.
+      const questionBridge = this.createQuestionBridge(task);
+      task.question.bridge = questionBridge;
       // `started` means "this task called the runner", not "the executor is
       // running": placement resolves before the runner sees an Agent, so the task
       // is handed over in `before-create` and only the executor's own events
@@ -2961,6 +3203,10 @@ export class JobEngine {
         // run's setup, scanned by the engine before it is offered here, and
         // disposed when the run ends. `null` keeps the deterministic `never` stance.
         ...(bridge === null ? {} : { permissionBridge: bridge }),
+        // The ordinary-question answerer for THIS task's own Agent. Independent of the
+        // approval bridge: a `never` approval stance still lets the worker ask a
+        // question, and answering one grants nothing.
+        ...(questionBridge === null ? {} : { questionBridge }),
         configureDelegatedSession: this.deps.configureDelegatedSession,
         policyServices: this.deps.policyServices,
         // The engine is the authority for "may this chain be joined": a parent it
@@ -3444,6 +3690,13 @@ export class JobEngine {
   settleReason(task) {
     const terminal = terminalReason(task);
     if (terminal !== null) return terminal;
+    // A QUESTION outranks silence for the same reason a permission does, and it is the
+    // defect this reason exists to remove: a worker waiting for a human answer used to
+    // be reported only when the ten-minute silence threshold fired, so the commander
+    // learned about the question long after the worker had asked it.
+    if (task?.question?.pending !== null && task?.question?.pending !== undefined) {
+      return OBSERVE_TASK_REASONS.question;
+    }
     if (task?.permission?.pending !== null && task?.permission?.pending !== undefined) {
       return OBSERVE_TASK_REASONS.permission;
     }
@@ -3502,6 +3755,16 @@ export class JobEngine {
       reason,
       // The full, unshortened redacted request on the ONE reason that needs it.
       permission: reason === OBSERVE_TASK_REASONS.permission ? pending : null,
+      // The questions the worker actually asked, on the one reason that needs them.
+      // Carried here rather than only inside the task summary so a waiting host gets the
+      // question, its options and its detail in ONE answer — the same shape the
+      // permission reason uses, and for the same reason: a commander that had to read
+      // the task first would spend a round trip before it could answer.
+      question: reason === OBSERVE_TASK_REASONS.question
+        ? (task?.question?.pending === null || task?.question?.pending === undefined
+          ? null
+          : redactDeep(task.question.pending))
+        : null,
       // The typed, bounded diagnostic for a repeated-failure reminder. It is the only
       // thing that distinguishes that reminder from an ordinary silence report, whose
       // own diagnostic is `selfCheck`.
@@ -3605,6 +3868,7 @@ export class JobEngine {
     // (the worker's paused tool call resumes `unavailable`) and the bridge can never
     // answer a request that outlived the run it belonged to.
     this.releasePermissionBridge(task, 'dispose');
+    this.releaseQuestionBridge(task, 'dispose');
     // The monitor is stopped BEFORE the record is persisted, so no observation can
     // still be waiting on a run that has already ended. The summary survives on the
     // task, so the stored view still says how much activity there was.
@@ -3696,6 +3960,7 @@ export class JobEngine {
     let timer = null;
     try {
       const view = this.view(task);
+      this.attachContinuationProof(view, task);
       const bounded = new Promise((resolvePromise, rejectPromise) => {
         timer = setTimeout(() => {
           rejectPromise(new JobError(JOB_CODES.historyFailed, 'the job history write exceeded its time budget', {
@@ -3722,6 +3987,38 @@ export class JobEngine {
     } finally {
       if (timer !== null) clearTimeout(timer);
     }
+  }
+
+  /**
+   * Put the verifiable continuation identity beside the two display paths.
+   *
+   * The stored record needs BOTH: the readable path an operator recognises, and a
+   * proof that survives the projection it is written through. The digests are opaque
+   * to redaction, so a row whose path was shortened still proves which directory it
+   * named — and a row whose digest is absent proves nothing, which is what a follow-up
+   * must refuse.
+   *
+   * The digests are taken from the identity {@link rememberConversation} actually
+   * wrote when that ran for the same placement, so the two durable documents cannot
+   * record two different identities for one task. Otherwise they are derived from the
+   * task's own live paths.
+   * @param {object} view - the public view about to be stored.
+   * @param {object} task - terminal task record.
+   * @returns {void}
+   */
+  attachContinuationProof(view, task) {
+    if (view === null || typeof view !== 'object') return;
+    const placement = task.execution?.conversation ?? null;
+    const written = task.continuationIdentityWritten ?? null;
+    const usable = written !== null && placement !== null
+      && written.workspaceId === (placement.workspaceId ?? '')
+      && written.sessionId === (placement.sessionId ?? '');
+    const identity = usable ? written : continuationIdentityOf(task, placement, task.effective?.worker?.isolation ?? null);
+    if (identity === null) return;
+    view.sourcePathDigest = identity.sourcePathDigest;
+    view.executionPathDigest = identity.executionPathDigest;
+    view.workspaceId = identity.workspaceId;
+    view.sessionId = identity.sessionId;
   }
 
   /**
@@ -4056,6 +4353,12 @@ export class JobEngine {
     const placement = task.execution?.conversation ?? null;
     if (store === null || store === undefined || placement === null) return;
     const worktree = task.worktree === null || task.worktree === undefined ? null : task.worktree;
+    // The canonical identity, computed once here and reused by the durable history row
+    // (see {@link persistHistory}): the paths as one canonical spelling plus the digest
+    // of each, so a later follow-up compares a verifiable identity instead of relying on
+    // a display string that a projection may have shortened.
+    const identity = continuationIdentityOf(task, placement, task.effective?.worker?.isolation ?? null);
+    task.continuationIdentityWritten = identity;
     try {
       const saved = await rememberSession(store, {
         workspaceId: placement.workspaceId,
@@ -4277,6 +4580,11 @@ export class JobEngine {
       sourcePath: task.sourcePath,
       workspacePath: task.executionPath ?? task.sourcePath,
       executionWorkspacePath: task.executionPath,
+      // The verifiable half of the same identity (a digest of each canonical path, plus
+      // the DSH Workspace/Session the run drove) is attached by
+      // {@link attachContinuationProof} when the view is STORED. It is not part of the
+      // live projection: a reader of a running task does not need it, and one place
+      // that decides it cannot disagree with another.
       isolation: effective === null ? null : effective.worker.isolation,
       connectionId: task.connectionId,
       grantId: task.grantId,
@@ -4336,6 +4644,11 @@ export class JobEngine {
       // the standing mode the decision did NOT change. Present on every task, so a
       // reader never has to infer "no bridge" from a missing field.
       permission: this.permissionView(task),
+      // The ordinary-question surface: the questions the worker is actually waiting on,
+      // the settled trail, and how much of the execution budget went to waiting. It is
+      // a separate block because answering a question grants nothing — `grantsAccess`
+      // is stated as `false` rather than left to be inferred.
+      question: this.questionView(task),
       // The approval stance the run installed and read back (`never` without a
       // bridge, `ask` with an armed one), recorded from the run itself.
       approval: task.execution?.approval ?? null,
@@ -4403,12 +4716,14 @@ export class JobEngine {
         // A terminal task may still hold a bridge if its own teardown has not run
         // yet; disposing is idempotent and cannot answer anything after this point.
         this.releasePermissionBridge(task, 'dispose');
+        this.releaseQuestionBridge(task, 'dispose');
         continue;
       }
       this.abortTask(task, 'dispose');
       // Teardown is not a cancel: the answerer goes away, so the worker's paused
       // call must be told the channel is gone rather than that it was withdrawn.
       this.releasePermissionBridge(task, 'dispose');
+      this.releaseQuestionBridge(task, 'dispose');
       count += 1;
     }
     await Promise.race([
@@ -4482,31 +4797,6 @@ function samePath(a, b) {
     return process.platform === 'win32' ? trimmed.toLowerCase() : trimmed;
   };
   return normalize(a) === normalize(b);
-}
-
-/**
- * The placeholder a redacted path segment is rewritten to.
- */
-const PATH_MASK_SEGMENT = 'masks-user-profile-segment';
-
-/**
- * Whether a persisted path cannot prove which directory it names.
- *
- * Durable documents are projected through redaction, which replaces an
- * account-identifying directory name with the placeholder above. A path carrying that
- * placeholder is a shortened spelling: nothing can prove which directory stood there,
- * so it is never compared into a match and is treated exactly like a missing path — the
- * mask only ever causes a refusal, it never stands for equality. A real directory whose
- * name merely *starts with* the placeholder is still its own directory, which is why the
- * test is for the whole segment.
- * @param {unknown} value - candidate path.
- * @returns {boolean} true when the path was rewritten and can only be refused.
- */
-function recordedPathIsMasked(value) {
-  if (typeof value !== 'string') return false;
-  return value
-    .split(/[\\/]+/)
-    .some((part) => part.trim() === PATH_MASK_SEGMENT);
 }
 
 /**

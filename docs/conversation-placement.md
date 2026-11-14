@@ -200,13 +200,50 @@ cancelled run that never drove a conversation, and a record naming another
 repository are all refusals. None of them falls back to "the map says the thread
 is there, so it must be yours".
 
-**Masked paths are a refusal, never a wildcard.** The documents are projected
-through redaction, which rewrites an account-identifying directory segment
-(`masks-user-profile-segment`). A path carrying that segment cannot prove which
-directory it names, so it is treated exactly like a missing path: it never equals
-anything, it is never a pattern that matches a live path, and the continuation is
-refused. Nothing in this path treats a mask as equality, and that holds for both
-documents and for the live re-check.
+**Path identity: the operator's spelling plus a canonical digest.** Each stored row
+carries its paths in the operator's real spelling — that value can be handed back to the
+runtime as a directory to open, so it is never a comparison key — and, beside each, a
+`sha256:` digest of the canonical key. Two facts, and every fact a record states must
+agree before it proves anything:
+
+- two readable canonical paths are compared exactly. The canonical rule is the session
+  layer's own (`sessionPathKey`): trailing separators stripped, case folded on Windows
+  at every level, case kept on POSIX. Slash direction is *not* unified, exactly as that
+  layer does not unify it, so this module never calls two directories equal that the
+  harness treats as different;
+- when redaction shortened one of them, its **digest** is compared instead — a digest is
+  opaque to redaction, so it survives the same projection the path did not;
+- a record that states both a path and a digest must have them name the SAME directory.
+  A digest that contradicts the readable path beside it is refused **as a whole**:
+  neither half is believed. (An earlier version let the readable path win that case,
+  which admitted a row whose own two proofs disagreed.)
+- a side with no readable path and no digest proves nothing and is refused.
+
+**A digest is a proof, not a reverser.** It can confirm that a recorded directory is
+this directory; it can never reconstruct the original spelling. So when the identity
+store itself is masked there is no trustworthy original to open, and the follow-up is
+refused — the mask is never substituted as a directory. A legacy row written before
+digests existed still continues when its path is readable, and is refused when it is not.
+
+`src/jobs/continuation-identity.js` is the single definition; the live re-check in
+`assertAdmissible` and the session layer's `recordedSessionPathIs` both delegate to it,
+so no second comparison rule exists.
+
+**Masked paths are a refusal, never a wildcard — and masking is narrow.** The durable
+documents are projected through redaction, which rewrites a per-user profile directory
+under a *temporary root* (`…/Temp/dsh-VG1MVl/…`, `~/.cache/dsh-SoexNz/…`) to
+`masks-user-profile-segment`. That placeholder is never a pattern, never equals
+anything, and a path carrying it **without a digest** is refused exactly like a missing
+one.
+
+Redaction keys on the location, not on the shape of a name, because a shape-based rule
+was the defect: an earlier pattern masked every segment starting `dsh-`/`profile-` plus
+six alphanumerics, which is also the shape of an ordinary repository — this product's
+own checkout `dsh-delegate` and its installed package `dsh-taskbridge` were both
+rewritten, so a cancelled task could not be continued after a restart. A name outside a
+temporary root (`dsh-delegate`, `dsh-taskbridge`, `dsh-development`, `profile-settings`,
+`dsh-abc123`, `v2-tools`) now keeps its path; a real per-profile temporary directory is
+still masked. See `docs/redaction-contract.md`.
 
 **Equal Workspace ids are not proof of equal placement.** A recorded conversation
 must name a real Workspace *and* a directory this run resolved, and a live parent

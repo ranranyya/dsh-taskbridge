@@ -42,6 +42,7 @@ import {
   discoveryPin,
   hostRuntimeKind,
   inspectCodexBoundary,
+  isKnownPriorTemplate,
   isNodeExecutableName,
   isOwnedEntryScript,
   isOwnedStaleEntry,
@@ -67,7 +68,37 @@ import { USER_PLANE_PREFIX, wrapUserPlaneRoutes } from '../src/http/user-plane.j
 import { PREFLIGHT_ISOLATIONS, PREFLIGHT_REASONS } from '../src/workspace/preflight.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const DELIVERABLE_VERSION = '1.4.2';
+for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} managed rules are upgradeable, while user edits remain owned by the user`, () => {
+  const original = readFileSync(join(ROOT, `tests/fixtures/codex-agent-${version}.toml`), 'utf8');
+  const lf = original.replace(/\r\n/g, '\n');
+  for (const text of [lf, lf.replace(/\n/g, '\r\n')]) {
+    assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === version && entry.sha256 === digest(text)), true);
+    assert.equal(isKnownPriorTemplate(text), true);
+    assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
+  }
+});
+const DELIVERABLE_VERSION = '1.5.0';
+
+for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} companion upgrades to 1.5.0 without changing unrelated Codex settings`, async () => {
+  const fixture = codexHomeFixture();
+  const lf = readFileSync(join(ROOT, 'tests/fixtures/codex-agent-1.4.3-test.2.toml'), 'utf8').replace(/\r\n/g, '\n');
+  const prior = ending === 'CRLF' ? lf.replace(/\n/g, '\r\n') : lf;
+  const config = '# Existing operator settings\nmodel = "operator-model"\n';
+  try {
+    mkdirSync(dirname(fixture.agentPath), { recursive: true });
+    writeFileSync(fixture.agentPath, prior);
+    writeFileSync(fixture.configPath, config);
+    const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const refreshed = await seam.refreshKnownAgent();
+    assert.deepEqual(refreshed.changed, ['agent']);
+    assert.deepEqual(refreshed.refused, []);
+    assert.equal(refreshed.status.agent.state, 'installed');
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.5\.0"$/mu);
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
+  } finally {
+    fixture.cleanup();
+  }
+});
 // The baseline the current release upgrades *from*, pinned rather than derived: an
 // expectation that followed `DELIVERABLE_VERSION` would assert nothing.
 const PREVIOUS_VERSION = '0.1.14';

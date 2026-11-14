@@ -1,7 +1,7 @@
 # dsh-taskbridge Codex companion — managed by the DSH TaskBridge plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "1.4.2"
+version = "1.5.0"
 
 name = "dsh-taskbridge"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-taskbridge MCP tools, then return evidence for Codex review."
@@ -120,6 +120,20 @@ DISPATCH (only for an explicitly assigned implementation task)
    raising it — when a wait ends you simply call it again on the same taskId.
    A shorter explicit `waitSeconds` is legal but is only for a one-off diagnostic the
    operator explicitly asked for; it is never the normal loop.
+5a0. FOUR DIFFERENT THINGS, never conflated.
+   - `wait-limit` — THIS call's own wait budget ran out and nothing changed. Wait again
+     on the same taskId. Not a result, not a stall, not a task event.
+   - An OUTER limit — your client handed the call back on its own tool/exec time limit.
+     The MCP observation did not end and the worker did not stop. Continue the SAME exec
+     cell and ask for the largest yield it supports (see 5d).
+   - `attention` — genuine inactivity: no real progress for the configured threshold
+     (ten minutes by default) while the task still runs. A question, not a verdict.
+   - The task's TOTAL execution timeout — the worker's own budget, which ends the run and
+     is reported as a terminal state. It is not `wait-limit`, not `attention` and not a
+     client-side event.
+   A real hard failure is worth ONE de-duplicated reminder to the host. An ordinary
+   single failing test inside the worker is the WORKER's job to diagnose and fix: it is
+   not a host event, and you must not resubmit, cancel or take over for it.
 5a. WHAT THE WAIT REASONS MEAN, and what you do next.
    - `heartbeat`: nothing to report. The wait expired with no news. You will normally
      never see this, because the tool re-issues internally. If you do see it, call
@@ -163,12 +177,66 @@ DISPATCH (only for an explicitly assigned implementation task)
        operation, the request still reported as pending, and you quote that request's
        exact `fingerprint`. Call `delegate_permission_decide` with the `taskId`, the
        `requestId`, a `decision` of `allow-once` or `reject`, that `fingerprint`, and a
-       short bounded `reason`. Then call `delegate_wait` on the SAME task.
+       short bounded `reason`. When your MCP channel supports it, ALSO pass
+       `waitAfterDecision: true`: the decision and the following wait then happen in ONE
+       call, so a following request does not cost a second tool call. The answer is the
+       same compact `delegate_wait` shape plus `decisionReceipt`; a NEW request comes
+       back in it, and the request you just decided is never re-asked. Read
+       `decisionReceipt` first. `applied: true` is claimed ONLY when the harness confirmed
+       the SAME task, the SAME request and the SAME operation: the decision is in force,
+       so keep it — even when this answer instead carries `reason: null` and a
+       `waitError` block, which means the DECISION SUCCEEDED and only the FOLLOWING WAIT
+       failed, was cancelled or was interrupted. In that case never send the decision
+       again, never cancel or reassign the task, and resume following the same taskId with
+       `delegate_wait`. `applied: null` with `confirmation: "unknown"` means nothing was
+       established — the call failed before the harness answered, or the answer
+       contradicted or lacked the evidence to confirm it (the refusal names which, under
+       `error.details.decisionReceipt`): read the task with `delegate_result` before
+       sending anything again, and never resend automatically. If your client does not
+       offer the flag, decide first and then call `delegate_wait` on the SAME task — the
+       decision alone does not resume your observation.
      - An invalid or stale decision grants nothing. If an allow is refused as stale or
        changed, re-read the CURRENT pending request and decide again safely. Never
        retry under broader settings, never widen the sandbox, and never silently
        enable anything to get past a refusal. An approval covers exactly one tool
        call; it is never host acceptance and never a standing sandbox grant.
+     - A `reject` reaches the WORKER with your reason. It is sent back into the same
+       agent as a note, so the worker can read WHY and adjust. Write the reason as a
+       statement of what to change ("the command was too long for the evidence bound,
+       shorten it and ask again", "that path is outside the authorised workspace, use
+       the source checkout"), never as a hidden instruction. The note is not a grant:
+       the call stays rejected, and a new attempt is decided on its own.
+   - `question`: the worker asked YOU a question and is paused until you answer.
+     This is NOT a permission request and grants nothing. `question.questions[]` gives
+     each question's `id`, `question`, optional `header`/`detail`, its `options`
+     (each with a `label`) and whether it is `multiSelect`; `question.grantsAccess` is
+     always false. Answer with `delegate_question_answer({ taskId, requestId, answers })`,
+     where `answers` has one entry per question naming that question's `id` exactly
+     once, with `selected` (labels the question actually offered) and/or non-empty
+     `custom` text; a question with no options needs `custom`. Every asked question
+     must be answered, a single-select question takes at most one offered label, and an unknown
+     id or an unoffered label is refused while the question stays pending. When your
+     channel supports it, pass `waitAfterAnswer: true` to answer and keep following the
+     SAME task in one call: the answer is the compact wait shape plus `answerReceipt`.
+     If the answer IS applied but the following wait fails, the call still succeeds with
+     `answerReceipt.applied: true`, `reason: null` and a `waitError` — the answer stands
+     and must not be resent. A question whose `intent` is `approval` is REFUSED on this
+     channel by design: a permission decision must go through
+     `delegate_permission_decide`, so tell the worker through its next step or reject
+     the tool call; never treat a question answer as a way to grant access. Answering a
+     `plan-review` question is information only and grants nothing either.
+     - A question is published WHOLE or refused. If `delegate_wait` reports
+       `questionAnswerable: false`, `questionsOmitted: true`, `QUESTION_PAYLOAD_REDACTED`,
+       or `QUESTION_PAYLOAD_TOO_LARGE` (or a task view has no `question` block while the phase
+       is `awaiting-question`), the worker's question set was too large to carry intact and
+       was refused BEFORE it reached you: you never saw a shortened version of it, and you
+       must not answer it. Applied receipts still stand; do not resend them. Tell the worker
+       in its next step to ask a smaller question (fewer questions, or
+       shorter detail), or reject that tool call. Never invent questions or ids to work
+       around it.
+     - A question also has a FINITE life (ten minutes by default). If it expires the worker
+       gets `ASK_TIMED_OUT` and continues on its own; that is not a failure you must
+       unblock, and an expired `requestId` can never be answered afterwards.
    - `ready`: execution finished and the task now waits for HOST REVIEW. That is not
      acceptance: the plugin never approves its own work. Call `delegate_result` ONCE
      for the same task to read the full evidence (diff, validation output, review
@@ -287,9 +355,10 @@ DISPATCH (only for an explicitly assigned implementation task)
      available yield is genuinely short and there is no automatic continuation, a long
      wait costs one resumed turn per yield window. In that case say so plainly to the
      operator once. Never invent an automatic wake-up, never claim the plugin will notify
-     you in the background, and never report a "background wait" that no interface
-     provides. Changing the operator's Codex configuration to work around it is also
-     outside your authority.
+     you in the background, never report a "background wait" that no interface
+     provides, and never promise the plugin will wake you or achieve zero wake-ups
+     across clients — no such interface exists. Changing the operator's Codex
+     configuration to work around it is also outside your authority.
    - Asking for a long yield is a request, not a guarantee; the host may still return
      early — including for a permission request that arrives during the wait. When it
      does, resume the same cell as above; the plugin side did not fail.

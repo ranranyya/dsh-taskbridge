@@ -741,6 +741,9 @@ export const OBSERVE_REASONS = Object.freeze({
   heartbeat: 'heartbeat',
   attention: 'attention',
   permission: 'permission',
+  // The worker asked a human an ordinary question. It is its own reason because answering
+  // it grants nothing, and it must be reported at once rather than as silence.
+  question: 'question',
   ready: 'ready',
   failed: 'failed',
   cancelled: 'cancelled',
@@ -1210,6 +1213,13 @@ export class TaskMonitor {
 
         if (this.task?.permission?.pending !== null && this.task?.permission?.pending !== undefined) {
           return this.outcome(OBSERVE_REASONS.permission, activitySinceWait, at - startedAt, selfCheck);
+        }
+        if (this.task?.question?.pending !== null && this.task?.question?.pending !== undefined) {
+          // A question is checked with the same precedence as a permission (and AFTER it, so
+          // the one wait that can grant is reported first): the worker is paused on a human
+          // and the host must act now. The self-check above still runs, but it can never
+          // turn this into `attention`.
+          return this.outcome(OBSERVE_REASONS.question, activitySinceWait, at - startedAt, selfCheck);
         }
         // (3b) Repeated failures. Same reason as the silence report — it needs the
         // commander — but it carries its own typed diagnostic and is NOT gated on

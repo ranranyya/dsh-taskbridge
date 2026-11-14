@@ -573,6 +573,14 @@ function projectView(view, maxEntryBytes, options = {}) {
     sourcePath: path(view.sourcePath, ctx, 'sourcePath'),
     workspacePath: path(view.workspacePath, ctx, 'workspacePath'),
     executionWorkspacePath: path(view.executionWorkspacePath, ctx, 'executionWorkspacePath'),
+    // The verifiable continuation identity stored beside those paths. A digest is
+    // opaque to redaction, so a row whose path a projection shortened can still prove
+    // which directory it named; a row without one proves nothing and is refused by a
+    // follow-up. Nothing here is executable material or conversation content.
+    sourcePathDigest: digest(view.sourcePathDigest),
+    executionPathDigest: digest(view.executionPathDigest),
+    workspaceId: label(view.workspaceId),
+    sessionId: label(view.sessionId),
     isolation: knownValue(view.isolation, ['worktree', 'shared']),
     interruptedFrom: knownValue(view.interruptedFrom, ['pending', 'running']),
     // The connection identity is provenance: which external connection asked for
@@ -947,6 +955,37 @@ function permissionEntryView(value, ctx, field) {
         reusable: grant.reusable === true,
       },
     standingModeUnchanged: value.standingModeUnchanged === true,
+    // Whether the commander's rejection reason actually reached the worker, and — only when
+    // it did — the exact text. Stored because "the worker was told why" is a claim that must
+    // be checkable after a restart, and bounded so one long note cannot grow the record.
+    rejectionFeedback: rejectionFeedbackView(value.rejectionFeedback, ctx, `${field}.rejectionFeedback`),
+  };
+}
+
+/**
+ * Bounded projection of one rejection-feedback outcome.
+ *
+ * `delivered` and `reason` are kept VERBATIM (they are a closed vocabulary and the fact the
+ * record exists to state). `text` is kept only when delivery succeeded — a failed note has
+ * nothing to quote — and is bounded, because it is prose.
+ * @param {unknown} value - the delivered/not-delivered outcome.
+ * @param {object} ctx - cut context.
+ * @param {string} field - field label for a cut.
+ * @returns {object | null} bounded copy.
+ */
+function rejectionFeedbackView(value, ctx, field) {
+  if (!isPlainObject(value)) return null;
+  const delivered = value.delivered === true;
+  const quoted = delivered && typeof value.text === 'string' && value.text !== ''
+    ? text(value.text, ctx, field, MAX_MESSAGE_CHARS)
+    : null;
+  return {
+    delivered,
+    reason: label(value.reason),
+    requestId: label(value.requestId),
+    callId: label(value.callId),
+    messageId: label(value.messageId),
+    text: quoted,
   };
 }
 
@@ -1484,6 +1523,20 @@ function path(value, ctx = null, field = '') {
   if (value.length <= MAX_PATH_CHARS) return value;
   if (ctx !== null && field !== '') ctx.fields.add(field);
   return value.slice(0, MAX_PATH_CHARS);
+}
+
+/**
+ * A stored continuation digest, kept verbatim when well formed.
+ *
+ * A digest is fixed-length and opaque, so it is never shortened: a cut digest would
+ * compare unequal to every real directory and turn "provable" into "refused" without
+ * saying so. A value that is not a well-formed digest is dropped, which is the same
+ * as the row having none — the follow-up then refuses rather than guesses.
+ * @param {unknown} value - candidate digest.
+ * @returns {string | null} the digest, or null.
+ */
+function digest(value) {
+  return typeof value === 'string' && /^sha256:[0-9a-f]{64}$/u.test(value) ? value : null;
 }
 
 /**

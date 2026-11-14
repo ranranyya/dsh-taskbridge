@@ -101,10 +101,29 @@ function observation(reason, overrides = {}) {
     task: summary(),
     reason,
     permission: reason === 'permission' ? pending() : null,
+    // A `question` observation carries the whole pending question, exactly as the engine
+    // publishes it — the wait answer must be answerable from this one reply.
+    question: reason === 'question' ? pendingQuestion() : null,
     activity: { toolCalls: 7 },
     selfCheck: { ok: true },
     wait: { waitMs: OBSERVE_WAIT_MS, waitedMs: OBSERVE_WAIT_MS, activitySinceWait: false },
     ...overrides,
+  };
+}
+
+/**
+ * One pending question set, shaped as the engine publishes it.
+ * @returns {object} pending question.
+ */
+function pendingQuestion() {
+  return {
+    requestId: 'question-task-wait-1-1',
+    taskId: 'task-wait-1',
+    sessionId: 'session-wait',
+    callId: 'call-1',
+    state: 'pending',
+    questions: [{ id: 'q1', question: 'Which?', header: null, detail: null, options: [{ label: 'a', description: null }], multiSelect: false, intent: null }],
+    grantsAccess: false,
   };
 }
 
@@ -1260,8 +1279,9 @@ test('delegate_result keeps its own schema and behaviour beside the new tool', a
   const listed = await server.handle({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const names = listed.result.tools.map((tool) => tool.name).sort();
   assert.deepEqual(names, [
-    'delegate_cancel', 'delegate_permission_decide', 'delegate_preflight',
-    'delegate_result', 'delegate_review', 'delegate_status', 'delegate_submit', 'delegate_wait',
+    'delegate_cancel', 'delegate_metrics', 'delegate_permission_decide', 'delegate_preflight',
+    'delegate_question_answer', 'delegate_result', 'delegate_review', 'delegate_status',
+    'delegate_submit', 'delegate_wait',
   ]);
   const result = listed.result.tools.find((tool) => tool.name === 'delegate_result');
   // The result read keeps its own closed schema; the only additions are the OPTIONAL

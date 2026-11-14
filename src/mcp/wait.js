@@ -40,6 +40,7 @@ import {
   OBSERVE_WAIT_MS,
   WAIT_LIMIT_REASON,
   isPermissionDecidable,
+  isQuestionAnswerable,
 } from './server.js';
 import { REPEATED_FAILURE_KIND } from '../jobs/diagnostics.js';
 
@@ -107,6 +108,10 @@ const TERMINAL_REASONS = new Set(['ready', 'failed', 'cancelled', 'interrupted']
 /**
  * Reasons that ask the host to DO something about the task.
  *
+ * `question` is here for the same reason `permission` is: the worker is paused and only
+ * the host can release it by answering. Leaving it out would report a question as a
+ * non-actionable answer, which is exactly the confusion the acceptance run hit.
+ *
  * `wait-limit` is deliberately absent: it says only that this call's own budget ran
  * out while nothing changed, so the correct next action is to wait again — not to
  * review, decide, resubmit or cancel. Reporting it as actionable would invite a host
@@ -115,7 +120,9 @@ const TERMINAL_REASONS = new Set(['ready', 'failed', 'cancelled', 'interrupted']
  * that a host will or will not surface it to its own model.
  * @type {ReadonlySet<string>}
  */
-const ACTIONABLE_ANSWER_REASONS = new Set(['attention', 'permission', 'ready', 'failed', 'cancelled', 'interrupted']);
+const ACTIONABLE_ANSWER_REASONS = new Set([
+  'attention', 'permission', 'question', 'ready', 'failed', 'cancelled', 'interrupted',
+]);
 
 /**
  * Task states a live run can be in.
@@ -183,9 +190,33 @@ export function compactTask(task) {
   }
   if (task.reviewPersistence !== undefined) out.reviewPersistence = task.reviewPersistence;
   // Activity and self-check are small, bounded summaries the engine produced for
-  // exactly this purpose; they are carried whole rather than re-projected here.
-  if (task.activity !== undefined) out.activity = task.activity;
-  if (task.selfCheck !== undefined) out.selfCheck = task.selfCheck;
+  // exactly this purpose; they are carried whole rather than re-projected here — EXCEPT
+  // the fields a wait must never carry whatever depth they arrive at. An engine (or a
+  // fixture) that nested a diff or execution prose inside `activity` would otherwise put
+  // evidence on the one answer that is supposed to be cheap, so evidence keys are
+  // dropped at any depth.
+  if (task.activity !== undefined) out.activity = stripEvidenceFields(task.activity);
+  if (task.selfCheck !== undefined) out.selfCheck = stripEvidenceFields(task.selfCheck);
+  return out;
+}
+
+/** Field names that are evidence, never a wait fact. Dropped wherever they appear. */
+const EVIDENCE_FIELDS = Object.freeze(['diff', 'patchText', 'execution', 'review']);
+
+/**
+ * Copy a value with every evidence field removed, at any depth.
+ * @param {unknown} value - value to copy.
+ * @param {number} [depth] - recursion guard.
+ * @returns {unknown} the copy without evidence fields.
+ */
+export function stripEvidenceFields(value, depth = 0) {
+  if (value === null || typeof value !== 'object' || depth > 6) return value;
+  if (Array.isArray(value)) return value.map((entry) => stripEvidenceFields(entry, depth + 1));
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (EVIDENCE_FIELDS.includes(key)) continue;
+    out[key] = stripEvidenceFields(item, depth + 1);
+  }
   return out;
 }
 
@@ -353,8 +384,30 @@ export function resolveInterruption(observation) {
  * this function started", so an injected clock is the only thing that decides how
  * much time a wait takes. A loop driven by a fake clock therefore measures its own
  * elapsed time from the wait's real start, which is what a test asserts on.
+ *
+ * `waitMetrics` is the minimal accounting seam (a "continue waiting after a decision"
+ * call must be able to say WHAT it waited for, HOW it returned and HOW MUCH it handed
+ * back). It is an injected callback rather than a field on the answer, because the
+ * count belongs to the CALL: when the loop throws, there is no answer to put it on. The
+ * callback is invoked exactly once, on every exit path (answer, refusal, cancellation),
+ * and receives only counts, durations and a reason label — never task content or a size
+ * this loop could not know before the answer was bounded and redacted.
+ *
+ * `skipPermission` is the ONE hook the post-decision continuation needs, and it is
+ * deliberately a predicate rather than a second loop: after `allow-once` the engine may
+ * still report the settled request until the paused native call resumes, and answering
+ * that back to the host would present the commander's own decision as a new question.
+ * When the predicate says the observation describes the request already decided, the loop
+ * keeps waiting — with the same observation bound, the same early-heartbeat floor and the
+ * same deadline as any other turn — so there is exactly ONE wait loop in this program.
+ *
+ * `skipQuestion` is the same rollover for an ANSWERED question: the just-answered set can
+ * still occupy the engine's slot for a moment. A DIFFERENT request id is never skipped, so
+ * a genuinely new question returns at once.
  * @param {object} options - `callExecution`, `taskId`, `waitMs` (deadline), `signal`,
- *   `observeWaitMs` (per-request bound), `now`, `sleep`.
+ *   `observeWaitMs` (per-request bound), `now`, `sleep`, optional `waitMetrics`
+ *   (`(summary) => void`), optional `correlation` facts to echo back, optional
+ *   `skipPermission` / `skipQuestion` (`(observation) => boolean`).
  * @returns {Promise<object>} the compact wait answer (without `ok`).
  */
 export async function waitForTask(options) {
@@ -365,11 +418,53 @@ export async function waitForTask(options) {
   const signal = options.signal;
   const now = options.now ?? (() => Date.now());
   const sleep = options.sleep ?? ((ms) => new Promise((resolvePromise) => { setTimeout(resolvePromise, ms); }));
+  const waitMetrics = typeof options.waitMetrics === 'function' ? options.waitMetrics : null;
+  const skipPermission = typeof options.skipPermission === 'function' ? options.skipPermission : null;
+  const skipQuestion = typeof options.skipQuestion === 'function' ? options.skipQuestion : null;
 
   const startedAt = now();
+
+  /** The reason the LAST answer carried, for the accounting summary. */
+  let returnedReason = null;
+  /** Set when the loop ends without producing a task answer (a refusal, or a cancel). */
+  let failureCode = null;
+
+  /**
+   * Report this wait's own accounting, exactly once, on every exit path.
+   * @param {string | null} endedReason - reason of the last answer, or null when none was produced.
+   * @returns {void}
+   */
+  const report = (endedReason) => {
+    if (waitMetrics === null) return;
+    const elapsedMs = Math.max(0, now() - startedAt);
+    // One flat shape, whether or not there is a correlation: `recordWait` reads
+    // `waitId`/`afterDecisionId`/`taskId`/`reason`/`durationMs` from here, so a plain wait
+    // and a post-decision wait are counted by exactly the same rule.
+    waitMetrics({
+      waitId: typeof options.correlation?.waitId === 'string' ? options.correlation.waitId : null,
+      afterDecisionId: typeof options.correlation?.afterDecisionId === 'string'
+        ? options.correlation.afterDecisionId
+        : null,
+      taskId: typeof taskId === 'string' ? taskId : null,
+      reason: endedReason,
+      returnReason: endedReason,
+      failureCode,
+      durationMs: elapsedMs,
+      observedMs,
+      observationRequests,
+      heartbeatsConsumed: heartbeats,
+      interruptedObservations: interruptions,
+      // Observations that described the request this call had already decided. Counted so
+      // the rollover is auditable; they are consumed internally, never surfaced.
+      settledRequestObservations: skipped,
+      waitReturns: endedReason === null ? 0 : 1,
+    });
+  };
   let observationRequests = 0;
   let heartbeats = 0;
   let interruptions = 0;
+  let skipped = 0;
+  let observedMs = 0;
   let lastObservation = null;
 
   /** Throw the local cancellation, so the caller sees a refusal and not an answer. */
@@ -381,73 +476,141 @@ export async function waitForTask(options) {
     throw error;
   };
 
-  for (;;) {
-    throwIfCancelled();
-    const remaining = deadlineMs - (now() - startedAt);
-    if (remaining <= 0) return answer(WAIT_LIMIT_REASON, lastObservation, { resolved: false });
-    // One bounded observation. It never overruns the caller's deadline, so the wait
-    // cannot answer later than it said it would.
-    const perRequest = Math.min(observeWaitMs, remaining);
-    observationRequests += 1;
-    let observation;
-    try {
-      observation = await callExecution('observe', { taskId, waitMs: perRequest }, { signal });
-    } catch (error) {
-      if (error?.code === 'MCP_REQUEST_CANCELLED') throw error;
-      // A refusal is the harness's own answer and is returned as such: an unknown
-      // task must read as "no such task", never as an invented completion or as a
-      // retry loop against a task that does not exist here.
-      return {
-        ...failureAnswer(error),
-        wait: metrics(0),
-      };
-    }
-    lastObservation = observation;
-    const reason = reasonOf(observation);
-    if (reason === 'interrupted') {
-      // An interrupted OBSERVATION is not an interrupted RUN. This branch returns
-      // IMMEDIATELY in every case — it never re-issues an observation in the same call.
-      //
-      // Re-issuing was the defect: when the observer itself is disposed (the engine was
-      // torn down, the wait seam broke, the request's own signal aborted) every
-      // re-issued observation came back `interrupted` at once, so one `delegate_wait`
-      // call became an unbounded burst of HTTP requests. Returning lets the HOST decide
-      // to wait again, which is one observation per call at worst.
-      //
-      // `resolveInterruption` reads the task record, so the answer is the real state:
-      // a live task is reported as `interrupted` and NOT terminal, a restart history as
-      // terminal, and a settled record as its real outcome (`ready`/`failed`/`cancelled`)
-      // so a completed run still reaches review.
-      interruptions += 1;
-      const resolved = resolveInterruption(observation);
-      return answer(resolved.reason, observation, {
-        resolved: true,
-        resolvedState: resolved.state,
-        terminal: resolved.terminal,
-        kind: resolved.kind,
-      });
-    }
-    if (CONTINUING_REASONS.has(reason)) {
-      heartbeats += 1;
-      // A NORMAL heartbeat has already waited out its own `waitMs` inside the engine,
-      // so nothing is slept here. This branch only fires for a heartbeat that came
-      // back EARLY (a fake engine, or an engine that answers at once): a per-
-      // observation floor keeps such a stream from becoming a request storm. The
-      // pause is a slice of that floor, never the remaining deadline — sleeping the
-      // remaining budget on the first early heartbeat would turn one observation into
-      // the whole wait.
-      const elapsed = now() - startedAt;
-      // A duration, not an instant: `nextDueOffset` used to be an absolute clock value
-      // and subtracting an elapsed duration from it produced a pause of
-      // (startedAt + 1s), which swallowed the whole deadline on the first heartbeat.
-      const nextDueOffset = observationRequests * EARLY_HEARTBEAT_INTERVAL_MS;
-      if (elapsed < nextDueOffset) {
-        const pause = Math.min(nextDueOffset - elapsed, remaining);
-        if (pause > 0) await sleep(pause);
+  /**
+   * Account for one observation's own waited time.
+   * @param {object | null | undefined} observation - observation answer.
+   * @returns {void}
+   */
+  const countObserved = (observation) => {
+    const waited = observation?.wait?.waitedMs;
+    if (Number.isFinite(waited) && waited > 0) observedMs += waited;
+  };
+
+  /**
+   * Emit one answer, measuring it exactly once, then report and return it.
+   *
+   * The measurement is of the ANSWER OBJECT (the data the host receives), serialized
+   * once — the envelope a client prints has no bearing on how much data was handed
+   * back, and counting it here keeps `returnedBytes` and the published `metrics` in
+   * agreement.
+   * @param {object} answerValue - the compact answer.
+   * @returns {object} the same answer.
+   */
+  const finish = (answerValue) => {
+    returnedReason = typeof answerValue.reason === 'string' ? answerValue.reason : null;
+    if (returnedReason === null) failureCode = answerValue.error?.code ?? 'MCP_CALL_FAILED';
+    report(returnedReason);
+    return answerValue;
+  };
+
+  try {
+    for (;;) {
+      throwIfCancelled();
+      const remaining = deadlineMs - (now() - startedAt);
+      if (remaining <= 0) return finish(answer(WAIT_LIMIT_REASON, lastObservation, { resolved: false }));
+      // One bounded observation. It never overruns the caller's deadline, so the wait
+      // cannot answer later than it said it would.
+      const perRequest = Math.min(observeWaitMs, remaining);
+      observationRequests += 1;
+      let observation;
+      try {
+        observation = await callExecution('observe', { taskId, waitMs: perRequest }, { signal });
+      } catch (error) {
+        if (error?.code === 'MCP_REQUEST_CANCELLED') throw error;
+        // A refusal is the harness's own answer and is returned as such: an unknown
+        // task must read as "no such task", never as an invented completion or as a
+        // retry loop against a task that does not exist here.
+        return finish({
+          ...failureAnswer(error),
+          wait: metrics(0),
+        });
       }
-      continue;
+      lastObservation = observation;
+      countObserved(observation);
+      const reason = reasonOf(observation);
+      // The post-decision rollover: the request this call already decided may still occupy
+      // the engine's slot until the paused native call resumes. It is not a new question,
+      // and it is never answered (or decided) again — the loop simply keeps waiting on the
+      // SAME task, under the SAME deadline and the SAME observation bound. A DIFFERENT
+      // requestId (or a changed fingerprint) is NOT skipped: it falls through and is
+      // answered as a new request that needs its own decision.
+      if (reason === 'permission' && skipPermission !== null && skipPermission(observation) === true) {
+        skipped += 1;
+        // The skip still costs time, so an engine that answers instantly with the settled
+        // request cannot turn one call into a request storm (same floor as a heartbeat).
+        const elapsed = now() - startedAt;
+        const nextDueOffset = (observationRequests + skipped) * EARLY_HEARTBEAT_INTERVAL_MS;
+        if (elapsed < nextDueOffset) {
+          const pause = Math.min(nextDueOffset - elapsed, remaining);
+          if (pause > 0) await sleep(pause);
+        }
+        continue;
+      }
+      // The same rollover for a question this call just answered. Only the request that
+      // was actually answered is skipped; a new id falls through and is returned at once.
+      if (reason === 'question' && skipQuestion !== null && skipQuestion(observation) === true) {
+        skipped += 1;
+        const elapsed = now() - startedAt;
+        const nextDueOffset = (observationRequests + skipped) * EARLY_HEARTBEAT_INTERVAL_MS;
+        if (elapsed < nextDueOffset) {
+          const pause = Math.min(nextDueOffset - elapsed, remaining);
+          if (pause > 0) await sleep(pause);
+        }
+        continue;
+      }
+      if (reason === 'interrupted') {
+        // An interrupted OBSERVATION is not an interrupted RUN. This branch returns
+        // IMMEDIATELY in every case — it never re-issues an observation in the same call.
+        //
+        // Re-issuing was the defect: when the observer itself is disposed (the engine was
+        // torn down, the wait seam broke, the request's own signal aborted) every
+        // re-issued observation came back `interrupted` at once, so one `delegate_wait`
+        // call became an unbounded burst of HTTP requests. Returning lets the HOST decide
+        // to wait again, which is one observation per call at worst.
+        //
+        // `resolveInterruption` reads the task record, so the answer is the real state:
+        // a live task is reported as `interrupted` and NOT terminal, a restart history as
+        // terminal, and a settled record as its real outcome (`ready`/`failed`/`cancelled`)
+        // so a completed run still reaches review.
+        interruptions += 1;
+        const resolved = resolveInterruption(observation);
+        return finish(answer(resolved.reason, observation, {
+          resolved: true,
+          resolvedState: resolved.state,
+          terminal: resolved.terminal,
+          kind: resolved.kind,
+        }));
+      }
+      if (CONTINUING_REASONS.has(reason)) {
+        heartbeats += 1;
+        // A NORMAL heartbeat has already waited out its own `waitMs` inside the engine,
+        // so nothing is slept here. This branch only fires for a heartbeat that came
+        // back EARLY (a fake engine, or an engine that answers at once): a per-
+        // observation floor keeps such a stream from becoming a request storm. The
+        // pause is a slice of that floor, never the remaining deadline — sleeping the
+        // remaining budget on the first early heartbeat would turn one observation into
+        // the whole wait.
+        const elapsed = now() - startedAt;
+        // A duration, not an instant: `nextDueOffset` used to be an absolute clock value
+        // and subtracting an elapsed duration from it produced a pause of
+        // (startedAt + 1s), which swallowed the whole deadline on the first heartbeat.
+        const nextDueOffset = observationRequests * EARLY_HEARTBEAT_INTERVAL_MS;
+        if (elapsed < nextDueOffset) {
+          const pause = Math.min(nextDueOffset - elapsed, remaining);
+          if (pause > 0) await sleep(pause);
+        }
+        continue;
+      }
+      return finish(answer(reason, observation, { resolved: false }));
     }
-    return answer(reason, observation, { resolved: false });
+  } catch (error) {
+    // A cancellation ends THIS observation and nothing else. The accounting is still
+    // reported, so the caller can tell a cancelled call (0 returns) from one that
+    // answered — and the error is rethrown untouched, so the refusal path stays the
+    // only thing that describes it.
+    failureCode = typeof error?.code === 'string' ? error.code : 'MCP_CALL_FAILED';
+    report(null);
+    throw error;
   }
 
   /**
@@ -522,6 +685,25 @@ export async function waitForTask(options) {
         out.permissionDecidable = isPermissionDecidable(pendingOperation);
       }
     }
+    // The question block is carried WHOLE for the same reason the permission block is:
+    // the host must be able to ANSWER from this one answer. It carries the questions,
+    // their options, the identity a reply is bound to, and no reasoning stream or
+    // transcript — `questionAnswerable` states that answering this cannot grant access.
+    if (reason === 'question') {
+      const block = observation?.question;
+      const pendingQuestion = block !== null && typeof block === 'object' && block.questions === undefined
+        && block.pending !== undefined
+        ? block.pending
+        : block;
+      if (pendingQuestion !== null && typeof pendingQuestion === 'object') {
+        out.question = pendingQuestion;
+        // Derived from the ANSWER AS PUBLISHED, by the same rule the bounded projection
+        // uses, so a block replaced with an explicit omission is never advertised as
+        // answerable. A question is answerable and grants nothing.
+        out.questionAnswerable = isQuestionAnswerable(pendingQuestion);
+        out.grantsAccess = false;
+      }
+    }
     if (observation?.wait !== null && typeof observation?.wait === 'object') out.longPoll = observation.wait;
     return out;
   }
@@ -529,10 +711,17 @@ export async function waitForTask(options) {
   /**
    * Build the metrics block of one return.
    *
-   * `totalWaitMs` is the time this call has spent following the task, which includes
-   * the internal observations before the last one. It is separate from `elapsedMs`
-   * so a host can tell "the last observation waited 25 s" from "this call has been
-   * following the task for twenty minutes".
+   * `elapsedMs` is the time this call has spent following the task, which includes
+   * the internal observations before the last one. It is separate from
+   * `perRequestWaitMs` so a host can tell "the last observation waited 25 s" from "this
+   * call has been following the task for twenty minutes". `waitedMs` is the sum the
+   * engine itself reported for those observations.
+   *
+   * Deliberately ABSENT here: the size of the answer. A wait cannot measure its own
+   * serialized text before that text exists, and a value the answer carries about itself
+   * is self-referential. The MCP server measures the final bounded, redacted text with
+   * `Buffer.byteLength` and records it in the process census, which is the only place a
+   * byte count means "what the host was actually handed".
    * @param {number} waitReturns - how many answers the host has received (0 or 1).
    * @returns {object} metrics with no content and no credentials.
    */
@@ -544,8 +733,11 @@ export async function waitForTask(options) {
       // task reached a state. Counted separately from heartbeats so the two are never
       // read as the same event.
       interruptedObservations: interruptions,
+      // Observations that described a permission request this call had already decided.
+      settledRequestObservations: skipped,
       waitReturns,
       elapsedMs: Math.max(0, now() - startedAt),
+      waitedMs: observedMs,
       deadlineMs,
       perRequestWaitMs: observeWaitMs,
     };

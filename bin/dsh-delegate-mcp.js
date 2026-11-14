@@ -70,6 +70,10 @@ const ROUTES = Object.freeze({
   // plane registers exactly this path, and a name-to-path guess would 404 with
   // `EXECUTION_ROUTE_UNKNOWN` on the one call that unblocks a paused worker.
   permission: Object.freeze({ method: 'POST', path: '/tasks/permission' }),
+  // The ordinary-question answer. Spelled out like every other route: the plane registers
+  // exactly `/tasks/question`, and a name-to-path guess would 404 on the one call that
+  // resumes a worker paused on a human question.
+  question: Object.freeze({ method: 'POST', path: '/tasks/question' }),
   // The commander's delivery review. Spelled out like every other route: the plane
   // registers exactly `/tasks/review`, so a missing entry here refused the one call that
   // records `hostAcceptance` with `MCP_ROUTE_UNMAPPED` before any request was sent.
@@ -261,6 +265,17 @@ async function main() {
   const server = createMcpServer({
     callExecution: createExecutionClient(config),
     logger: { warn: (...args) => process.stderr.write(`dsh-delegate-mcp: ${args.join(' ')}\n`) },
+  });
+  // One bounded diagnostics line on the way out, on STDERR (stdout is the protocol
+  // stream). It carries counts, durations and byte totals only — no task content, no
+  // tool arguments — and it states explicitly that the host model's own activity is not
+  // observed here, so nobody can read it as a wake-up or token count.
+  process.once('exit', () => {
+    try {
+      process.stderr.write(`${server.diagnosticsLine()}\n`);
+    } catch {
+      // An exit-time diagnostic must never change the exit status.
+    }
   });
   await serveStdio({
     input: process.stdin,

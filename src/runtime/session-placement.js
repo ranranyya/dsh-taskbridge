@@ -50,6 +50,7 @@ import { dirname, join } from 'node:path';
 
 import { ISOLATION_MODES, SESSIONS_FILE } from '../config/defaults.js';
 import { diagnostic } from '../config/redact.js';
+import { continuationIdentityOf, pathDigest, isPathDigest, sameRecordedDirectory } from '../jobs/continuation-identity.js';
 
 /** Stable ids of a managed worktree life cycle, mirrored as a plain string set here. */
 const WORKTREE_STATE_DISPOSED = 'disposed';
@@ -59,6 +60,12 @@ const RECORD_FIELDS = Object.freeze([
   'taskId',
   'sourcePath',
   'executionPath',
+  // Digests of the two canonical paths. They are the identity a follow-up can
+  // compare even when a projection shortened the path string itself, and they are
+  // opaque to redaction, so a readable path and its digest normally agree and the
+  // path remains what an operator recognises.
+  'sourcePathDigest',
+  'executionPathDigest',
   'workspaceId',
   'sessionId',
   'isolation',
@@ -165,6 +172,28 @@ export function sameSessionPath(a, b) {
   const left = sessionPathKey(a);
   const right = sessionPathKey(b);
   return left !== null && right !== null && left === right;
+}
+
+/**
+ * Whether a recorded path PROVES it is one directory, from either kind of evidence.
+ *
+ * This is a thin adapter over {@link sameRecordedDirectory}, NOT a rule of its own:
+ * the identity module is the single definition of what a stored path proves. An
+ * earlier version of this function compared the readable path first and returned
+ * `true` on that alone, so a record whose digest named a DIFFERENT directory was
+ * admitted — its two proofs contradicted each other and one of them was believed.
+ * Delegating removes that second rule entirely: a contradictory record proves
+ * nothing, a masked record needs its digest, and a record with neither is refused.
+ * @param {unknown} recordedPath - the stored path.
+ * @param {unknown} recordedDigest - the stored digest, if the row has one.
+ * @param {unknown} currentPath - the directory this run resolved.
+ * @returns {boolean} true only when the record proves it is that directory.
+ */
+export function recordedSessionPathIs(recordedPath, recordedDigest, currentPath) {
+  return sameRecordedDirectory(
+    { path: recordedPath, digest: recordedDigest },
+    { path: currentPath, digest: pathDigest(currentPath) },
+  );
 }
 
 /**
@@ -557,7 +586,7 @@ async function continueTaskThread({ deps, sessions, workspace, parent, execPath,
     );
   }
   const recordedExec = parent.executionPath ?? parent.path ?? null;
-  if (!sameSessionPath(recordedExec, execPath)) {
+  if (!recordedSessionPathIs(recordedExec, parent.executionPathDigest, execPath)) {
     throw new SessionPlacementError(
       SESSION_CODES.continuationPathMismatch,
       'the named task ran in another execution directory, so its conversation was not continued',
@@ -578,7 +607,7 @@ async function continueTaskThread({ deps, sessions, workspace, parent, execPath,
   const recordedSource = parent.sourcePath ?? null;
   const currentSource = deps?.sourcePath ?? null;
   if (typeof recordedSource === 'string' && recordedSource !== '' && typeof currentSource === 'string' && currentSource !== ''
-    && !sameSessionPath(recordedSource, currentSource)) {
+    && !recordedSessionPathIs(recordedSource, parent.sourcePathDigest, currentSource)) {
     throw new SessionPlacementError(
       SESSION_CODES.continuationWorkspaceMismatch,
       'the named task was authorized for another source repository, so its conversation was not continued',
@@ -1058,6 +1087,17 @@ function projectSessionRecord(value) {
     taskId,
     sourcePath,
     executionPath,
+    // A digest is carried through verbatim when the row has one, so a stored
+    // identity read back from disk keeps the proof a shortened path lost. When it
+    // has none (a row written by this build always does) it is derived from the
+    // path it belongs to, which yields the same value for a readable path and
+    // nothing at all for a masked one.
+    sourcePathDigest: isPathDigest(value.sourcePathDigest)
+      ? value.sourcePathDigest
+      : (sourcePath === null ? null : pathDigest(sourcePath)),
+    executionPathDigest: isPathDigest(value.executionPathDigest)
+      ? value.executionPathDigest
+      : (executionPath === null ? null : pathDigest(executionPath)),
     workspaceId: typeof value.workspaceId === 'string' ? value.workspaceId.trim() : '',
     sessionId,
     isolation,
@@ -1103,12 +1143,36 @@ export async function rememberSession(store, placement, entry) {
   // A row without a task and an execution path names nothing a continuation could
   // validate, so it is not written at all rather than half-written.
   if (taskId === '' || executionPath === '') return false;
+  const identity = continuationIdentityOf(target, placement, target.isolation ?? null);
+  return identity === null ? false : rememberIdentity(store, placement, target, identity);
+}
+
+/**
+ * Write one already-computed identity row.
+ * @param {object} store - the identity store.
+ * @param {object} placement - the run's placement.
+ * @param {object} target - the caller's identity target.
+ * @param {object} identity - {@link continuationIdentityOf} result.
+ * @returns {Promise<boolean>} whether a record was written.
+ */
+async function rememberIdentity(store, placement, target, identity) {
+  const sessionId = typeof placement.sessionId === 'string' ? placement.sessionId : '';
+  if (sessionId === '') return false;
+  const taskId = identity.taskId;
+  const executionPath = identity.executionPath ?? trimmedPath(target.executionPath);
+  if (executionPath === '') return false;
+  const sourcePath = identity.sourcePath ?? (trimmedPath(target.sourcePath) !== ''
+    ? trimmedPath(target.sourcePath)
+    : executionPath);
   await store.put({
     taskId,
     executionPath,
-    sourcePath: typeof target.sourcePath === 'string' && target.sourcePath.trim() !== ''
-      ? target.sourcePath.trim()
-      : executionPath,
+    sourcePath,
+    // Recorded canonically, with the digest of the canonical form, so a later
+    // follow-up can prove the directory even if redaction shortens the display
+    // path. `continuationIdentityOf` is the one definition of this identity.
+    sourcePathDigest: identity.sourcePathDigest ?? (sourcePath === '' ? null : pathDigest(sourcePath)),
+    executionPathDigest: identity.executionPathDigest ?? pathDigest(executionPath),
     workspaceId: typeof placement.workspaceId === 'string' ? placement.workspaceId : '',
     sessionId,
     isolation: typeof target.isolation === 'string' ? target.isolation : null,
@@ -1116,6 +1180,15 @@ export async function rememberSession(store, placement, entry) {
     worktreeState: typeof target.worktreeState === 'string' ? target.worktreeState : null,
   });
   return true;
+}
+
+/**
+ * The trimmed spelling of a caller-supplied path, or an empty string.
+ * @param {unknown} value - candidate path.
+ * @returns {string} trimmed path or ''.
+ */
+function trimmedPath(value) {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
 export { RECORD_FIELDS };

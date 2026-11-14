@@ -44,12 +44,29 @@ export declare function readConfig(env: Record<string, string | undefined>): Mcp
  * - `observe`   → `POST /dsh-delegate/x/tasks/observe` (bounded long-poll read)
  * - `cancel`    → `POST /dsh-delegate/x/tasks/cancel`
  * - `permission`→ `POST /dsh-delegate/x/tasks/permission`
+ * - `question`  → `POST /dsh-delegate/x/tasks/question`
+ * - `review`    → `POST /dsh-delegate/x/tasks/review`
  * - `preflight` → `POST /dsh-delegate/x/workspace/preflight`
  *
- * `observe` backs `delegate_wait`; `preflight` is the read-only workspace
- * inspection behind `delegate_preflight`, and it creates nothing.
+ * `observe` backs `delegate_wait`; `review` records the commander's delivery conclusion
+ * (the only writer of `hostAcceptance`); `preflight` is the read-only workspace
+ * inspection behind `delegate_preflight`, and it creates nothing. `question` answers an
+ * ordinary question a worker asked — it settles one paused call and grants nothing, which
+ * is why it is NOT a second permission route.
+ *
+ * There is deliberately NO route for `delegate_metrics`: that tool reports this process's
+ * own census and never reaches the plane.
  */
-export type ExecutionRoute = 'submit' | 'status' | 'result' | 'observe' | 'cancel' | 'permission' | 'preflight';
+export type ExecutionRoute =
+  | 'submit'
+  | 'status'
+  | 'result'
+  | 'observe'
+  | 'cancel'
+  | 'permission'
+  | 'question'
+  | 'review'
+  | 'preflight';
 
 /**
  * Per-call context passed beside the route and payload.

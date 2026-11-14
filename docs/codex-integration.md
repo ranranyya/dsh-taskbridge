@@ -1,6 +1,8 @@
 # Codex integration contract
 
-Status: implemented in 1.4.2 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
+Status: implemented in 1.5.0 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
+
+1.5.0 adds `delegate_question_answer`, combined decision/answer-and-wait flows and program metrics. Managed upgrades recognize the exact published 1.4.2 and verified local test.1/test.2 companions; customized files remain operator-owned. See the [1.5.0 release notes](releases/1.5.0.zh.md).
 
 1.4.2 also recognizes the exact published 1.4.1 companion for managed upgrades.
 The review behavior introduced in 1.4.1 recognizes the exact unmodified
@@ -528,7 +530,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.4.2",
+  "packageVersion": "1.5.0",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,

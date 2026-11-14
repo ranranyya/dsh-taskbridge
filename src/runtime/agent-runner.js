@@ -97,6 +97,11 @@ export const RUN_CODES = Object.freeze({
   // bridge while installing `never` would look like the commander could decide,
   // and nothing would ever reach it.
   permissionBridgeUnavailable: 'RUN_PERMISSION_BRIDGE_UNAVAILABLE',
+  // A question bridge was handed to the run but the answerer could not be registered on
+  // its Agent. The run still starts: unlike an approval bridge, an uninstalled question
+  // answerer cannot misrepresent a grant — it only means questions cannot be surfaced,
+  // which the tool surface already governs.
+  questionBridgeUnavailable: 'RUN_QUESTION_BRIDGE_UNAVAILABLE',
   // The conversation's own model API (`agent.model`)
   // is present but unusable: it threw, answered nothing, answered a route
   // this run did not select, or exposed a surface that cannot be selected through
@@ -289,6 +294,23 @@ export class RunError extends Error {
  */
 export function userMessage(text) {
   return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } });
+}
+
+/**
+ * The production message factory a bridge should be handed.
+ *
+ * Exported so the plugin's own composition can pass the REAL `createUserMessage` to a
+ * bridge instead of relying on that bridge's local fallback: the native helper normalises
+ * ids, roles and content, and a hand-built object is only ever a stand-in. The source kind
+ * (`'user-approval'`) is the one the native approval service already uses for its policy
+ * notices, so the message is a recognised, natively-supported shape rather than an
+ * invented one.
+ * @param {string} text - message body.
+ * @param {object} [source] - a `MessageSourceMap` entry; defaults to `{ kind: 'user-approval' }`.
+ * @returns {object} frozen user message.
+ */
+export function approvalFeedbackMessage(text, source = { kind: 'user-approval' }) {
+  return createUserMessage({ content: [{ type: 'text', text }], source });
 }
 
 /**
@@ -670,6 +692,9 @@ export async function driveAgent(deps, request) {
     // Removes the `approval/request` answerer when the run ends. Null when the run
     // had no bridge, which is the ordinary worker run.
     permissionAnswerer: null,
+    // Removes the `user-questions/request` answerer when the run ends. Null when the
+    // run had no question bridge or the harness exposes no such seam.
+    questionAnswerer: null,
     // The execution deadline this run owns. It is PAUSED around every permission
     // wait, so the wait is not charged to the operator's execution budget.
     deadline: null,
@@ -874,6 +899,19 @@ export async function driveAgent(deps, request) {
         // The owning fiber disposes the listener on unload; this is best effort.
       }
     }
+    // The QUESTION answerer is removed on the SAME every-exit path, for the same reason:
+    // a finished run must not keep a listener that could answer a question for an Agent it
+    // no longer drives. Removing it here (not only at dispose) is what lets the ordinary
+    // UI answerer take that Agent's questions again as soon as the run is over.
+    if (state.questionAnswerer !== null) {
+      const remove = state.questionAnswerer;
+      state.questionAnswerer = null;
+      try {
+        remove();
+      } catch {
+        // Best effort, exactly like the approval answerer above.
+      }
+    }
   }
 
   /**
@@ -965,6 +1003,11 @@ export async function driveAgent(deps, request) {
         policy: bridged?.approvalPolicy ?? null,
         bridged: bridged?.bridged === true,
       };
+      // The QUESTION bridge is independent of the approval stance: asking a question
+      // is not granting anything, so a run whose approval policy is `never` may still
+      // ask. Its answerer is registered after the composition exists and before the
+      // prompt, so no turn can ask with nothing listening.
+      bindQuestionBridge(agent, runRequest);
     } catch (error) {
       // A bridge refusal keeps its own code: it is a different operator problem from
       // a policy that could not be installed, and reporting it as one would send an
@@ -986,6 +1029,41 @@ export async function driveAgent(deps, request) {
         { reason: 'policy setup failed' },
       );
     }
+  }
+
+  /**
+   * Arm the run's QUESTION bridge and register its answerer for this Agent.
+   *
+   * A run with no question bridge is the ordinary worker run: nothing is registered and
+   * the native chain falls through as before. A supplied bridge that cannot be armed is
+   * a REFUSAL rather than a silent downgrade, because the caller believes questions are
+   * surfaced; the operator would otherwise see a task sit in `execute` while its worker
+   * waits for an answer nobody can give.
+   * @param {object} agent - the live native Agent the run will drive.
+   * @param {object} runRequest - the run request carrying the optional bridge.
+   * @returns {void}
+   * @throws {RunError} when a supplied question bridge cannot be armed or registered.
+   */
+  function bindQuestionBridge(agent, runRequest) {
+    const bridge = runRequest?.questionBridge ?? null;
+    if (bridge === null || bridge === undefined) return;
+    if (typeof bridge.arm !== 'function' || typeof bridge.answer !== 'function') {
+      throw new RunError(
+        RUN_CODES.questionBridgeUnavailable,
+        'the requested question bridge cannot be used for this run, so the worker was not started',
+        { reason: 'the bridge exposes no arm()/answer()' },
+      );
+    }
+    try {
+      bridge.arm(agent);
+    } catch (error) {
+      throw new RunError(
+        RUN_CODES.questionBridgeUnavailable,
+        'the question bridge could not be bound to the delegated session, so the worker was not started',
+        { reason: typeof error?.details?.reason === 'string' ? error.details.reason : 'the bridge refused this agent' },
+      );
+    }
+    installQuestionAnswerer(agent?.ctx ?? null, bridge);
   }
 
   /**
@@ -1114,6 +1192,93 @@ export async function driveAgent(deps, request) {
         remove?.();
       } catch {
         // The owning fiber disposes the listener on unload; this is best effort.
+      }
+    };
+  }
+
+  /**
+   * Register this run's QUESTION bridge as the answerer for its own Agent.
+   *
+   * The seam is the native, agent-scoped waterfall `'user-questions/request'`
+   * (`UserQuestionService.ask()` dispatches
+   * `ctx.waterfall(scopeTarget(agent, agent), 'user-questions/request', …)`); a listener
+   * on the AGENT's own context therefore sees only that Agent's questions, so an
+   * ordinary DSH session keeps whatever answerer it already has.
+   *
+   * `prepend: true` is REQUIRED for the same reason the approval answerer needs it: the
+   * waterfall gives the request to the FIRST listener that returns a value, and this run
+   * exists to surface the question to the COMMANDER. Registered plainly, a UI answerer
+   * that was composed earlier would claim it first and the commander would never learn
+   * the worker was asking — which is exactly the acceptance failure (the task sat in
+   * `execute` for ten minutes). The listener still falls through for every other agent.
+   *
+   * A question that cannot be answered (an approval intent, a malformed or oversized
+   * set) makes the bridge THROW: the native seam turns a thrown answerer into a failed
+   * tool result carrying the code, so the worker learns why immediately instead of
+   * waiting out the run.
+   * @param {object} agentCtx - the agent's scoped context (listener target).
+   * @param {object} bridge - the armed question bridge.
+   * @returns {() => void} disposer removing the listener.
+   * @throws {RunError} when the context cannot register a question answerer.
+   */
+  function installQuestionAnswerer(agentCtx, bridge) {
+    if (agentCtx === null || agentCtx === undefined || typeof agentCtx.on !== 'function') {
+      // A context that cannot register a listener has NOT been wired: returning a no-op
+      // would let the run report a bridged question channel it does not have, and the
+      // worker's question would then wait for an answerer that was never installed.
+      throw new RunError(
+        RUN_CODES.questionBridgeUnavailable,
+        'the delegated agent exposes no context a question answerer could be registered on, so the worker was not started',
+        { reason: 'agent context unavailable' },
+      );
+    }
+    let disposer;
+    try {
+      disposer = agentCtx.on('user-questions/request', async (request, next) => {
+        if (bridge.owns(request) !== true) {
+          // Not this Agent's question: leave the chain untouched, so an ordinary
+          // session keeps the answerer it actually has.
+          return await next();
+        }
+        // PAUSE the run's execution deadline for the duration of the wait, exactly as
+        // the approval answerer does: a worker waiting for a human answer is not
+        // consuming its work budget, and the pause is repaid on every exit.
+        const deadline = state.deadline;
+        const pausedAt = Date.now();
+        deadline?.pause();
+        try {
+          return await bridge.answer(request);
+        } finally {
+          if (deadline !== null) {
+            deadline.notePaused(Date.now() - pausedAt);
+            deadline.resume();
+          }
+        }
+      }, { prepend: true });
+    } catch (error) {
+      throw new RunError(
+        RUN_CODES.questionBridgeUnavailable,
+        'the question answerer could not be registered for the delegated session',
+        { reason: typeof error?.code === 'string' ? error.code : 'agent context refused the answerer' },
+      );
+    }
+    if (typeof disposer !== 'function') {
+      // A registration that returns no disposer cannot be removed, so it would outlive the
+      // run and keep answering that Agent's questions from a finished task.
+      throw new RunError(
+        RUN_CODES.questionBridgeUnavailable,
+        'the question answerer registration returned no disposer, so it could not be removed when the run ended',
+        { reason: 'no disposer' },
+      );
+    }
+    state.questionAnswerer = disposer;
+    return () => {
+      const remove = state.questionAnswerer;
+      state.questionAnswerer = null;
+      try {
+        remove?.();
+      } catch {
+        // Best effort: the owning fiber disposes it on unload.
       }
     };
   }

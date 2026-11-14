@@ -198,12 +198,24 @@ export class PermissionError extends Error {
 /**
  * Bounds on what one request keeps, so a hostile argument blob cannot become a
  * memory or history problem. Every bound is applied to a REDACTED value.
+ *
+ * The two text caps are set from the EVIDENCE, not from a round number. An allow is
+ * only possible on a complete operation, so any cap that fires turns a legitimate
+ * one-line request into an unapprovable one. A Windows absolute path plus a
+ * read-back command is ~400 characters on its own — that size was refused by an
+ * earlier `argumentValueChars: 400`, and a real platform refusal was the result. The
+ * caps below hold roughly an 8 KiB command field and a 16 KiB argument object: far
+ * more than any single tool call this surface reviews, and still a hard, stated
+ * limit — a value past it is `truncated`, `argumentsComplete: false`, and cannot be
+ * allowed (see {@link PermissionBridge#allowRefusalReason}). The protection the
+ * caps provide is the same as before; only the point where a normal request stops
+ * fitting moved.
  */
 export const PERMISSION_BOUNDS = Object.freeze({
   /** Maximum characters retained for the redacted JSON arguments. */
-  argumentsChars: 4000,
+  argumentsChars: 16_384,
   /** Maximum characters retained for any single redacted argument scalar. */
-  argumentValueChars: 400,
+  argumentValueChars: 8_192,
   /** Maximum depth retained when projecting arguments. */
   argumentDepth: 6,
   /** Maximum argument keys retained per object. */
@@ -594,6 +606,62 @@ export function openTurnAt(session, fromSeq) {
 }
 
 /**
+ * The text sent back into the worker after its call was rejected.
+ *
+ * It is written for the MODEL, not for a log, and every sentence is load-bearing:
+ *
+ *  * the decision is final — the call was rejected and stays rejected;
+ *  * nothing was widened — not the sandbox, not the grant, not the mode;
+ *  * the note is not an authorization — a later attempt needs its own approval;
+ *  * what to do: rewrite the operation to fit the stated reason and ask again.
+ *
+ * The reason is already redacted and bounded by the caller, so this function only
+ * composes. The operation is named by tool and call id so the worker can tell WHICH
+ * call was refused when several are in flight.
+ * @param {object} pending - the settled request.
+ * @param {string} reason - the commander's reason, redacted and bounded.
+ * @returns {string} the message body.
+ */
+export function rejectionFeedbackText(pending, reason) {
+  const tool = typeof pending?.toolName === 'string' && pending.toolName !== '' ? pending.toolName : 'the requested tool call';
+  const callId = typeof pending?.callId === 'string' && pending.callId !== '' ? pending.callId : 'unknown';
+  const requestId = typeof pending?.requestId === 'string' && pending.requestId !== '' ? pending.requestId : 'unknown';
+  const taskId = typeof pending?.taskId === 'string' && pending.taskId !== '' ? pending.taskId : 'unknown';
+  const stated = typeof reason === 'string' && reason.trim() !== ''
+    ? reason.trim()
+    : 'no reason was given';
+  return [
+    `The commander REJECTED your ${tool} call (task ${taskId}, request ${requestId}, call id ${callId}).`,
+    `Reason for rejecting this one operation: ${stated}`,
+    'The rejection stands: this call was not approved and will not run.',
+    'Nothing was granted or widened. Sandbox permissions, the delegation switch, the session policy and your standing sandbox mode are unchanged.',
+    'This note is NOT a new authorization and grants nothing by itself. If you still need the operation, change it to fit the reason above and request approval again; the new request will be decided on its own.',
+  ].join(' ');
+}
+
+/**
+ * The message shape an Agent's inbox accepts, built without the native LLM package.
+ *
+ * `agent.inject()` takes a user message object; the native helper is `createUserMessage`
+ * from `@deepseek-ai/dsh-llm`, which this module deliberately does not import (the stdio
+ * executable links it). This default therefore produces the same minimum shape, and the
+ * plugin's own composition injects the REAL factory so production never depends on it.
+ *
+ * The source kind is `'user-approval'` — the value the native approval service already
+ * uses for its own policy notices — so the message is a recognised producer's message, not
+ * an invented source. Nothing here claims to be a user instruction.
+ * @param {string} text - message body.
+ * @returns {{ role: 'user', content: { type: 'text', text: string }[], source: { kind: string } }} message.
+ */
+export function defaultUserMessage(text) {
+  return {
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'user-approval' },
+  };
+}
+
+/**
  * The permission bridge for ONE delegated run.
  *
  * One broker per worker run. It is written in the run's own scope, armed before
@@ -648,6 +716,16 @@ export class PermissionBridge {
     // `this.session` so a replaced `agent.session` is detectable rather than silently
     // followed (see {@link liveBindingRefusal}).
     this.boundSessionId = null;
+    // Request id -> the id of the message that carried its rejection reason. One entry
+    // per delivered note, so a repeated reject, a retried decision or a restart cannot
+    // deliver the same feedback twice.
+    this.feedbackSent = new Map();
+    // The message factory. Injected so this module stays free of a hard dependency on the
+    // native LLM package (the stdio executable imports this file); the plugin passes the
+    // real `createUserMessage`, and the default below builds the same shape.
+    this.createMessage = typeof options.createUserMessage === 'function'
+      ? options.createUserMessage
+      : defaultUserMessage;
   }
 
   /** Maximum settled requests retained on one run. */
@@ -1231,6 +1309,19 @@ export class PermissionBridge {
     }
     this.history.push(this.publicView(pending));
     if (this.history.length > PermissionBridge.HISTORY_BOUND) this.history.shift();
+    // The reason is delivered to the worker BEFORE the paused tool call is released, so
+    // the note is already in the Agent's inbox by the time the model can take its next
+    // step. It is delivered only for a REJECT: an allow needs no explanation, and a
+    // cancellation is not a decision about the operation.
+    let feedback = null;
+    if (pending.settledOutcome === 'rejected' && pending.decidedBy === 'commander') {
+      feedback = this.deliverRejectionFeedback(pending, pending.decisionReason);
+      // Recorded on the settled view as a verified fact, so "the worker was told why" is
+      // never claimed merely because a reason was stored.
+      const last = this.history.at(-1);
+      if (last !== null && last !== undefined) last.rejectionFeedback = feedback;
+      pending.rejectionFeedback = feedback;
+    }
     const resolvePromise = pending.resolve;
     pending.resolve = null;
     if (typeof resolvePromise === 'function') resolvePromise(pending.settledOutcome);
@@ -1241,6 +1332,105 @@ export class PermissionBridge {
       this.logger?.warn?.('dsh-delegate: permission observer failed', String(error?.code ?? ''));
     }
     return true;
+  }
+
+  /**
+   * Send the commander's REJECTION REASON back into the same Agent.
+   *
+   * The native approval protocol cannot carry prose: `ApprovalService.request()`
+   * resolves one of four closed outcomes, so the reason a commander typed never reached
+   * the worker — it was recorded in history and the tool received a bare `rejected`.
+   * The acceptance report is exactly that: the worker could not know it should narrow
+   * its request and ask again.
+   *
+   * The real channel for prose is the Agent's own inbox. The native approval service
+   * itself uses it for its policy notices
+   * (`agent.inject(createUserMessage({ content, source }))`), and `dsh-user-questions`
+   * uses the same call to steer a late answer. So this method injects ONE user message
+   * describing the rejection.
+   *
+   * What the message says, and what it must never be read as:
+   *
+   *  * WHY this one call was rejected, quoted from the decision;
+   *  * that the rejection STANDS — the call is not approved, and nothing was widened;
+   *  * that this is NOT a new authorization and grants nothing by itself;
+   *  * what to do next: rewrite the operation to fit and request approval again.
+   *
+   * The reason is redacted and bounded before it is sent, by the same rules the stored
+   * evidence uses. A send failure is returned as a bounded outcome and NEVER changes the
+   * settlement: `rejected` already happened, and reporting a failed notice as success,
+   * or un-rejecting the call because the notice failed, would both be lies.
+   *
+   * Delivery is tracked per request id so a repeated reject, a retried decision or a
+   * plugin restart cannot deliver the same feedback twice. Only an ACTUAL injection on
+   * the bound Agent counts as delivered; anything else stays `not-sent` and is reported.
+   * @param {object} pending - the request that was just settled.
+   * @param {string} reason - the commander's decision reason (already redacted and bounded).
+   * @returns {{ delivered: boolean, requestId: string, callId: string | null,
+   *   messageId: string | null, reason: string }} the outcome, never a rejection.
+   */
+  deliverRejectionFeedback(pending, reason) {
+    const requestId = typeof pending?.requestId === 'string' ? pending.requestId : '';
+    // One delivery per request, ever. A duplicate reject and a restart both land here.
+    if (this.feedbackSent.has(requestId)) {
+      return {
+        delivered: false,
+        requestId,
+        callId: typeof pending?.callId === 'string' ? pending.callId : null,
+        messageId: this.feedbackSent.get(requestId),
+        reason: 'already-delivered',
+      };
+    }
+    const agent = this.agent;
+    const sessionRefusal = this.liveBindingRefusal();
+    if (agent === null || typeof agent?.inject !== 'function' || sessionRefusal !== null) {
+      return {
+        delivered: false,
+        requestId,
+        callId: typeof pending?.callId === 'string' ? pending.callId : null,
+        messageId: null,
+        reason: sessionRefusal ?? 'no-injectable-agent',
+      };
+    }
+    const text = rejectionFeedbackText(pending, reason);
+    let message;
+    try {
+      message = this.createMessage(text);
+    } catch (error) {
+      return {
+        delivered: false,
+        requestId,
+        callId: typeof pending?.callId === 'string' ? pending.callId : null,
+        messageId: null,
+        reason: typeof error?.code === 'string' ? error.code : 'message-unavailable',
+      };
+    }
+    try {
+      agent.inject(message);
+    } catch (error) {
+      // The rejection is already in force. This only reports that the NOTE did not reach
+      // the worker, which is a different, smaller fact than the decision itself.
+      this.logger?.warn?.('dsh-delegate: the rejection reason could not be delivered', String(error?.code ?? ''));
+      return {
+        delivered: false,
+        requestId,
+        callId: typeof pending?.callId === 'string' ? pending.callId : null,
+        messageId: null,
+        reason: 'inject-failed',
+      };
+    }
+    const messageId = typeof message?.id === 'string' ? message.id : null;
+    this.feedbackSent.set(requestId, messageId);
+    return {
+      delivered: true,
+      requestId,
+      callId: typeof pending?.callId === 'string' ? pending.callId : null,
+      messageId,
+      reason: 'delivered',
+      // The record states what was said, so "feedback happened" is auditable rather than
+      // claimed: the exact text is the evidence.
+      text,
+    };
   }
 
   /**

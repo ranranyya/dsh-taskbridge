@@ -66,6 +66,9 @@ export function createExecutionHandler(deps) {
     // The switch gate below applies to it exactly as it does to a submission,
     // because a decision is an authorization exercise like any other.
     ['POST /tasks/permission', decidePermission],
+    // The ordinary-question answer. Registered beside the permission route because it is
+    // the other way a paused native tool call resumes.
+    ['POST /tasks/question', answerQuestion],
     // The commander's DELIVERY REVIEW of one finished task. It is the only write that
     // records `hostAcceptance`, and it is narrow on purpose: it decides no permission,
     // changes no switch/provider/model/isolation/credential, merges no file and creates
@@ -118,12 +121,13 @@ export function createExecutionHandler(deps) {
 
       let connection;
       if (deps.engine.authorizationMode === 'switch') {
-        // Only the two AUTHORIZING verbs need the switch: a submission creates work and a
-        // decision releases a paused call. A delivery REVIEW is not one of them: it records
-        // a conclusion about an already-finished result, so it stays answerable with the
+        // Only the AUTHORIZING verbs need the switch: a submission creates work, and a
+        // decision (a permission decision or a question answer) releases a paused call
+        // whose work already exists. A delivery REVIEW is not one of them: it records a
+        // conclusion about an already-finished result, so it stays answerable with the
         // switch off, exactly like reading or cancelling a task. Reads, cancel and
         // preflight are equally unaffected.
-        const gated = key === 'POST /tasks' || key === 'POST /tasks/permission';
+        const gated = key === 'POST /tasks' || key === 'POST /tasks/permission' || key === 'POST /tasks/question';
         if (gated && deps.engine.posture().authorized !== true) {
           sendJson(res, 403, {
             ok: false,
@@ -339,7 +343,74 @@ async function decidePermission({ req, res, connection, deps }) {
   sendJson(res, 200, { ok: true, ...result });
 }
 
-/** Body fields `POST /tasks/review` accepts. Everything else is refused. */
+/**
+ * Answer one pending QUESTION for one owned task.
+ *
+ * Shaped like the permission route and for the same reasons: the connection identity is
+ * the authenticated one (never the body's), so a caller can only answer its OWN task, and
+ * the body is validated here because any local caller can reach this route. The answer
+ * batch itself is validated by the bridge against the questions the worker actually
+ * asked — this route only checks the shape, so a malformed batch is refused early.
+ *
+ * Nothing here can grant access: the engine settles a paused native question, and any
+ * widening still needs `POST /tasks/permission`.
+ * @param {object} context - `req`, `res`, `connection`, `deps`.
+ * @returns {Promise<void>} resolves after the answer is sent.
+ */
+async function answerQuestion({ req, res, connection, deps }) {
+  const body = await readJsonBody(req);
+  // A closed top-level field set: an unknown field (including a transport CONTROL field
+  // such as `waitAfterAnswer`, which the MCP server strips and the route must not accept)
+  // is refused rather than silently dropped, so a caller never believes it changed
+  // something here.
+  for (const key of Object.keys(body)) {
+    if (!['taskId', 'requestId', 'answers'].includes(key)) {
+      throw new HttpError(400, 'QUESTION_FIELD_UNKNOWN', `unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  if (typeof body.taskId !== 'string' || body.taskId.trim() === '') {
+    throw new HttpError(400, 'TASK_ID_REQUIRED', 'taskId is required');
+  }
+  if (typeof body.requestId !== 'string' || body.requestId.trim() === '') {
+    throw new HttpError(400, 'QUESTION_REQUEST_ID_REQUIRED', 'requestId is required');
+  }
+  if (!Array.isArray(body.answers)) {
+    throw new HttpError(400, 'QUESTION_ANSWERS_REQUIRED', 'answers must be an array');
+  }
+  for (const answer of body.answers) {
+    if (answer === null || typeof answer !== 'object' || Array.isArray(answer)) {
+      throw new HttpError(400, 'QUESTION_ANSWER_INVALID', 'each answer must be an object');
+    }
+    // Each answer is a closed shape too: an unknown field is refused, not ignored.
+    const allowed = ['id', 'selected', 'custom'];
+    for (const key of Object.keys(answer)) {
+      if (!allowed.includes(key)) {
+        throw new HttpError(400, 'QUESTION_ANSWER_INVALID', `unknown answer field ${JSON.stringify(key)}`);
+      }
+    }
+    if (typeof answer.id !== 'string' || answer.id === '') {
+      throw new HttpError(400, 'QUESTION_ANSWER_INVALID', 'each answer needs a question id');
+    }
+    if (answer.selected !== undefined && (!Array.isArray(answer.selected)
+      || answer.selected.some((label) => typeof label !== 'string'))) {
+      throw new HttpError(400, 'QUESTION_ANSWER_INVALID', 'selected must be an array of labels');
+    }
+    if (answer.custom !== undefined && answer.custom !== null && typeof answer.custom !== 'string') {
+      throw new HttpError(400, 'QUESTION_ANSWER_INVALID', 'custom must be a string when present');
+    }
+  }
+  const result = await deps.engine.decideQuestion({
+    connectionId: connection.connectionId,
+    taskId: body.taskId,
+    requestId: body.requestId,
+    answers: body.answers.map((answer) => ({
+      id: answer.id,
+      selected: Array.isArray(answer.selected) ? [...answer.selected] : [],
+      ...(typeof answer.custom === 'string' ? { custom: answer.custom } : {}),
+    })),
+  });
+  sendJson(res, 200, { ok: true, ...result });
+}
 const REVIEW_FIELDS = Object.freeze(['taskId', 'decision', 'note']);
 
 /**

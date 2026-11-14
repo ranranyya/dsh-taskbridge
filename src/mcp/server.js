@@ -42,6 +42,17 @@
 // a model, the isolation or a credential, merge a diff, or create work; it also cannot
 // be reached by the worker's own catalog, for the same reason as above.
 //
+// `delegate_metrics` is the one tool with NO plane route at all: it reports this MCP
+// process's own bounded accounting (tool calls, wait answers and their reasons, durations,
+// UTF-8 byte sizes, applied decisions and the waits that followed them). It is a read of
+// a census this process kept — not of the host's model, whose turns, tokens and cost are
+// reported as `not-integrated` rather than as zero.
+//
+// `delegate_permission_decide`'s optional `waitAfterDecision` is the one argument this
+// surface adds for itself. It is a CONTROL field of the MCP call, stripped at this
+// boundary and never sent to the plane; its continuation reuses the bounded observation
+// loop in `./wait.js` through `./continuation.js` rather than growing a second one.
+//
 // `delegate_preflight` is the one addition that is not an authorization at all: it
 // is a read-only measurement of a workspace, and it exists so a dispatcher can
 // learn before submitting that a checkout is dirty, is not a repository, or would
@@ -79,6 +90,20 @@ import {
   truncateCodePoints,
 } from '../jobs/review-note.js';
 import { waitForTask } from './wait.js';
+import { QUESTION_ANSWER_KIND, createCallMetrics, correlationId } from './metrics.js';
+// The engine's own per-call permission bounds. Imported rather than re-stated so this
+// layer can never publish a SMALLER operation cap than the engine allowed: a smaller
+// one here re-cuts an operation the engine already published whole and turns a
+// reviewable request into an unapprovable one.
+import { PERMISSION_BOUNDS } from '../runtime/permissions.js';
+import { reportedVersion } from '../version.js';
+// The question answer's own bounds, re-exported so the MCP schema and the runtime agree on
+// the custom-text limit rather than restating it.
+import { QUESTION_BOUNDS } from '../runtime/questions.js';
+import {
+  decidedRequestMatcher,
+  decisionReceipt,
+} from './continuation.js';
 
 /** Protocol revisions this server can speak, newest first (as the SDK lists them). */
 export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
@@ -91,8 +116,18 @@ export const SUPPORTED_PROTOCOL_VERSIONS = Object.freeze([
 /** The revision answered when a client asks for one this server does not know. */
 export const LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0];
 
-/** Identifies this server in the handshake. */
-export const SERVER_INFO = Object.freeze({ name: 'dsh-delegate', version: '1.4.2' });
+/**
+ * Identifies this server in the handshake.
+ *
+ * The version is read from the package manifest this file ships in, never written
+ * here: a literal is a second copy of the same fact and the two drift, so a
+ * pre-release tarball answered `initialize` with the last released number and a host
+ * could not tell which build it was talking to. `delegate_metrics` and the exit
+ * diagnostics report the same value through {@link reportedVersion}.
+ */
+const REPORTED = reportedVersion();
+
+export const SERVER_INFO = Object.freeze({ name: REPORTED.name, version: REPORTED.version });
 
 /** Bound on a tool result's text. A task view can be large; a model's context cannot. */
 export const MAX_TOOL_TEXT_CHARS = 20_000;
@@ -158,10 +193,17 @@ export const MAX_CALL_LOG = 256;
 /**
  * Reasons on which `delegate_wait` returns to the host.
  *
+ * `question` is here for the same reason `permission` is: the worker is PAUSED on an
+ * ordinary question it cannot answer itself, so the host must act now. Surfacing it only
+ * through the silence threshold is the acceptance defect this reason removes — a question
+ * asked at minute one used to be reported at minute ten.
+ *
  * `heartbeat` is deliberately absent: it is the engine's internal "nothing changed
  * yet" signal, consumed by the wait loop and never surfaced as an answer.
  */
-export const ACTIONABLE_REASONS = Object.freeze(['attention', 'permission', 'ready', 'failed', 'cancelled', 'interrupted']);
+export const ACTIONABLE_REASONS = Object.freeze([
+  'attention', 'permission', 'question', 'ready', 'failed', 'cancelled', 'interrupted',
+]);
 
 /** The reason a wait that reached its own deadline reports. */
 export const WAIT_LIMIT_REASON = 'wait-limit';
@@ -183,13 +225,16 @@ export class McpError extends Error {
   /**
    * @param {string} code - stable machine code, surfaced to the client as text.
    * @param {string} message - explanation, already free of secrets.
-   * @param {object} [options] - `rpcCode` for a protocol-level refusal.
+   * @param {object} [options] - `rpcCode` for a protocol-level refusal, `details` for the
+   *   bounded, already-redacted facts the refusal must carry (for example a decision
+   *   receipt whose outcome is unknown). Details are published as `error.details`.
    */
   constructor(code, message, options = {}) {
     super(message);
     this.name = 'McpError';
     this.code = code;
     this.rpcCode = options.rpcCode ?? null;
+    this.details = options.details ?? null;
   }
 }
 
@@ -447,7 +492,17 @@ export const TOOLS = Object.freeze([
       + 'the switch, the provider/model or the isolation, and cannot approve a future call. '
       + '`allow-once` REQUIRES the pending request\u2019s `fingerprint` and is refused when `permission.pending.'
       + 'completeness` is not `complete` (the operation was shortened by a bound, so an allow cannot be granted '
-      + 'on it). `reject` needs neither and is therefore always available.',
+      + 'on it). `reject` needs neither and is therefore always available. '
+      + 'OPTIONAL `waitAfterDecision` (default false) decides and then keeps following the SAME task inside this '
+      + 'same call, answering in the compact `delegate_wait` shape plus a `decisionReceipt`. Use it when your '
+      + 'channel supports it: deciding and then waiting is what resumes the task without a second call. The '
+      + 'receipt states what happened to the decision: `applied: true` ONLY when the harness confirmed the same '
+      + 'task, request and operation, and `applied: null` with `confirmation: "unknown"` when nothing was '
+      + 'established (the call failed before an answer, or the answer contradicted or lacked the evidence to '
+      + 'confirm it — then read the task with delegate_result before sending it again). An unconfirmed decision is '
+      + 'refused and never continued. A refused decision never waits, a new request is never inherited, and when '
+      + 'an APPLIED decision\'s follow-up wait fails or is cancelled this call still succeeds with the receipt, '
+      + '`reason: null` and a `waitError` block: the decision is never unsaid.',
     // It does not read and it does not write a configuration: it settles ONE paused
     // call. A repeated decision for the same request is refused, so it is not
     // idempotent — the second call is a different outcome by design.
@@ -478,8 +533,112 @@ export const TOOLS = Object.freeze([
             + 'the exact operation it grants, and an allow that omits it is refused. Optional for `reject` (a '
             + 'refusal is safe without it); when supplied, a request whose operation no longer matches is refused.',
         },
+        waitAfterDecision: {
+          type: 'boolean',
+          description: 'OPTIONAL, default false: the historical behaviour — decide only, and the answer is the '
+            + 'permission route\'s own reply, unchanged. Set it to true to keep following the SAME task inside this '
+            + 'same call after the decision is applied and confirmed. The answer is then the SAME compact shape '
+            + '`delegate_wait` returns — `reason`/`state`/`actionable`/`terminal`/`task`, and for a new request the '
+            + 'whole redacted `permission` operation with its `completeness` and `fingerprint` — plus '
+            + '`decisionReceipt` (taskId, requestId, decision, fingerprint, `applied`, `confirmation`, `outcome`). '
+            + '`applied: true` is claimed only when the harness confirmed the SAME task, request and operation; a '
+            + 'CONTRADICTED or evidence-free answer is `applied: null` with `confirmation: "unknown"`, which is '
+            + 'refused (MCP_DECISION_UNCONFIRMED) and never continued. The request you just decided is never asked '
+            + 'again and never re-approved: the wait continues past it. A NEW request id, or the same id with a '
+            + 'changed operation, is a new question and is NOT inherited. A decision that is refused never starts a '
+            + 'wait. When the decision IS applied but the following wait fails, is cancelled or is interrupted, '
+            + 'this call still SUCCEEDS with `decisionReceipt.applied: true`, `reason: null`, `actionable: false` '
+            + 'and a `waitError` block: the decision stands, only the waiting ended, the execution was not stopped, '
+            + 'and the decision must not be resent. For the same waiting rules as `delegate_wait`: omit '
+            + 'waitSeconds, expect `wait-limit` to mean "wait again on the same taskId", and never read intermediate '
+            + 'code while it waits.',
+        },
       },
       required: ['taskId', 'requestId', 'decision'],
+      additionalProperties: false,
+    }),
+  }),
+  Object.freeze({
+    name: 'delegate_question_answer',
+    title: 'Answer a question a delegated worker asked',
+    description: 'Answer ONE ordinary question that a delegated task is waiting on. '
+      + 'A delegated worker may ask a human a question with the native `ask_user_question` tool — typically '
+      + 'because something is ambiguous, or because it needs a choice it must not make itself. That tool call '
+      + 'PAUSES, the task stays `running` with phase `awaiting-question`, and the question appears in '
+      + '`delegate_wait` as `reason: "question"` with the full `question` block: `requestId`, `taskId`, '
+      + '`sessionId`, `callId` and `questions[]` (`id`, `question`, `header`, `detail`, `options[]` with '
+      + '`label`/`description`, `multiSelect`). Nothing about the worker\u2019s reasoning or transcript is included. '
+      + 'Answer with `answers`: one entry per question, each naming that question\u2019s `id` exactly once, with '
+      + '`selected` (labels that question actually offered) and/or non-empty `custom` text. A single-select '
+      + 'question takes at most one offered label; every asked question must be answered; an unknown id or a label the '
+      + 'question did not offer is refused and the question STAYS PENDING so a correct answer can still be made. '
+      + 'This tool does NOT grant access. Answering a question is not an approval and creates no authorization, '
+      + 'sandbox widening, standing grant or policy change; a worker that needs wider access must still request '
+      + 'it through `delegate_permission_decide`, and a question that presents an approval (`intent` of '
+      + '`approval`) is REFUSED here with `QUESTION_APPROVAL_INTENT` — that channel is the only one that can '
+      + 'grant, and the refused question fails promptly instead of hanging. A `plan-review` question is an '
+      + 'information answer and grants nothing either. '
+      + 'An answer applies ONCE: repeating it is refused as `QUESTION_ALREADY_ANSWERED`, an expired or '
+      + 'cancelled question cannot be answered, and a question is never answerable across tasks or after a '
+      + 'restart. '
+      + 'OPTIONAL `waitAfterAnswer` (default false) answers and then keeps following the SAME task inside this '
+      + 'same call, answering in the compact `delegate_wait` shape plus an `answerReceipt`. When the answer IS '
+      + 'applied but the following wait fails, is cancelled or is interrupted, this call still SUCCEEDS with '
+      + '`answerReceipt.applied: true`, `reason: null` and a `waitError` block: the answer stands and must not be '
+      + 'sent again.',
+    // It settles ONE paused question. It cannot read a configuration, create work or grant
+    // anything, and a second answer to the same question is refused — so it is not
+    // idempotent by design.
+    annotations: Object.freeze({
+      title: 'Answer a question a delegated worker asked',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    }),
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
+        requestId: {
+          type: 'string',
+          description: 'The pending question\u2019s `requestId`, copied from the `question` block of delegate_wait.',
+        },
+        answers: {
+          type: 'array',
+          description: 'One entry per asked question, each naming that question\u2019s id exactly once.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'The question id, copied from `questions[].id`.' },
+              selected: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Labels this question actually offered. A single-select question takes at most one.',
+              },
+              custom: {
+                type: 'string',
+                maxLength: QUESTION_BOUNDS.customChars,
+                description: 'Optional free-text answer. Required when the question offers no options.',
+              },
+            },
+            required: ['id'],
+            additionalProperties: false,
+          },
+        },
+        waitAfterAnswer: {
+          type: 'boolean',
+          description: 'OPTIONAL, default false: answer only, and the answer is the question route\u2019s own reply. '
+            + 'Set it to true to keep following the SAME task inside this same call after the answer is applied. '
+            + 'The answer is then the SAME compact shape `delegate_wait` returns plus `answerReceipt` '
+            + '(taskId, requestId, `applied`, `confirmation`, answers). When the answer IS applied but the '
+            + 'following wait fails, is cancelled or is interrupted, this call still SUCCEEDS with '
+            + '`answerReceipt.applied: true`, `reason: null`, `actionable: false` and a `waitError` block: the '
+            + 'answer stands, only the waiting ended, and it must not be resent. A refused answer never starts a '
+            + 'wait.',
+        },
+      },
+      required: ['taskId', 'requestId', 'answers'],
       additionalProperties: false,
     }),
   }),
@@ -568,6 +727,54 @@ export const TOOLS = Object.freeze([
       additionalProperties: false,
     }),
   }),
+  Object.freeze({
+    name: 'delegate_metrics',
+    title: 'Read this MCP session\'s accounting',
+    description: 'Report bounded accounting for THIS MCP process only: how many times each tool was called, how '
+      + 'many wait answers were handed back and why, how much data they carried (UTF-8 bytes), how many PER-CALL '
+      + 'permission decisions were applied, and the wait that followed each decision with its own reason, '
+      + 'duration and size. '
+      + 'These are counts of the PROGRAM (this process and its internal observations), not of model activity: '
+      + 'the host model\u2019s own turns, token usage and cost are not observable from here and are returned as '
+      + '"not-integrated", never as 0. A read-only census of THIS connection with no task identity required; '
+      + 'it carries no tool arguments, no reasoning, no answer body, no credential and no task content, and it '
+      + 'cannot change anything. The counters live in memory and reset when this MCP process restarts.',
+    annotations: Object.freeze({
+      title: 'Read this MCP session\'s accounting',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    }),
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    }),
+  }),
+]);
+
+/**
+ * Refusal codes that mean "the harness never answered", so a decision's outcome is UNKNOWN.
+ *
+ * Every other code the permission route can produce (`PERMISSION_REQUEST_CHANGED`,
+ * `PERMISSION_EVIDENCE_INCOMPLETE`, `DELEGATION_DISABLED`, `JOB_TASK_NOT_FOUND`, …) is the
+ * harness's own verdict: the decision was definitely NOT applied. The distinction matters
+ * because a clean "failed" invites a resend, while an unconfirmed decision might already be
+ * in force — a resend there is a second authorization attempt, and the caller must read the
+ * task first.
+ * @type {ReadonlySet<string>}
+ */
+const UNCONFIRMED_DECISION_CODES = new Set([
+  'MCP_HARNESS_UNREACHABLE',
+  'MCP_HARNESS_MALFORMED',
+  'MCP_REQUEST_CANCELLED',
+  'MCP_CALL_FAILED',
+  'MCP_CONFIG_INVALID',
+  // The request outlived its own timeout. The plane may have applied the decision or
+  // answer before the connection was abandoned, so this is UNKNOWN in the same way as a
+  // dropped connection — not a clean refusal that invites a resend.
+  'MCP_REQUEST_TIMEOUT',
 ]);
 
 /** Tool name → the execution-plane call it makes. */
@@ -578,9 +785,92 @@ const TOOL_ROUTES = Object.freeze({
   delegate_wait: 'observe',
   delegate_cancel: 'cancel',
   delegate_permission_decide: 'permission',
+  delegate_question_answer: 'question',
   delegate_review: 'review',
   delegate_preflight: 'preflight',
+  // No plane route: the census is this process's own and travels to no backend.
+  delegate_metrics: null,
 });
+
+/**
+ * The one argument this surface adds to a request it forwards.
+ *
+ * `waitAfterDecision` is a CONTROL field of the MCP call: it tells this server to keep
+ * following the task after the decision. It is NOT part of the permission request, and
+ * the decision route validates a closed field set, so forwarding it would turn every such
+ * call into a refusal. It is stripped once — at the MCP boundary, in
+ * {@link validateArgs} — and never reintroduced anywhere else.
+ */
+export const MCP_ONLY_ARGUMENTS = Object.freeze({
+  delegate_permission_decide: Object.freeze(['waitAfterDecision']),
+  delegate_question_answer: Object.freeze(['waitAfterAnswer']),
+});
+
+/**
+ * Validate one entry of a declared array argument.
+ *
+ * Handles exactly the item shapes this catalog declares — a string, or a closed object
+ * with `string` and `string[]` fields plus an optional bounded `custom` string — so an
+ * undeclared or wrong-typed entry is refused HERE, with its position named, instead of
+ * reaching the plane. That matters for the answer batch: an answer that silently lost
+ * or gained a label would be applied to a question it does not answer.
+ * @param {object} tool - tool definition.
+ * @param {string} key - the array argument's name.
+ * @param {object} items - declared item schema.
+ * @param {unknown} entry - one item.
+ * @param {number} index - its position.
+ * @returns {unknown} the validated item.
+ */
+function validateArrayItem(tool, key, items, entry, index) {
+  const where = `${tool.name}.${key}[${index}]`;
+  if (items.type === 'string' || items.type === undefined) {
+    if (typeof entry !== 'string') throw new McpError('MCP_ARGUMENT_TYPE', `${where} must be a string`);
+    return entry;
+  }
+  if (items.type !== 'object') throw new McpError('MCP_ARGUMENT_TYPE', `${where} has an unsupported item shape`);
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new McpError('MCP_ARGUMENT_TYPE', `${where} must be an object`);
+  }
+  const allowed = Object.keys(items.properties ?? {});
+  for (const field of Object.keys(entry)) {
+    if (!allowed.includes(field)) {
+      throw new McpError('MCP_ARGUMENT_UNKNOWN', `${where} does not accept field ${JSON.stringify(field)}`);
+    }
+  }
+  for (const field of items.required ?? []) {
+    if (typeof entry[field] !== 'string' || entry[field].trim() === '') {
+      throw new McpError('MCP_ARGUMENT_REQUIRED', `${where}.${field} must be a non-empty string`);
+    }
+  }
+  const out = {};
+  for (const field of allowed) {
+    if (!(field in entry)) continue;
+    const declared = items.properties[field];
+    const value = entry[field];
+    if (declared.type === 'string') {
+      if (typeof value !== 'string') throw new McpError('MCP_ARGUMENT_TYPE', `${where}.${field} must be a string`);
+      if (typeof declared.maxLength === 'number' && value.length > declared.maxLength) {
+        throw new McpError('MCP_ARGUMENT_RANGE',
+          `${where}.${field} must be at most ${declared.maxLength} characters`);
+      }
+      out[field] = value;
+      continue;
+    }
+    if (declared.type === 'array') {
+      const itemType = declared.items?.type ?? 'string';
+      if (!Array.isArray(value)) throw new McpError('MCP_ARGUMENT_TYPE', `${where}.${field} must be an array`);
+      for (const item of value) {
+        if (itemType === 'string' && typeof item !== 'string') {
+          throw new McpError('MCP_ARGUMENT_TYPE', `${where}.${field} must contain strings only`);
+        }
+      }
+      out[field] = [...value];
+      continue;
+    }
+    throw new McpError('MCP_ARGUMENT_TYPE', `${where}.${field} has an unsupported type`);
+  }
+  return out;
+}
 
 /**
  * Validate one tool's arguments against its own schema.
@@ -588,6 +878,12 @@ const TOOL_ROUTES = Object.freeze({
  * Written by hand rather than pulled from a schema validator because the shapes
  * here are four small objects; a validator dependency would be the largest thing
  * in this file for no extra safety.
+ *
+ * The returned object is the argument set this server will act on. Every declared
+ * field survives; nothing undeclared does. The MCP-only control fields listed in
+ * {@link MCP_ONLY_ARGUMENTS} stay in the object because they are declared — they are
+ * removed at the point where a body is forwarded to the plane, which is the boundary
+ * that must not see them.
  * @param {object} tool - definition from {@link TOOLS}.
  * @param {unknown} args - caller-supplied arguments.
  * @returns {object} the arguments to forward.
@@ -608,6 +904,20 @@ function validateArgs(tool, args) {
   }
   for (const key of tool.inputSchema.required ?? []) {
     const field = value[key];
+    const declared = tool.inputSchema.properties?.[key] ?? {};
+    if (declared.type === 'array') {
+      // An array argument is required when it is present AND non-empty: an empty answer
+      // batch is not an answer, and accepting one would settle a question with nothing.
+      // A NON-array value is a type error, which is a different fact from a missing one
+      // and is reported as such below by the per-field pass.
+      if (field === undefined || field === null) {
+        throw new McpError('MCP_ARGUMENT_REQUIRED', `${tool.name} requires a non-empty ${key}`);
+      }
+      if (Array.isArray(field) && field.length === 0) {
+        throw new McpError('MCP_ARGUMENT_REQUIRED', `${tool.name} requires a non-empty ${key}`);
+      }
+      continue;
+    }
     if (typeof field !== 'string' || field.trim() === '') {
       throw new McpError('MCP_ARGUMENT_REQUIRED', `${tool.name} requires a non-empty ${key}`);
     }
@@ -657,6 +967,13 @@ function validateArgs(tool, args) {
         throw new McpError('MCP_ARGUMENT_TYPE', `${tool.name}.${key} must be an object`);
       }
       out[key] = field;
+    } else if (declared.type === 'array') {
+      // An array argument is validated ITEM BY ITEM against the declared item schema, so
+      // a caller learns which entry is wrong instead of sending an object the plane must
+      // then reject. Only the shapes this catalog declares are accepted: strings, or a
+      // closed object with string/string-array fields and a bounded custom string.
+      if (!Array.isArray(field)) throw new McpError('MCP_ARGUMENT_TYPE', `${tool.name}.${key} must be an array`);
+      out[key] = field.map((entry, index) => validateArrayItem(tool, key, declared.items ?? {}, entry, index));
     } else {
       out[key] = field;
     }
@@ -894,6 +1211,108 @@ function reduceHeavy(source, path, collect) {
 }
 
 /**
+ * Bound the pending-question block of a wait answer, keeping it WHOLE or marking it unusable.
+ *
+ * A question is answerable only when the commander received it EXACTLY as the worker asked —
+ * every question, header, detail, option label and description. A generic per-string cap
+ * would shorten `question`/`detail` while the answer still advertised
+ * `questionAnswerable: true`, so the commander could answer a question it never actually saw.
+ * That is the defect this function exists to remove.
+ *
+ * The rule is therefore all-or-nothing on the block:
+ *
+ *  * it fits at its real serialised width → published VERBATIM;
+ *  * it does not → published as an explicit omission (`questionsOmitted`, `questionAnswerable:
+ *    false`, `reason: 'question-too-large'`), with identity and the count of questions kept so
+ *    the host knows a question exists and must ask the worker to narrow it. No question text
+ *    is carried, because a shortened one is worse than none: it invites a wrong answer.
+ *
+ * `deadlineAt` is kept in both forms so a host can still see how long the wait has left.
+ * @param {object} block - the pending question block from the engine.
+ * @param {string} path - JSON path for truncation records.
+ * @param {object[]} collect - truncation records.
+ * @param {number} budget - characters the whole block may occupy.
+ * @returns {object | null} the bounded block, or null when there is none.
+ */
+function boundQuestionBlock(block, path, collect, budget) {
+  if (block === null || block === undefined || typeof block !== 'object' || Array.isArray(block)) return null;
+  if (block.pending !== null && typeof block.pending === 'object' && !Array.isArray(block.questions)) {
+    if (Array.isArray(block.evidence) && block.evidence.length > 0) {
+      collect.push(truncationRecord(`${path}.evidence`, { total: block.evidence.length, omitted: block.evidence.length }));
+    }
+    return {
+      bridged: block.bridged === true,
+      waiting: block.waiting === true,
+      pending: boundQuestionBlock(block.pending, `${path}.pending`, collect, budget),
+      evidence: [],
+      pausedExecutionMs: block.pausedExecutionMs ?? 0,
+    };
+  }
+  const dropped = truncationRecord(path, {
+    total: Array.isArray(block.questions) ? block.questions.length : 0,
+    omitted: Array.isArray(block.questions) ? block.questions.length : 0,
+    detail: 'the question set did not fit the tool-text bound, so it is not published and cannot be answered',
+  });
+  let serialised;
+  try {
+    serialised = JSON.stringify(block);
+  } catch {
+    serialised = null;
+  }
+  if (serialised !== null && serialised.length <= budget) {
+    // Whole: the exact questions the worker asked, untouched.
+    return {
+      ...block,
+      questionsOmitted: block.questionsOmitted === true,
+    };
+  }
+  collect.push(dropped);
+  return {
+    requestId: typeof block.requestId === 'string' ? block.requestId : null,
+    taskId: typeof block.taskId === 'string' ? block.taskId : null,
+    sessionId: typeof block.sessionId === 'string' ? block.sessionId : null,
+    callId: typeof block.callId === 'string' ? block.callId : null,
+    state: block.state ?? null,
+    createdAt: block.createdAt ?? null,
+    deadlineAt: block.deadlineAt ?? null,
+    questionCount: Array.isArray(block.questions) ? block.questions.length : 0,
+    // Stated three ways so no reader or older client can read this as answerable:
+    questions: [],
+    questionsOmitted: true,
+    questionAnswerable: false,
+    grantsAccess: false,
+    reason: 'question-too-large',
+  };
+}
+
+/**
+ * Whether a published pending question can actually be answered from what the host received.
+ *
+ * One rule, in one place, so the flag and the block can never disagree: the state must be
+ * `pending`, the question list must be non-empty, and the block must NOT be an omission. An
+ * omission (`questionsOmitted: true`) is explicitly not answerable even though it has a
+ * `requestId` — the host has no question text to answer, and answering would guess.
+ * @param {object} question - the published question block.
+ * @returns {boolean} true only when the whole question set was published.
+ */
+export function isQuestionAnswerable(question) {
+  if (question === null || typeof question !== 'object') return false;
+  if (!Array.isArray(question.questions) && question.pending !== undefined) return isQuestionAnswerable(question.pending);
+  if (question.questionsOmitted === true) return false;
+  if (question.state !== undefined && question.state !== 'pending') return false;
+  return Array.isArray(question.questions) && question.questions.length > 0;
+}
+
+/**
+ * The character budget a pending question block may occupy in one answer.
+ *
+ * The engine refuses to accept a question set whose serialised form exceeds 12 000
+ * characters, so a legitimate block always fits this; anything larger can only be a
+ * projection artifact and is therefore published as an explicit omission.
+ */
+const QUESTION_WIRE_BUDGET = 16_000;
+
+/**
  * Copy a value without losing JSON-compatible structure.
  * @param {unknown} value - JSON value.
  * @returns {unknown} independent copy.
@@ -936,6 +1355,16 @@ function pathsFor(value) {
  */
 function projectWithStage(value, stage, collect) {
   const projected = structuredCloneSafe(value);
+  for (const key of ['decisionReceipt', 'answerReceipt']) {
+    const receipt = minimalReceipt(projected[key]);
+    if (receipt !== null) {
+      projected[key] = receipt;
+      collect.push({ path: key, field: 'receipt', detail: 'identity and application facts retained; bulky evidence omitted' });
+    }
+  }
+  if (projected.question !== null && typeof projected.question === 'object') {
+    projected.question = boundQuestionBlock(projected.question, 'question', collect, QUESTION_WIRE_BUDGET);
+  }
   const targets = pathsFor(projected);
   for (const [target, prefix] of targets) {
     for (const key of HEAVY_FIELDS) {
@@ -1002,6 +1431,15 @@ function projectWithStage(value, stage, collect) {
         projected[key] = boundPermissionBlock(item, key, collect);
         continue;
       }
+      // A pending QUESTION is the other decision surface a wait answer publishes, and it is
+      // held to the same rule: published whole, or explicitly unusable. A generic per-string
+      // cut here would shorten `question`/`detail` while the answer still said
+      // `questionAnswerable: true`, which is the defect this branch removes.
+      if (key === 'question') {
+        projected[key] = boundQuestionBlock(item, key, collect, stage.questionBudget ?? QUESTION_WIRE_BUDGET);
+        continue;
+      }
+      if (key === 'answerReceipt' || key === 'decisionReceipt') continue;
       if (key === 'hostAcceptance' && item !== null && typeof item === 'object' && !Array.isArray(item)) {
         projected[key] = boundAcceptance(item, key, collect);
         continue;
@@ -1054,6 +1492,9 @@ function skeletonize(task, path, cap, collect) {
   // operation can never read as complete.
   const pending = pendingPermissionsOf(task, path, collect);
   if (pending !== undefined) out.permission = pending;
+  if (task.question?.pending !== null && typeof task.question?.pending === 'object') {
+    out.question = boundQuestionBlock(task.question, `${path}.question`, collect, QUESTION_WIRE_BUDGET);
+  }
   out.truncation = { path, field: 'result', detail: 'only identity, state, routing, refusal, acceptance and the live pending permission request are shown' };
   collect.push(out.truncation);
   return out;
@@ -1151,13 +1592,18 @@ function pendingPermissionsOf(task, path, collect) {
   for (const key of ['requestId', 'taskId', 'toolName', 'callId', 'fingerprint', 'sessionId']) {
     if (pending[key] !== undefined) out[key] = pending[key];
   }
-  for (const key of ['state', 'completeness', 'argumentsComplete', 'allowBlocked', 'reasonSource', 'boundsApplied', 'omitted', 'requestedAccess']) {
+  for (const key of ['state', 'completeness', 'argumentsComplete', 'allowBlocked', 'reasonSource', 'boundsApplied', 'omitted', 'requestedAccess', 'argumentKeys']) {
     if (pending[key] !== undefined) out[key] = pending[key];
   }
   // The two blobs get their own cap, stated when it fires. This is the only cut for
-  // them, because the capped value is what is published.
+  // them, because the capped value is what is published. `arguments` uses the
+  // engine's own bound so this layer never re-cuts an operation the engine published
+  // whole; `reason` is the worker's claim, not the operation, and keeps a smaller cap.
   for (const key of ['arguments', 'reason']) {
-    if (typeof pending[key] === 'string') out[key] = boundedText(pending[key], 4000, `${prefix}.${key}`, collect);
+    if (typeof pending[key] === 'string') {
+      const cap = key === 'arguments' ? PERMISSION_ARGUMENTS_CAP : PERMISSION_REASON_CAP;
+      out[key] = boundedText(pending[key], cap, `${prefix}.${key}`, collect);
+    }
   }
   // One identified: the provisional cap still applies to it, so the scratch list
   // holds no final cut to forward. Report the exception explicitly instead of a cut,
@@ -1195,8 +1641,16 @@ const PERMISSION_IDENTITY_KEYS = Object.freeze([
  * call. When the cap fires, `boundsApplied` gains this server's own marker and
  * `argumentsComplete` is forced to `false` in {@link boundPermissionRequest}, so a
  * shortened operation is never presented as complete.
+ *
+ * The argument cap is the ENGINE's own bound, not a second, smaller number. A
+ * smaller value here silently re-cut an operation the engine had already published
+ * whole, which turned a complete, reviewable request into an unapprovable one at the
+ * last layer before the host saw it — the exact failure the engine's own bound was
+ * raised to remove. `reason` keeps its separate, smaller cap: it is a claim, never
+ * the operation.
  */
-const PERMISSION_BLOB_CAP = 4_000;
+const PERMISSION_ARGUMENTS_CAP = PERMISSION_BOUNDS.argumentsChars;
+const PERMISSION_REASON_CAP = 4_000;
 
 /**
  * Bound one pending permission request without ever making it look decidable when
@@ -1223,9 +1677,18 @@ function boundPermissionRequest(pending, path, collect) {
       out[key] = value;
       continue;
     }
-    if ((key === 'arguments' || key === 'reason') && typeof value === 'string' && value.length > PERMISSION_BLOB_CAP) {
-      out[key] = boundedText(value, PERMISSION_BLOB_CAP, `${path}.${key}`, collect);
-      ownCuts.push(key);
+    if (key === 'arguments' || key === 'reason') {
+      if (typeof value !== 'string') {
+        out[key] = value;
+        continue;
+      }
+      const cap = key === 'arguments' ? PERMISSION_ARGUMENTS_CAP : PERMISSION_REASON_CAP;
+      if (value.length > cap) {
+        out[key] = boundedText(value, cap, `${path}.${key}`, collect);
+        ownCuts.push(key);
+      } else {
+        out[key] = value;
+      }
       continue;
     }
     out[key] = boundValue(value, `${path}.${key}`, 512, collect);
@@ -1396,6 +1859,14 @@ function boundedJson(value) {
     if (projected.permission !== undefined && projected.permission !== null) {
       projected.permissionDecidable = isPermissionDecidable(projected.permission);
     }
+    // The same rule for a question, and for the same reason: the flag must describe what
+    // was PUBLISHED. `boundQuestionBlock` either kept the questions whole or replaced them
+    // with an explicit omission, so this is derived from the surviving block, never from the
+    // pre-bound value.
+    if (projected.question !== undefined && projected.question !== null) {
+      projected.questionAnswerable = isQuestionAnswerable(projected.question);
+      projected.grantsAccess = false;
+    }
     return JSON.stringify(redactDeepStrings(projected), null, 2);
   };
   for (const stage of stages) {
@@ -1404,16 +1875,23 @@ function boundedJson(value) {
   }
 
   // The refusal path is reached only when nothing above fits. An answer that carries
-  // a LIVE pending permission request is different from any other oversized answer:
-  // dropping it would leave the task paused and undecidable from what the host was
-  // told. So before refusing, the answer is reduced to those requests alone — with
-  // their blobs re-capped to whatever the bound leaves — and published under an
-  // explicit `permissionOnly` marker that states the rest was not included. When
-  // even this does not fit, the refusal below stands: a trimmed request must never
-  // be presented as an answer.
+  // a LIVE pending permission request — or a DECISION RECEIPT — is different from any
+  // other oversized answer: dropping the request leaves the task paused and undecidable
+  // from what the host was told, and dropping the receipt makes a coordinator believe an
+  // authorization it applied never happened (or that it must be resent). So before
+  // refusing, the answer is reduced to those alone — with their blobs re-capped to
+  // whatever the bound leaves — and published under an explicit `permissionOnly` marker
+  // that states the rest was not included. When even this does not fit, the refusal below
+  // still carries the minimal receipt, so the refusal itself is never a lost decision.
+  const questionRescue = rescueQuestion(value, compact.length);
+  if (questionRescue !== null) return questionRescue;
   const rescue = permissionRescue(value, compact.length);
   if (rescue !== null) {
-    for (const cap of [4_000, 1_000, 400, 160, 0]) {
+    // The first rung is the engine's own operation bound, so a request that the
+    // engine published WHOLE is rescued whole whenever it fits at all; only an answer
+    // that still does not fit steps down. Every rung below it re-cuts the operation
+    // and marks the request unapprovable.
+    for (const cap of [PERMISSION_ARGUMENTS_CAP, 4_000, 1_000, 400, 160, 0]) {
       const text = rescue(cap);
       if (text.length <= MAX_TOOL_TEXT_CHARS) return { text, isError: false };
     }
@@ -1422,7 +1900,9 @@ function boundedJson(value) {
   // Nothing projected fits. The answer is refused as data, carrying the task
   // identity when it can: the caller learns which task the content belonged to
   // and why the result was not delivered, instead of receiving a cut fragment
-  // that looks like an answer.
+  // that looks like an answer. A decision receipt the refusal cannot carry in full
+  // is carried minimally, because "the answer did not fit" must never mean "the
+  // decision is lost".
   const identity = {};
   if (value?.task !== null && typeof value?.task === 'object' && !Array.isArray(value.task)) {
     if (value.task.taskId !== undefined) identity.taskId = truncateScalar(value.task.taskId);
@@ -1431,6 +1911,10 @@ function boundedJson(value) {
   if (Array.isArray(value?.tasks)) {
     identity.tasks = value.tasks.slice(0, 5).map((task) => ({ taskId: truncateScalar(task?.taskId) }));
   }
+  const refusedReceipt = minimalReceipt(value?.decisionReceipt);
+  if (refusedReceipt !== null) identity.decisionReceipt = refusedReceipt;
+  const refusedAnswer = minimalReceipt(value?.answerReceipt);
+  if (refusedAnswer !== null) identity.answerReceipt = refusedAnswer;
   return refuseResult(
     'MCP_RESULT_OVER_BUDGET',
     'the critical fields alone exceed the tool-text bound, so no usable projection could be produced',
@@ -1439,17 +1923,105 @@ function boundedJson(value) {
 }
 
 /**
- * Build a last-resort projection that keeps only the live pending permission
- * requests of an oversized answer.
+ * The minimum facts a decision receipt must keep under ANY bound.
+ *
+ * A receipt is the one answer a coordinator cannot recover by asking again: a decision was
+ * applied (or may have been), and losing the fact makes it either resend an authorization
+ * or assume one that never happened. So this projection keeps identity, `applied` and
+ * `confirmation` VERBATIM, and drops the bulky evidence (`verified`, `grant`, `outcome`) that
+ * can be re-read from `delegate_result`. It states the omission rather than pretending the
+ * receipt was complete, and it never invents a field: a value it did not receive is absent.
+ * @param {object} receipt - the receipt as produced by the decision path.
+ * @returns {object} a bounded receipt with its own identity intact.
+ */
+function minimalReceipt(receipt) {
+  if (receipt === null || typeof receipt !== 'object' || Array.isArray(receipt)) return null;
+  const out = {};
+  for (const key of ['receiptId', 'taskId', 'requestId', 'decision', 'fingerprint', 'applied', 'confirmation', 'outcome']) {
+    if (receipt[key] !== undefined) out[key] = receipt[key];
+  }
+  // An ANSWER receipt also carries the answer batch, which can be huge; its identity and
+  // verdict are what must survive, so the batch is replaced by its size. Stated, never
+  // silently dropped: a coordinator can re-read the task.
+  if (Array.isArray(receipt.answers)) {
+    out.answerCount = receipt.answers.length;
+    out.answersOmitted = true;
+  }
+  if (receipt.grantsAccess !== undefined) out.grantsAccess = receipt.grantsAccess === true;
+  if (receipt.rejectionFeedback !== undefined) out.rejectionFeedback = feedbackDeliveryFact(receipt.rejectionFeedback);
+  // `applied` and `confirmation` are the whole point; if the source lacked one, the
+  // omission is stated rather than filled with a guess.
+  if (!('applied' in out) || !('confirmation' in out)) return null;
+  out.evidenceOmitted = true;
+  return out;
+}
+
+/** Keep the whole live question and both receipt identities when other result data is large. */
+function rescueQuestion(value, fullTextChars) {
+  if (value?.question === null || typeof value?.question !== 'object') return null;
+  for (const budget of [QUESTION_WIRE_BUDGET, 0]) {
+    const records = [];
+    const question = boundQuestionBlock(value.question, 'question', records, budget);
+    const payload = {
+      ok: value.ok,
+      taskId: value.taskId ?? value.task?.taskId ?? null,
+      state: value.state ?? value.task?.state ?? null,
+      phase: value.phase ?? value.task?.phase ?? null,
+      reason: value.reason,
+      actionable: value.actionable,
+      terminal: value.terminal,
+      question,
+      questionAnswerable: isQuestionAnswerable(question),
+      grantsAccess: false,
+      truncation: { truncated: true, fullResultIncluded: false, fullTextChars, boundChars: MAX_TOOL_TEXT_CHARS, fields: records },
+    };
+    for (const key of ['decisionReceipt', 'answerReceipt']) {
+      const receipt = minimalReceipt(value[key]);
+      if (receipt !== null) payload[key] = receipt;
+    }
+    const redacted = redactDeepStrings(payload);
+    const pretty = JSON.stringify(redacted, null, 2);
+    if (pretty.length <= MAX_TOOL_TEXT_CHARS) return { text: pretty, isError: false };
+    const compact = JSON.stringify(redacted);
+    if (compact.length <= MAX_TOOL_TEXT_CHARS) return { text: compact, isError: false };
+  }
+  return null;
+}
+
+/**
+ * The short rejection-feedback DELIVERY FACT a decision receipt may carry.
+ *
+ * The full note text is already the worker's own message and is stored in history; repeating
+ * it in every receipt would multiply the answer for no gain. What a receipt must state is
+ * whether the reason actually reached the worker and, when it did not, why — the two fields
+ * that make the delivery checkable instead of claimed.
+ * @param {object | null} feedback - the settled `rejectionFeedback` record.
+ * @returns {{ delivered: boolean, reason: string | null } | null} the short fact.
+ */
+function feedbackDeliveryFact(feedback) {
+  if (feedback === null || typeof feedback !== 'object' || Array.isArray(feedback)) return null;
+  return {
+    delivered: feedback.delivered === true,
+    reason: typeof feedback.reason === 'string' ? feedback.reason : null,
+  };
+}
+
+/**
+ * Build a last-resort projection that keeps the live pending permission request(s) of an
+ * oversized answer — and the decision receipt, when the answer carries one.
  *
  * The ORDER is fixed and the caps are tried by the caller: identity first, then a
  * smaller operation blob. `completeness`/`argumentsComplete`/`allowBlocked` are
  * always carried as the engine states them (or downgraded by the capping), so a
  * shortened request still cannot be allowed.
+ *
+ * The receipt is projected by {@link minimalReceipt} for EVERY cap, including `cap === 0`:
+ * a huge `grant` or `verified` blob can be dropped, but the receipt's identity and its
+ * `applied`/`confirmation` survive, because this answer is the only place they exist.
  * @param {unknown} value - the answer that did not fit.
  * @param {number} fullTextChars - size of the original answer, for the record.
- * @returns {((cap: number) => string) | null} renderer, or null when the answer
- *   carries no live pending request.
+ * @returns {((cap: number) => string) | null} renderer, or null when the answer carries
+ *   neither a live pending request nor a decision receipt.
  */
 function permissionRescue(value, fullTextChars) {
   const entries = [];
@@ -1471,7 +2043,9 @@ function permissionRescue(value, fullTextChars) {
       path: 'permission', taskId: value.taskId, state: value.state, phase: value.phase, block: null, pending: bare, bare: true,
     });
   }
-  if (entries.length === 0) return null;
+  const receipt = minimalReceipt(value?.decisionReceipt);
+  const answerReceipt = minimalReceipt(value?.answerReceipt);
+  if (entries.length === 0 && receipt === null && answerReceipt === null) return null;
   return (cap) => {
     const records = [];
     const render = (entry) => {
@@ -1486,7 +2060,7 @@ function permissionRescue(value, fullTextChars) {
         pending.completeness = 'truncated';
         pending.allowBlocked = pending.allowBlocked ?? 'the operation could not be included within the tool-text bound';
         records.push({ path: 'permission.arguments', field: 'text', keptChars: 0, detail: 'the operation did not fit' });
-      } else if (cap < 4_000 && typeof pending.arguments === 'string' && pending.arguments.length > cap) {
+      } else if (cap < PERMISSION_ARGUMENTS_CAP && typeof pending.arguments === 'string' && pending.arguments.length > cap) {
         pending.arguments = boundedText(pending.arguments, cap, 'permission.arguments', records);
         pending.argumentsComplete = false;
         pending.completeness = pending.completeness === 'complete' ? 'truncated' : pending.completeness;
@@ -1494,8 +2068,17 @@ function permissionRescue(value, fullTextChars) {
       }
       return pending;
     };
+    /** Attach the receipt, with the omission stated where it happened. */
+    const withReceipt = (payload) => {
+      for (const [key, item] of [['decisionReceipt', receipt], ['answerReceipt', answerReceipt]]) {
+        if (item === null) continue;
+        records.push({ path: key, field: 'receipt', detail: 'identity and application facts retained; bulky evidence omitted' });
+        payload[key] = item;
+      }
+      return payload;
+    };
     if (entries.length === 1 && entries[0].bare === true) {
-      const payload = {
+      const payload = withReceipt({
         ok: value.ok,
         taskId: entries[0].taskId,
         state: entries[0].state,
@@ -1505,7 +2088,21 @@ function permissionRescue(value, fullTextChars) {
         permission: render(entries[0]),
         permissionDecidable: false,
         truncation: truncationBlock(records, fullTextChars, entries),
-      };
+      });
+      return JSON.stringify(redactDeepStrings(payload), null, 2);
+    }
+    if (entries.length === 0) {
+      // A RECEIPT-ONLY rescue: no live request survived to publish, but the decision must
+      // not vanish with the rest of the answer.
+      const payload = withReceipt({
+        ok: value.ok,
+        taskId: value.taskId ?? receipt?.taskId ?? answerReceipt?.taskId ?? null,
+        state: value.state ?? null,
+        phase: value.phase ?? null,
+        reason: value.reason ?? null,
+        actionable: true,
+        truncation: truncationBlock(records, fullTextChars, entries),
+      });
       return JSON.stringify(redactDeepStrings(payload), null, 2);
     }
     const tasks = entries.map((entry) => {
@@ -1519,9 +2116,9 @@ function permissionRescue(value, fullTextChars) {
         permission: block,
       };
     });
-    const payload = entries.length === 1 && entries[0].path === 'task'
+    const payload = withReceipt(entries.length === 1 && entries[0].path === 'task'
       ? { ok: value.ok, task: tasks[0], truncation: truncationBlock(records, fullTextChars, entries) }
-      : { ok: value.ok, tasks, truncation: truncationBlock(records, fullTextChars, entries) };
+      : { ok: value.ok, tasks, truncation: truncationBlock(records, fullTextChars, entries) });
     return JSON.stringify(redactDeepStrings(payload), null, 2);
   };
 }
@@ -1648,6 +2245,24 @@ export function createMcpServer(options) {
   // only shows up in the field.
   const calls = [];
   let initialized = false;
+  // The per-process census behind `delegate_metrics` and the exit diagnostics line.
+  // Counts, durations, byte sizes and closed-vocabulary reasons only.
+  const metrics = createCallMetrics({
+    now,
+    limit: Number.isInteger(options.metricsSamples) && options.metricsSamples > 0 ? options.metricsSamples : 64,
+  });
+  /** Per-server sequence, so every wait chain has its own identifier. */
+  let correlationSequence = 0;
+
+  /**
+   * The identifier of the next wait chain in this process.
+   * @param {string} prefix - `wait` or `decision`.
+   * @returns {string} identifier.
+   */
+  function nextCorrelationId(prefix) {
+    correlationSequence += 1;
+    return correlationId(prefix, correlationSequence);
+  }
 
   /**
    * Remember one call without growing without bound.
@@ -1658,6 +2273,7 @@ export function createMcpServer(options) {
     calls.push(record);
     if (calls.length > MAX_CALL_LOG) calls.splice(0, calls.length - MAX_CALL_LOG);
   }
+
   /**
    * Run one tool call and wrap the answer as MCP content.
    * @param {string} name - tool name.
@@ -1687,14 +2303,35 @@ export function createMcpServer(options) {
       };
     }
     recordCall({ tool: name, route, payload });
+    // Counted AFTER validation: a refused argument never reached the program, so it is
+    // not evidence of what this surface was asked to do.
+    metrics.recordToolCall(name);
+    // Every answer this call produces is measured in ONE place, after it has been bounded
+    // and redacted: `boundedJson` output IS the tool text the host parses, so its UTF-8
+    // size is the only honest byte count. Measuring earlier (on the raw plane body, or on
+    // the compact answer) would count something the host never receives, and measuring
+    // inside the answer would be self-referential. Not a delivery receipt: this is the
+    // size handed to the transport, not proof the host read it.
+    let producedText = null;
     try {
-      const result = name === 'delegate_wait'
-        ? await waitAnswer(payload, context)
-        : await callExecution(route, payload);
+      let result;
+      if (name === 'delegate_wait') {
+        result = await waitAnswer(payload, context);
+      } else if (name === 'delegate_permission_decide') {
+        result = await decidePermissionAnswer(payload, context);
+      } else if (name === 'delegate_question_answer') {
+        result = await answerQuestionCall(payload, context);
+      } else if (name === 'delegate_metrics') {
+        // A census of THIS process: no plane route, no task identity, nothing to change.
+        result = { ok: true, metrics: metrics.snapshot() };
+      } else {
+        result = await callExecution(route, payload);
+      }
       // A paged read of the review note returns only its slice: it is a different, small
       // ANSWER shape, not a projection of the big one.
       const page = name === 'delegate_result' ? reviewNotePage(payload, result) : null;
       const bounded = boundedJson(page ?? result);
+      producedText = bounded.text;
       // A structurally trimmed answer is a real answer, so `isError` stays unset;
       // only an answer that could not be delivered at all is reported as an error.
       return bounded.isError
@@ -1707,10 +2344,26 @@ export function createMcpServer(options) {
       const code = typeof error?.code === 'string' ? error.code : 'MCP_CALL_FAILED';
       const message = diagnostic(error?.message ?? String(error), 400) ?? 'the delegated call was refused';
       logger?.warn?.('dsh-delegate-mcp: call refused', code);
+      // A refusal that carries structured facts (a decision receipt whose outcome nobody
+      // established) publishes them as `error.details`. The refusal still REFUSES — nothing
+      // here turns it into a success — but a coordinator keeps the identity it needs to
+      // query the task instead of resending blindly.
+      const details = error instanceof McpError && error.details !== null && error.details !== undefined
+        ? error.details
+        : undefined;
+      producedText = boundedJson({
+        ok: false,
+        error: { code, message, ...(details === undefined ? {} : { details }) },
+      }).text;
       return {
-        content: [{ type: 'text', text: boundedJson({ ok: false, error: { code, message } }).text }],
+        content: [{ type: 'text', text: producedText }],
         isError: true,
       };
+    } finally {
+      // Counted for every outcome, including a refusal and a cancellation: the size is of
+      // the text this process handed back, whatever that text said. `null` means no text
+      // existed at all, which the census reports as an unmeasured return.
+      metrics.recordReturn(producedText);
     }
   }
 
@@ -1725,8 +2378,12 @@ export function createMcpServer(options) {
    * @param {{ signal?: AbortSignal }} context - per-request cancellation.
    * @returns {Promise<object>} `{ ok: true, ...answer }`.
    */
-  async function waitAnswer(payload, context) {
+  async function waitAnswer(payload, context, options = {}) {
     const waitSeconds = payload.waitSeconds ?? DEFAULT_WAIT_SECONDS;
+    const correlation = {
+      waitId: nextCorrelationId('wait'),
+      afterDecisionId: options.afterDecisionId ?? null,
+    };
     const result = await waitForTask({
       callExecution,
       taskId: payload.taskId,
@@ -1734,6 +2391,13 @@ export function createMcpServer(options) {
       signal: context?.signal,
       now,
       sleep,
+      correlation,
+      skipPermission: options.skipPermission,
+      skipQuestion: options.skipQuestion,
+      // The loop reports its own accounting once, on every exit path, so a wait that
+      // threw is counted too. Counting lives HERE, not in the answer: a thrown call has
+      // no answer to carry a count.
+      waitMetrics: (summary) => metrics.recordWait(summary),
     });
     if (result?.error !== undefined) {
       // The loop could not obtain an observation at all. That is a refusal with the
@@ -1742,6 +2406,344 @@ export function createMcpServer(options) {
       throw new McpError(result.error.code, result.error.message);
     }
     return { ok: true, ...result };
+  }
+
+  /**
+   * One `delegate_permission_decide` call.
+   *
+   * Two shapes, and the flag selects between them:
+   *
+   *  * **`waitAfterDecision` absent or `false` — the historical call, unchanged.** The
+   *    permission route's answer is returned verbatim, with no receipt and no added
+   *    field, so an existing client sees exactly what it saw in 1.4.2. Only the internal
+   *    census knows the call happened.
+   *  * **`waitAfterDecision: true` — decide, then continue in the SAME call.** The answer
+   *    is the flat wait shape a `delegate_wait` returns (`reason`/`state`/`permission`/
+   *    `task` at the top level, the whole redacted pending operation with its
+   *    `completeness`/`fingerprint`) plus a `decisionReceipt`. That shape is deliberate:
+   *    it is the shape `boundedJson` already protects, so a very large answer still keeps
+   *    the receipt AND the live request — `minimalReceipt` guarantees the identity and
+   *    `applied`/`confirmation` survive even the last-resort rescue, while a cut operation
+   *    is explicitly marked unapprovable rather than silently shortened.
+   *
+   * Five invariants, in order:
+   *
+   *  1. **The decision goes to the existing permission route, unchanged.** It is the only
+   *     thing that can apply it, and it re-validates ownership, the switch, the deadline,
+   *     the fingerprint and the completeness flags. It is sent FIRST and alone, so a
+   *     refused decision issues no other request and raises the same refusal code it always
+   *     did.
+   *  2. **`waitAfterDecision` never reaches the plane.** It is stripped here, at the MCP
+   *     boundary, and the decision route's existing unknown-field validation is the guard
+   *     for a caller that tries anyway. No route change is needed for this flag.
+   *  3. **`applied` is only claimed from matching evidence.** The receipt is built by
+   *     `decisionReceipt`, which requires the answer to name the SAME task, the SAME request
+   *     and the SAME operation the decision was bound to, plus a settled `state` and the
+   *     `outcome` this decision asked for. An answer that is `ok: false`, that lacks that
+   *     evidence, or that CONTRADICTS the decision is `applied: null` with
+   *     `confirmation: "unknown"` — never a fabricated `false` and never a silent
+   *     substitution of the quoted fingerprint — and it is refused and NOT continued.
+   *  4. **A new request is never inherited.** The shared wait loop skips an observation
+   *     that still describes the request this call decided, matching on requestId AND
+   *     fingerprint; anything else is answered as the new question it is.
+   *  5. **An applied decision is never unsaid.** If the follow-up wait then fails, is
+   *     cancelled or is interrupted, this call still SUCCEEDS with the receipt,
+   *     `reason: null` and a `waitError` block, instead of falling into the generic refusal
+   *     path that would replace the answer with a bare error and swallow the receipt.
+   * @param {object} payload - validated arguments (may carry `waitAfterDecision`).
+   * @param {{ signal?: AbortSignal }} context - per-request cancellation.
+   * @returns {Promise<object>} the permission answer, or the flat wait answer plus a receipt.
+   */
+  async function decidePermissionAnswer(payload, context) {
+    const { waitAfterDecision, ...decisionBody } = payload;
+    const receiptId = nextCorrelationId('decision');
+    let result;
+    try {
+      result = await callExecution('permission', decisionBody);
+    } catch (error) {
+      // Nothing was confirmed. Two cases, and they are NOT the same fact:
+      //
+      //  * the HARNESS answered with its own refusal code — the decision is definitely NOT
+      //    applied, which is the refusal every earlier client already handles;
+      //  * the call failed before an answer existed (transport, timeout, malformed body) —
+      //    whether it was applied is genuinely UNKNOWN, and that must never be reported as
+      //    a clean failure that invites a resend.
+      const code = typeof error?.code === 'string' ? error.code : 'MCP_CALL_FAILED';
+      const unconfirmed = UNCONFIRMED_DECISION_CODES.has(code);
+      const receipt = {
+        receiptId,
+        ...decisionReceipt({
+          taskId: decisionBody.taskId ?? null,
+          requestId: decisionBody.requestId ?? null,
+          decision: decisionBody.decision ?? null,
+          fingerprint: typeof decisionBody.fingerprint === 'string' ? decisionBody.fingerprint : null,
+          error: { code },
+          refusedByHarness: !unconfirmed,
+        }),
+      };
+      metrics.recordDecision({
+        receiptId,
+        taskId: receipt.taskId,
+        requestId: receipt.requestId,
+        decision: receipt.decision,
+        fingerprint: receipt.fingerprint,
+        applied: receipt.applied,
+        confirmation: receipt.confirmation,
+      });
+      // The historical protocol is unchanged: without the flag the refusal is rethrown
+      // exactly as before, with no added field.
+      if (waitAfterDecision !== true) throw error;
+      // With the flag, an UNCONFIRMED decision is still refused (nothing awaits it), but the
+      // refusal now CARRIES its identity so a coordinator can query the task by name instead
+      // of resending blindly. A harness refusal keeps its own code and its own shape.
+      if (!unconfirmed) throw error;
+      throw new McpError(code, `${error?.message ?? 'the decision could not be confirmed'} `
+        + '(unknown whether it was applied; read the task with delegate_result before sending it again)', {
+        details: { decisionReceipt: receipt },
+      });
+    }
+    const receipt = { receiptId, ...decisionReceipt({
+      taskId: decisionBody.taskId ?? null,
+      requestId: decisionBody.requestId ?? null,
+      decision: decisionBody.decision ?? null,
+      fingerprint: typeof decisionBody.fingerprint === 'string' ? decisionBody.fingerprint : null,
+      answer: result,
+    }) };
+    metrics.recordDecision({
+      receiptId,
+      taskId: receipt.taskId,
+      requestId: receipt.requestId,
+      decision: receipt.decision,
+      fingerprint: receipt.fingerprint,
+      applied: receipt.applied,
+      confirmation: receipt.confirmation,
+    });
+    if (waitAfterDecision !== true) return result;
+    // A decision that could not be CONFIRMED must never continue: the answer would look like
+    // a running task whose state nobody established. It is refused with its identity instead.
+    if (receipt.applied !== true) {
+      throw new McpError('MCP_DECISION_UNCONFIRMED',
+        `the decision was not confirmed by the harness (${receipt.reason ?? 'no usable confirmation evidence'}); `
+        + 'read the task with delegate_result before deciding whether to send it again',
+        { details: { decisionReceipt: receipt } });
+    }
+    // The same wait loop a plain `delegate_wait` uses: its default deadline, its 25-second
+    // observation bound, its heartbeat handling and its interruption classification. The
+    // ONLY addition is the rollover predicate.
+    let answer;
+    try {
+      answer = await waitAnswer({ taskId: receipt.taskId }, context, {
+        afterDecisionId: receipt.receiptId,
+        skipPermission: decidedRequestMatcher(receipt),
+      });
+    } catch (error) {
+      // The decision was ALREADY APPLIED. The general refusal path would replace this answer
+      // with a bare error and swallow the receipt, which is exactly how a coordinator loses
+      // track of an authorization that IS in force. So a follow-up failure — a transport
+      // error, an abort, a spent deadline — is reported WITH the receipt, and says plainly
+      // that only the waiting failed.
+      const code = typeof error?.code === 'string' ? error.code : 'MCP_CALL_FAILED';
+      const message = diagnostic(error?.message ?? String(error), 400) ?? 'the follow-up wait could not be completed';
+      logger?.warn?.('dsh-delegate-mcp: decision applied, follow-up wait ended', code);
+      return {
+        ok: true,
+        // A wait outcome, not a decision outcome: `reason: null` states that no task state was
+        // observed, so nothing can be read as "still running" or "finished".
+        reason: null,
+        taskId: receipt.taskId,
+        actionable: false,
+        terminal: false,
+        instruction: 'The decision WAS applied and stands — do not resend it. This call\'s follow-up wait '
+          + 'failed or was interrupted; the execution was NOT stopped, cancelled or reassigned. Keep the taskId '
+          + 'and call delegate_wait again on the SAME task to resume following it.',
+        waitError: { code, message, phase: 'follow-up-wait' },
+        decisionReceipt: receipt,
+      };
+    }
+    return { ...answer, decisionReceipt: receipt };
+  }
+
+  /**
+   * The request id of a pending block, in either published shape.
+   *
+   * A wait answer may publish the block directly (`{ requestId, questions }`) or wrap it
+   * (`{ pending: { requestId, questions } }`), and both are accepted everywhere else in this
+   * file. Reading only one shape here would make the post-answer rollover skip nothing — the
+   * answered question would be offered again as if it were new — so both are read in one place.
+   * @param {unknown} block - the published question block.
+   * @returns {string | null} the request id, or null.
+   */
+  function pendingRequestIdOf(block) {
+    if (block === null || typeof block !== 'object') return null;
+    const inner = block.questions === undefined && block.pending !== null && typeof block.pending === 'object'
+      ? block.pending
+      : block;
+    return typeof inner?.requestId === 'string' && inner.requestId !== '' ? inner.requestId : null;
+  }
+
+  /**
+   * Whether a route's echoed answer batch is the one this call sent.
+   *
+   * Compared entry by entry, because a route that normalised an answer differently (dropped
+   * a label, changed custom text, duplicated a question) did NOT apply what was sent. Order
+   * is not significant: answers are identified by question id.
+   * @param {unknown} echoed - the route's answers.
+   * @param {unknown} sent - the answers this call sent.
+   * @returns {boolean} true only when both batches are equal by id.
+   */
+  function sameAnswerBatch(echoed, sent) {
+    if (!Array.isArray(echoed) || !Array.isArray(sent)) return false;
+    if (echoed.length !== sent.length) return false;
+    const byId = new Map();
+    for (const entry of echoed) {
+      if (entry === null || typeof entry !== 'object' || typeof entry.id !== 'string') return false;
+      if (byId.has(entry.id)) return false;
+      byId.set(entry.id, entry);
+    }
+    for (const entry of sent) {
+      const other = byId.get(entry?.id);
+      if (other === undefined) return false;
+      const left = Array.isArray(other.selected) ? other.selected : [];
+      const right = Array.isArray(entry.selected) ? entry.selected : [];
+      if (left.length !== right.length || left.some((label, index) => label !== right[index])) return false;
+      const leftCustom = typeof other.custom === 'string' ? other.custom : null;
+      const rightCustom = typeof entry.custom === 'string' ? entry.custom : null;
+      if (leftCustom !== rightCustom) return false;
+    }
+    return true;
+  }
+
+  /**
+   * One `delegate_question_answer` call.
+   *
+   * The same two shapes the permission decision has, for the same reasons:
+   *
+   *  * **`waitAfterAnswer` absent or `false` — the plain call.** The question route's
+   *    answer is returned verbatim, so a client that only answers sees exactly the route
+   *    reply and nothing it must learn.
+   *  * **`waitAfterAnswer: true` — answer, then keep following in the SAME call.** The
+   *    answer is the flat wait shape plus an `answerReceipt`.
+   *
+   * Four invariants:
+   *
+   *  1. **The answer goes to the question route, unchanged.** It is the only thing that
+   *     can apply it: ownership, the switch, the deadline, the single-use rule and the
+   *     per-question validation all live behind it. It is sent FIRST and alone, so a
+   *     refused answer issues no other request.
+   *  2. **`waitAfterAnswer` never reaches the plane.** It is stripped at this boundary.
+   *  3. **The receipt is evidence, not optimism.** `applied: true` is claimed only when
+   *     the route answered `ok: true` AND its `answer.receiptId`/`requestId` match the
+   *     ones this call sent. A transport failure is `applied: null` with
+   *     `confirmation: "unknown"`, because whether it landed is genuinely unknown — and
+   *     the receipt then tells the caller to read the task rather than resend.
+   *  4. **An applied answer is never unsaid.** A failed follow-up wait still SUCCEEDS
+   *     with the receipt, `reason: null` and a `waitError`, saying plainly that only the
+   *     waiting ended.
+   * @param {object} payload - validated arguments (may carry `waitAfterAnswer`).
+   * @param {{ signal?: AbortSignal }} context - per-request cancellation.
+   * @returns {Promise<object>} the question answer, or the flat wait answer plus a receipt.
+   */
+  async function answerQuestionCall(payload, context) {
+    const { waitAfterAnswer, ...answerBody } = payload;
+    const receiptId = nextCorrelationId('answer');
+    const receiptFor = (applied, confirmation, extra = {}) => ({
+      receiptId,
+      taskId: answerBody.taskId ?? null,
+      requestId: answerBody.requestId ?? null,
+      answers: Array.isArray(answerBody.answers)
+        ? answerBody.answers.map((entry) => ({
+          id: entry?.id ?? null,
+          selected: Array.isArray(entry?.selected) ? [...entry.selected] : [],
+          ...(typeof entry?.custom === 'string' ? { custom: entry.custom } : {}),
+        }))
+        : [],
+      applied,
+      confirmation,
+      // Stated on every receipt so no reader can mistake this for an approval.
+      grantsAccess: false,
+      ...extra,
+    });
+    let result;
+    try {
+      result = await callExecution('question', answerBody);
+    } catch (error) {
+      const code = typeof error?.code === 'string' ? error.code : 'MCP_CALL_FAILED';
+      const unconfirmed = UNCONFIRMED_DECISION_CODES.has(code);
+      const receipt = receiptFor(
+        unconfirmed ? null : false,
+        unconfirmed ? 'unknown' : 'refused',
+        { reason: code },
+      );
+      // The historical protocol is unchanged: without the flag the refusal is rethrown as
+      // it is, with no added field.
+      if (waitAfterAnswer !== true) throw error;
+      if (!unconfirmed) throw error;
+      throw new McpError(code, `${error?.message ?? 'the answer could not be confirmed'} `
+        + '(unknown whether it was applied; read the task with delegate_result before sending it again)', {
+        details: { answerReceipt: receipt },
+      });
+    }
+    const answered = result?.answer ?? null;
+    // Confirmation requires the route to echo the SAME task, request AND the answers it
+    // actually normalised. A route that answers `ok: true` for a different request, or
+    // whose stored answers differ from what was sent, established nothing about THIS
+    // answer — so `applied` becomes `null` with `confirmation: "unknown"`, never `false`
+    // (which would read as "definitely not applied" and invite a resend).
+    const confirmed = result?.ok === true
+      && answered !== null && typeof answered === 'object'
+      && answered.requestId === answerBody.requestId
+      && answered.taskId === answerBody.taskId
+      && sameAnswerBatch(answered.answers, answerBody.answers);
+    const receipt = receiptFor(confirmed ? true : null, confirmed ? 'confirmed' : 'unknown', {
+      ...(confirmed ? {} : { reason: 'the route answered without matching this request and its answers' }),
+    });
+    metrics.recordDecision({
+      receiptId,
+      taskId: receipt.taskId,
+      requestId: receipt.requestId,
+      decision: QUESTION_ANSWER_KIND,
+      fingerprint: null,
+      applied: receipt.applied,
+      confirmation: receipt.confirmation,
+    });
+    if (waitAfterAnswer !== true) return result;
+    if (receipt.applied !== true) {
+      throw new McpError('MCP_ANSWER_UNCONFIRMED',
+        `the answer was not confirmed by the harness (${receipt.reason ?? 'no usable confirmation evidence'}); `
+        + 'read the task with delegate_result before answering again',
+        { details: { answerReceipt: receipt } });
+    }
+    let answer;
+    try {
+      answer = await waitAnswer({ taskId: receipt.taskId }, context, {
+        afterDecisionId: receipt.receiptId,
+        // The set this call just answered can occupy the engine's slot for a moment. Skip
+        // exactly that request id; a different one is a NEW question and returns at once.
+        // The id is read from the block directly AND from a `{ pending: … }` wrapper,
+        // because a harness may publish either shape — a matcher that knew one would let the
+        // answered question be re-offered as a new one.
+        skipQuestion: (observation) => pendingRequestIdOf(observation?.question) === receipt.requestId,
+      });
+    } catch (error) {
+      // The answer WAS applied. Reporting the generic refusal here would swallow the
+      // receipt, which is how a coordinator loses track of an answer that is in force.
+      const code = typeof error?.code === 'string' ? error.code : 'MCP_CALL_FAILED';
+      const message = diagnostic(error?.message ?? String(error), 400) ?? 'the follow-up wait could not be completed';
+      logger?.warn?.('dsh-delegate-mcp: answer applied, follow-up wait ended', code);
+      return {
+        ok: true,
+        reason: null,
+        taskId: receipt.taskId,
+        actionable: false,
+        terminal: false,
+        instruction: 'The answer WAS applied and stands — do not resend it. This call\'s follow-up wait failed or '
+          + 'was interrupted; the execution was NOT stopped, cancelled or reassigned. Keep the taskId and call '
+          + 'delegate_wait again on the SAME task to resume following it.',
+        waitError: { code, message, phase: 'follow-up-wait' },
+        answerReceipt: receipt,
+      };
+    }
+    return { ...answer, answerReceipt: receipt };
   }
 
   /**
@@ -1797,7 +2799,18 @@ export function createMcpServer(options) {
               + 'pauses that call and reports it as `permission.pending` in delegate_result; while it waits the '
               + 'task stays `running` with phase `awaiting-permission`. Answer exactly one such request with '
               + 'delegate_permission_decide (`allow-once` or `reject`). That decision covers only that call, is '
-              + 'never a standing grant, and cannot approve anything else. To follow a task without polling, use '
+              + 'never a standing grant, and cannot approve anything else. When your channel supports it, pass '
+              + '`waitAfterDecision: true`: the decision and the following wait then happen in ONE call, and the '
+              + 'answer is the same compact shape delegate_wait returns plus `decisionReceipt`. Deciding and then '
+              + 'waiting is what resumes the task; a client without the flag decides first and then calls '
+              + 'delegate_wait on the same taskId. `decisionReceipt.applied: true` is claimed only when the harness '
+              + 'confirmed the same task, request and operation. `applied: null` with `confirmation: "unknown"` '
+              + 'means nothing was established — the call failed before an answer, or the answer contradicted or '
+              + 'lacked the evidence to confirm it (the refusal carries `error.details.decisionReceipt`) — so read '
+              + 'the task with delegate_result before sending the decision again, and never resend automatically. '
+              + 'When an APPLIED decision\'s follow-up wait fails or is cancelled, the call still succeeds with that '
+              + 'receipt, `reason: null` and a `waitError` block: only the waiting ended, the execution was not '
+              + 'stopped, and the decision must not be resent. To follow a task without polling, use '
               + 'delegate_wait({ taskId }): one call blocks until the task needs you (permission, ready, failed, '
               + 'cancelled, interrupted) or until its own one-hour deadline, in which case it answers reason '
               + '`wait-limit` with `actionable: false` and you call it again with the same taskId instead of '
@@ -1810,24 +2823,34 @@ export function createMcpServer(options) {
               + 'own client tool timeout firing, does not prove the execution stopped or that it is alive: keep '
               + 'the taskId and check one compact fact if you need to, and never duplicate, restart or cancel a '
               + 'task merely because a wait or a client timeout ended. '
+              + 'Four different things must not be confused. (a) `wait-limit` is this call\'s OWN deadline: nothing '
+              + 'changed, wait again on the same taskId. (b) Your client handing the call back on its own tool/exec '
+              + 'time limit is an OUTER limit: the observation did not end and the worker did not stop, so continue '
+              + 'the SAME exec cell and ask for the longest yield the host supports (roughly 1200000 ms when a '
+              + 'yield/pragmas parameter exists, not a minute) instead of re-issuing every second. (c) `attention` '
+              + 'is genuine inactivity: no activity for the configured threshold (ten minutes by default) while the '
+              + 'task still runs. (d) The task\'s total execution timeout is the worker\'s own budget, reported as a '
+              + 'terminal state — it is not `wait-limit`, not `attention` and not a client-side event. A real '
+              + 'failure is worth one de-duplicated reminder; an ordinary single failing test inside the worker is '
+              + 'the worker\'s job to fix and is not a host event. '
               + '`interrupted` never means the execution stopped by itself: this call returns it at once '
               + 'with `terminal: false` while the task is still pending or running (wait again on the same '
               + 'taskId); only a task record that is itself interrupted (a restart history) is `terminal: true`. '
-              + 'A host that hands the wait back on its own tool/exec time limit is reporting an OUTER limit, '
-              + 'not a result: the MCP observation did not end and the worker did not stop. Continue the SAME '
-              + 'exec cell on the taskId you hold, ask for the longest yield the host supports (roughly 1200000 '
-              + 'ms when a yield/pragmas parameter exists, not a minute) rather than re-issuing every second, and '
-              + 'do not open a second wait, read delegate_result or submit a duplicate. A one-minute return is a '
-              + 'caller choice, not a documented hard limit, and not every client offers the same yield. This '
-              + 'plugin cannot create a background waiter or wake the agent, so a client with only a short yield '
-              + 'and no automatic continuation costs one resumed turn per yield window — state that plainly '
-              + 'instead of inventing a wake-up. An `attention` answer that carries a `failure` '
+              + 'A one-minute return is a caller choice, not a documented hard limit, and not every client offers '
+              + 'the same yield. This plugin cannot create a background waiter or wake the agent, so a client with '
+              + 'only a short yield and no automatic continuation costs one resumed turn per yield window; there is '
+              + 'no zero-wake guarantee across clients — state that plainly instead of inventing a wake-up. '
+              + 'An `attention` answer that carries a `failure` '
               + 'block means the worker repeated the same failed operation several times while still running: '
               + 'it is a question for the host, sent once, and nothing is cancelled or reconfigured for it. '
               + 'If a host serialises tool calls so that this '
               + 'connection is blocked by a long wait, the independently installed `dsh-delegate-control` '
               + 'binary can report or cancel one task from a separate process; it cannot submit, configure or '
               + 'change the switch. '
+              + '`delegate_metrics` is a read-only census of THIS MCP process: tool calls, wait returns and their '
+              + 'reasons, the UTF-8 bytes of the tool text it returned, and applied decisions. It counts the '
+              + 'PROGRAM, not the host model: the host\'s own turns, token usage and cost are reported as '
+              + '`not-integrated` because this process cannot observe them. '
               + 'When a task reaches `ready`/`awaiting-host-review`, finish YOUR review and record it with '
               + 'delegate_review ({ taskId, decision: "accepted" | "changes-requested", note }): that call is the '
               + 'only thing that records host acceptance, and until it is made the task stays unreviewed. '
@@ -1872,7 +2895,16 @@ export function createMcpServer(options) {
     }
   }
 
-  return { handle, tools: TOOLS, calls, isInitialized: () => initialized };
+  return {
+    handle,
+    tools: TOOLS,
+    calls,
+    isInitialized: () => initialized,
+    /** The bounded census behind `delegate_metrics`; counts and sizes only. */
+    metrics: () => metrics.snapshot(),
+    /** One line for the exit diagnostics; counts and byte totals, no task content. */
+    diagnosticsLine: () => metrics.diagnosticsLine(),
+  };
 }
 
 /**

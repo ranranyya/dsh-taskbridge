@@ -350,6 +350,21 @@ export const KNOWN_AGENT_TEMPLATES = [
   // Exact published 1.4.1 companion, including its LF and CRLF forms.
   { version: '1.4.1', sha256: '8b6211918ce867ecfdac3495973813a70b7290bdd40221b439d98638f82ac3d4' },
   { version: '1.4.1', sha256: 'e2a8dc4cac897266e198b98be8fbf91d4159ab9a799704f200224457d292b5be' },
+  // Exact 1.4.2 bytes, taken from that RELEASE's own `codex/dsh-taskbridge.toml` in the
+  // repository's HEAD (the file as it was published, before later edits), in the LF form it
+  // was committed in (`38234033…`, 26388 bytes) and the CRLF form a Windows install rewrites
+  // it to (`b62426ab…`, 26740 bytes). Both were computed from the committed blob, never from
+  // the current working-tree template: deriving them from the NEW text would make every
+  // untouched 1.4.2 install hash to an unknown value, be reported `modified` and never be
+  // refreshed. An operator-edited file still hashes to something unknown and stays untouched.
+  { version: '1.4.2', sha256: '38234033103190c0523fbf5223c848186fbd03d86b109e89940d1623e430bfb7' },
+  { version: '1.4.2', sha256: 'b62426abad77e06b054941cc71fb3d821a9e0d695b1196f62e2170c47c6d17a7' },
+  // Exact local test.1 template, read from its installed package (LF and CRLF).
+  { version: '1.4.3-test.1', sha256: 'a42fa6da6f028f7ea489ee4b97af7a734958d0cf5ee9affe4361fd534b233882' },
+  { version: '1.4.3-test.1', sha256: 'd9fcf481dd7cd61a019dfd753f9dc29c6ad34e6a6aeb4e31e08de7117ff1deaf' },
+  // Exact installed test.2 package verified by the coordinator before 1.5.0.
+  { version: '1.4.3-test.2', sha256: 'a761461a769b8f297be0e4b7bb68de591918d5afa74a8348e9d475c87011a967' },
+  { version: '1.4.3-test.2', sha256: '75ee69400e040d8e18542121a0a49467539368cc0205cc120785b62b6692e16d' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */

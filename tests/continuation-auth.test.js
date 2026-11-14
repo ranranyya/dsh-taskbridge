@@ -26,14 +26,18 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { AuthorizationRegistry } from '../src/auth/grants.js';
+import { redactText } from '../src/config/redact.js';
 import { SettingsService } from '../src/config/settings.js';
 import { HistoryStore } from '../src/jobs/history.js';
 import { JobEngine, JOB_CODES, TASK_STATES } from '../src/jobs/engine.js';
 import { SessionStore } from '../src/runtime/session-placement.js';
+import { isPathDigest, pathDigest, recordedPathIsMasked } from '../src/jobs/continuation-identity.js';
 import { WorkspaceLocks } from '../src/workspace/locks.js';
 import {
   cleanup,
@@ -248,17 +252,23 @@ async function settle(engine, taskId) {
  * @returns {Promise<object>} the start request.
  */
 async function startOf(process, credentials, prompt, extra = {}) {
+  // `workspace` may be overridden so an acceptance case can drive a repository that is
+  // NOT the fixture's own tree (for example a path outside every temporary root, or a
+  // managed tree). It defaults to the fixture workspace, so every existing case is
+  // unchanged.
+  const workspace = typeof extra.workspace === 'string' ? extra.workspace : process.workspace;
+  const { workspace: _ignored, expectState: _expect, ...rest } = extra;
   const grant = process.auth.issueGrant(credentials.connectionId, {
     kind: 'task',
-    workspacePath: process.workspace,
+    workspacePath: workspace,
     ttlSeconds: 600,
   });
   return {
     connectionId: credentials.connectionId,
     grantId: grant.grantId,
-    workspacePath: process.workspace,
+    workspacePath: workspace,
     prompt,
-    ...extra,
+    ...rest,
   };
 }
 
@@ -273,7 +283,8 @@ async function startOf(process, credentials, prompt, extra = {}) {
 async function runOne(process, credentials, prompt, extra = {}) {
   const started = await process.engine.start(await startOf(process, credentials, prompt, extra));
   const settled = await settle(process.engine, started.taskId);
-  assert.equal(settled.state, TASK_STATES.awaitingHostReview, `the task did not complete: ${JSON.stringify(settled.error)}`);
+  const expected = extra.expectState ?? TASK_STATES.awaitingHostReview;
+  assert.equal(settled.state, expected, `the task did not reach ${expected}: ${JSON.stringify(settled.error)}`);
   return settled.taskId;
 }
 
@@ -1033,14 +1044,31 @@ test('a masked path is never a wildcard: it is refused, not matched', async () =
     // The durable document is projected through redaction, which rewrites an
     // account-identifying segment into a mask. The test writes that form explicitly
     // instead of relying on the platform's temporary path to be rewritten: the mask
-    // must not be read as "any segment" in either direction — it cannot prove which
-    // directory it named, so this record can never be continued.
+    // must not be read as "any segment" in any direction — it cannot prove which
+    // directory it named, so on its own this record can never be continued.
+    //
+    // The digests are rewritten too. A row that carried the real digests beside a
+    // mask would still PROVE the real directory (that is the point of recording
+    // them), so leaving them would test the digest proof, not the wildcard rule.
     const maskedPath = join(h.root, MASK);
     assert.equal(recordedIsMasked(maskedPath), true);
     const after = await h.restart();
     try {
+      const original = await after.sessionStore.get(parentId);
+      assert.ok(original !== null, 'the fixture needs the real identity to derive the wrong digests');
+      const maskedSourceDigest = pathDigest(maskedPath);
+      const maskedExecutionDigest = pathDigest(maskedPath);
+      // A different directory than the one the parent ran in.
+      assert.notEqual(maskedSourceDigest, original.sourcePathDigest, 'the fixture must change the directory');
+      assert.notEqual(maskedExecutionDigest, original.executionPathDigest, 'the fixture must change the directory');
       await rewriteHistory(after, h.dir, (row) => (row.taskId === parentId
-        ? { ...row, sourcePath: maskedPath, executionWorkspacePath: maskedPath }
+        ? {
+          ...row,
+          sourcePath: maskedPath,
+          executionWorkspacePath: maskedPath,
+          sourcePathDigest: maskedSourceDigest,
+          executionPathDigest: maskedExecutionDigest,
+        }
         : row));
       // The premise is read back through the seam the engine actually consumes
       // (`history.load()`), not from the document on disk: `rewriteHistory` replaces that
@@ -1056,6 +1084,63 @@ test('a masked path is never a wildcard: it is refused, not matched', async () =
         after.engine.start(await startOf(after, a, 'continue', { continueFromTaskId: parentId })),
         JOB_CODES.continuationRefused,
         { session: 'SESSION_CONTINUATION_WORKSPACE_MISMATCH' },
+      );
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('a masked path with no digest beside it is unusable, exactly like a missing one', async () => {
+  const h = await fixture();
+  try {
+    const a = authorize(h.auth, h.workspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work');
+    const maskedPath = join(h.root, MASK);
+    const after = await h.restart();
+    try {
+      // The mask alone: no digest can stand in for the directory it named.
+      await rewriteHistory(after, h.dir, (row) => (row.taskId === parentId
+        ? {
+          ...row,
+          sourcePath: maskedPath,
+          executionWorkspacePath: maskedPath,
+          sourcePathDigest: null,
+          executionPathDigest: null,
+        }
+        : row));
+      await assertRefusedUntouched(
+        after,
+        after.engine.start(await startOf(after, a, 'continue', { continueFromTaskId: parentId })),
+        JOB_CODES.continuationRefused,
+        { session: 'SESSION_CONTINUATION_WORKSPACE_MISMATCH' },
+      );
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('a digest that contradicts the readable path beside it is refused, not preferred', async () => {
+  const h = await fixture();
+  try {
+    const a = authorize(h.auth, h.workspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work');
+    const after = await h.restart();
+    try {
+      const elsewhere = pathDigest(join(h.root, 'not-this-repository'));
+      await rewriteHistory(after, h.dir, (row) => (row.taskId === parentId
+        ? { ...row, executionPathDigest: elsewhere }
+        : row));
+      await assertRefusedUntouched(
+        after,
+        after.engine.start(await startOf(after, a, 'continue', { continueFromTaskId: parentId })),
+        JOB_CODES.continuationRefused,
+        { session: 'SESSION_CONTINUATION_UNAVAILABLE' },
       );
     } finally {
       await after.engine.dispose();
@@ -1414,5 +1499,279 @@ test('assertAdmissible: an owner is compared exactly and an unstated owner is ne
   } finally {
     await h.before.engine.dispose();
     await h.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Acceptance: real stores, a real engine rebuild, real private temp parents
+//
+// The restart helper already re-creates `HistoryStore`, `SessionStore` and `JobEngine`
+// over the data directory, so these tests drive that same machinery — not a stub.
+// What they add is the ACCEPTANCE shape the first implementation missed, and each one
+// asserts its PREMISE first so it cannot pass for the wrong reason:
+//
+//  * a path OUTSIDE any temporary root (the ordinary repository, the installed
+//    package) is never masked;
+//  * a path INSIDE a per-profile temporary root IS masked in the history row, and the
+//    follow-up still continues the SAME Session because that row carries a digest;
+//  * a digest is not a reverser: when the identity store is itself masked there is no
+//    trustworthy original, so the follow-up is refused;
+//  * a legacy row with no digest and no readable path cannot be guessed back.
+// ---------------------------------------------------------------------------
+
+/**
+ * A real, writable repository-shaped root OUTSIDE every temporary root.
+ *
+ * The temp-dir helper always creates below the platform temp root, which on this host
+ * is itself a per-profile directory redaction masks. A test claiming "an ordinary path
+ * is kept" therefore cannot use it. This builds the root inside this repository's own
+ * `.cache` instead: writable under the sandbox, in no temporary root at all, and
+ * containing the literal `dsh-delegate` segment the acceptance case is about.
+ * @param {string} name - last path segment (for example `dsh-delegate`).
+ * @returns {Promise<{ dir: string, cleanup: () => Promise<void> }>} the root.
+ */
+async function plainRepositoryRoot(name) {
+  const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+  const base = await mkdtemp(join(repoRoot, '.cache', 'acceptance-'));
+  const dir = join(base, name);
+  await mkdir(dir, { recursive: true });
+  return {
+    dir,
+    async cleanup() { await rm(base, { recursive: true, force: true }); },
+  };
+}
+
+test('acceptance: the ordinary dsh-delegate repository keeps its readable path after a restart', async () => {
+  const h = await fixture();
+  const plain = await plainRepositoryRoot('dsh-delegate');
+  try {
+    // The premise, asserted before the engine sees it: this path is NOT masked.
+    assert.equal(recordedPathIsMasked(redactText(plain.dir)), false, 'the fixture must be an unmasked path');
+    const a = authorize(h.auth, plain.dir, 'A');
+    const parentId = await runOne(h.before, a, 'do work', { workspace: plain.dir });
+    const after = await h.restart();
+    try {
+      const row = await historyRow(h.dir, parentId);
+      assert.equal(row.sourcePath, plain.dir, 'the history row keeps the exact real path');
+      assert.equal(redactText(row.sourcePath), row.sourcePath, 'projection does not shorten it');
+      assert.equal(recordedPathIsMasked(row.executionWorkspacePath), false);
+      assert.ok(isPathDigest(row.executionPathDigest), 'the row still carries its execution digest');
+      const identity = await identityRow(h.dir, parentId);
+      assert.equal(identity.sourcePath, plain.dir, 'the identity map keeps the operator spelling');
+    const ownId = await runOne(after, a, 'continue my own', { continueFromTaskId: parentId, workspace: plain.dir });
+      const own = after.engine.get(ownId);
+      assert.equal(own.conversation.kind, 'continuation');
+      assert.equal(own.conversation.sessionId, identity.sessionId, 'the follow-up resumed the SAME Session');
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+    await plain.cleanup();
+  }
+});
+
+test('acceptance: an installed node_modules/dsh-taskbridge path is readable and continuable', async () => {
+  const h = await fixture();
+  const plain = await plainRepositoryRoot('dsh-delegate');
+  try {
+    // The exact installed-package spelling from the report.
+    const installed = join(plain.dir, 'node_modules', 'dsh-taskbridge');
+    await mkdir(installed, { recursive: true });
+    assert.equal(recordedPathIsMasked(redactText(installed)), false, 'the fixture must be an unmasked path');
+    const a = authorize(h.auth, installed, 'A');
+    const parentId = await runOne(h.before, a, 'do work', { workspace: installed });
+    const after = await h.restart();
+    try {
+      const row = await historyRow(h.dir, parentId);
+      assert.equal(row.sourcePath, installed, 'the package path is kept verbatim');
+      assert.equal(recordedPathIsMasked(row.executionWorkspacePath), false);
+      assert.equal(recordedPathIsMasked(row.execution?.conversation?.workspacePath), false);
+      const identity = await identityRow(h.dir, parentId);
+      const ownId = await runOne(after, a, 'continue my own', { continueFromTaskId: parentId, workspace: installed });
+      const own = after.engine.get(ownId);
+      assert.equal(own.conversation.kind, 'continuation');
+      assert.equal(own.conversation.sessionId, identity.sessionId);
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+    await plain.cleanup();
+  }
+});
+
+test('acceptance: a real private temp parent is masked on disk yet the SAME Session is continued', async () => {
+  const h = await fixture();
+  // A per-profile temporary parent of the shape this host produces:
+  // .../Temp/dsh-<6 id chars>/workspace. It sits directly under the temp root, so
+  // redaction MUST mask it — this is the case the digest exists for.
+  const profileRoot = await realpath(await mkdtemp(join(tmpdir(), 'dsh-')));
+  const privateWorkspace = join(profileRoot, 'workspace');
+  await mkdir(privateWorkspace, { recursive: true });
+  try {
+    const masked = redactText(privateWorkspace);
+    assert.equal(recordedPathIsMasked(masked), true, 'the premise: this path really is masked');
+    const a = authorize(h.auth, privateWorkspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work', { workspace: privateWorkspace });
+    const after = await h.restart();
+    try {
+      const row = await historyRow(h.dir, parentId);
+      assert.equal(row.executionWorkspacePath, masked, 'the history row carries the mask');
+      assert.equal(row.sourcePath, masked, 'both stored paths are shortened');
+      assert.ok(isPathDigest(row.executionPathDigest), 'the digest survives the same projection');
+      // The identity map keeps the REAL path, so a follow-up has a trustworthy source.
+      const identity = await identityRow(h.dir, parentId);
+      assert.equal(identity.executionPath, privateWorkspace, 'the identity map is not projected');
+      // ...and the continuation really resumes the same thread in the same directory.
+      const ownId = await runOne(after, a, 'continue in the private tree', { continueFromTaskId: parentId, workspace: privateWorkspace });
+      const own = after.engine.get(ownId);
+      assert.equal(own.conversation.kind, 'continuation');
+      assert.equal(own.conversation.sessionId, identity.sessionId, 'the SAME Session was continued');
+      assert.equal(own.conversation.workspaceId, identity.workspaceId, 'the SAME Workspace was reused');
+      // The follow-up executed in the REAL directory, never in the mask.
+      assert.equal(after.sessionController.sessions.get(identity.sessionId)?.cwd, privateWorkspace);
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+    await rm(profileRoot, { recursive: true, force: true });
+  }
+});
+
+test('acceptance: a masked identity with no other trustworthy original cannot be turned into a path', async () => {
+  const h = await fixture();
+  const profileRoot = await realpath(await mkdtemp(join(tmpdir(), 'dsh-')));
+  const privateWorkspace = join(profileRoot, 'workspace');
+  await mkdir(privateWorkspace, { recursive: true });
+  try {
+    const a = authorize(h.auth, privateWorkspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work', { workspace: privateWorkspace });
+    const after = await h.restart();
+    try {
+      // BOTH documents are projected the way a published answer would be: the paths
+      // become the mask while the digests stay. A digest is not a reverser, so without
+      // the original spelling there is nothing to open. This must be refused, never
+      // satisfied by substituting the mask itself as a directory.
+      const masked = redactText(privateWorkspace);
+      assert.equal(recordedPathIsMasked(masked), true);
+      await rewriteIdentity(h.dir, parentId, () => ({ sourcePath: masked, executionPath: masked }));
+      await rewriteHistory(after, h.dir, (row) => (row.taskId === parentId
+        ? { ...row, sourcePath: masked, executionWorkspacePath: masked }
+        : row));
+      const counts = nativeCounts(after);
+      await assertRefusedUntouched(
+        after,
+        after.engine.start(await startOf(after, a, 'continue', { continueFromTaskId: parentId, workspace: privateWorkspace })),
+        JOB_CODES.continuationRefused,
+      );
+      // Nothing was opened by the refused attempt, and no Session anywhere runs in the
+      // mask directory.
+      assert.equal(after.sessionController.resolves.length, counts.resolves,
+        'the mask is never resolved as a Session');
+      for (const session of after.sessionController.sessions.values()) {
+        assert.equal(session.cwd.includes('masks-user-profile-segment'), false,
+          'no Session may run in the mask directory');
+      }
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+    await rm(profileRoot, { recursive: true, force: true });
+  }
+});
+
+test('acceptance: a legacy row with no digest still continues by its readable path, and is refused without one', async () => {
+  const h = await fixture();
+  const plain = await plainRepositoryRoot('dsh-delegate');
+  try {
+    const a = authorize(h.auth, plain.dir, 'A');
+    const parentId = await runOne(h.before, a, 'do work', { workspace: plain.dir });
+    const after = await h.restart();
+    try {
+      // A row written by the build that never recorded a digest. Its path is readable,
+      // and a readable path is legitimate proof on its own, so it continues.
+      await rewriteHistory(after, h.dir, (row) => (row.taskId === parentId
+        ? { ...row, sourcePathDigest: null, executionPathDigest: null }
+        : row));
+      const ownId = await runOne(after, a, 'legacy but readable', { continueFromTaskId: parentId, workspace: plain.dir });
+      assert.equal(after.engine.get(ownId).conversation.kind, 'continuation');
+
+      // Now remove the readable path too: no path and no digest proves nothing, so the
+      // follow-up is refused instead of being guessed from the identity map.
+      await rewriteHistory(after, h.dir, (row) => (row.taskId === parentId
+        ? { ...row, sourcePath: null, executionWorkspacePath: null }
+        : row));
+      await assertRefusedUntouched(
+        after,
+        after.engine.start(await startOf(after, a, 'continue', { continueFromTaskId: parentId, workspace: plain.dir })),
+        JOB_CODES.continuationRefused,
+      );
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+    await plain.cleanup();
+  }
+});
+
+test('acceptance: a digest that names another directory than its own path is refused', async () => {
+  const h = await fixture();
+  const plain = await plainRepositoryRoot('dsh-delegate');
+  try {
+    const a = authorize(h.auth, plain.dir, 'A');
+    const parentId = await runOne(h.before, a, 'do work', { workspace: plain.dir });
+    const after = await h.restart();
+    try {
+      // The row's own two proofs contradict each other: the readable path is this
+      // workspace, the digest is one nobody authorised. Believing either alone is the
+      // defect the review found in the session-layer path check.
+      await rewriteHistory(after, h.dir, (row) => (row.taskId === parentId
+        ? { ...row, executionPathDigest: pathDigest(join(plain.dir, 'somewhere-else')) }
+        : row));
+      await assertRefusedUntouched(
+        after,
+        after.engine.start(await startOf(after, a, 'continue', { continueFromTaskId: parentId, workspace: plain.dir })),
+        JOB_CODES.continuationRefused,
+        { session: 'SESSION_CONTINUATION_UNAVAILABLE' },
+      );
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+    await plain.cleanup();
+  }
+});
+
+test('acceptance: an unreadable identity store is a refusal, never a path substituted from history', async () => {
+  const h = await fixture();
+  const plain = await plainRepositoryRoot('dsh-delegate');
+  try {
+    const a = authorize(h.auth, plain.dir, 'A');
+    const parentId = await runOne(h.before, a, 'do work', { workspace: plain.dir });
+    const after = await h.restart();
+    try {
+      // The identity store cannot answer. The history row still proves the directory,
+      // but it does NOT hold the Session, so there is nothing to continue — and the
+      // engine must refuse rather than mint a new conversation.
+      after.engine.deps.sessionStore = {
+        async get() { throw Object.assign(new Error('store unavailable'), { code: 'EIO' }); },
+      };
+      await assertRefusedUntouched(
+        after,
+        after.engine.start(await startOf(after, a, 'continue', { continueFromTaskId: parentId, workspace: plain.dir })),
+        JOB_CODES.continuationRefused,
+        { session: 'SESSION_CONTINUATION_UNAVAILABLE' },
+      );
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+    await plain.cleanup();
   }
 });
