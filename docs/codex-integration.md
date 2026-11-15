@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.5.1 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
+Status: implemented in 1.5.2 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
 
 1.5.1 refreshes the manifest on each activation, resolves a normal linked home root, and upgrades exact shipped/candidate templates while preserving custom content. See [1.5.1 notes](releases/1.5.1.zh.md).
 
@@ -526,7 +526,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.5.1",
+  "packageVersion": "1.5.2",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,

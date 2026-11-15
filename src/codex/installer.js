@@ -420,6 +420,9 @@ export const KNOWN_AGENT_TEMPLATES = [
   // Exact locally installed test.3 product template, verified before preparing 1.5.1.
   { version: '1.5.1-test.3', sha256: 'dc1c17f3bdfe171d3c1e7f943d569b12ffe12d6b25190fffe1c8c9550446f29d' },
   { version: '1.5.1-test.3', sha256: '06e13895f6df3ec9fbf48b1b40af42940f3ddf2b3afad356751dbd11e1205ff4' },
+  // Exact published v1.5.1 template; only the version stamp changes in 1.5.2.
+  { version: '1.5.1', sha256: '3d4fa9d8543306a10a5ac7d337d1538ebf57a20104674192de16ba13f580c0e6' },
+  { version: '1.5.1', sha256: 'ad0c09209e60234d369a0589fdc61477efa20b95b02d66534901d6fbc0f4d673' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */

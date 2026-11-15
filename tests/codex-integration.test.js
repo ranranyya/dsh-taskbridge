@@ -77,7 +77,7 @@ for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} m
     assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
   }
 });
-const DELIVERABLE_VERSION = '1.5.1';
+const DELIVERABLE_VERSION = '1.5.2';
 
 // The 1.5.0 allow-list entries are the OLD published identity of the template. This
 // working tree's template text has grown (team, same-chain preflight, review evidence
@@ -118,7 +118,7 @@ test('the 1.5.0 template allow-list keeps the PUBLISHED bytes, not the edited wo
 });
 
 
-for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} companion upgrades to 1.5.1 without changing unrelated Codex settings`, async () => {
+for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} companion upgrades to 1.5.2 without changing unrelated Codex settings`, async () => {
   const fixture = codexHomeFixture();
   const lf = readFileSync(join(ROOT, 'tests/fixtures/codex-agent-1.4.3-test.2.toml'), 'utf8').replace(/\r\n/g, '\n');
   const prior = ending === 'CRLF' ? lf.replace(/\n/g, '\r\n') : lf;
@@ -132,7 +132,7 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
     assert.deepEqual(refreshed.changed, ['agent']);
     assert.deepEqual(refreshed.refused, []);
     assert.equal(refreshed.status.agent.state, 'installed');
-    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.5\.1"$/mu);
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.5\.2"$/mu);
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
   } finally {
     fixture.cleanup();
@@ -4114,8 +4114,8 @@ test('the published 1.5.0 bytes are a real, enumerated prior build', () => {
     'the CRLF form a Windows install writes is enumerated too');
 });
 
-test('a real published 1.5.0 install (LF and CRLF) is refreshed to this candidate, idempotently', async () => {
-  const published = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.0.toml'), 'utf8').replace(/\r\n/g, '\n');
+for (const previous of ['1.5.0', '1.5.1']) test(`a real published ${previous} install (LF and CRLF) is refreshed to this release, idempotently`, async () => {
+  const published = readFileSync(join(ROOT, `tests/fixtures/agent-${previous}.toml`), 'utf8').replace(/\r\n/g, '\n');
   for (const [label, text] of [['LF', published], ['CRLF', published.replace(/\n/g, '\r\n')]]) {
     const fixture = codexHomeFixture();
     try {
@@ -4177,7 +4177,7 @@ test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () =
   assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0'
     && entry.sha256 === '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b'), true);
   // The public version matches the formal release; test identity registration is separate.
-  assert.equal(DELIVERABLE_VERSION, '1.5.1');
+  assert.equal(DELIVERABLE_VERSION, '1.5.2');
 });
 
 test('an untouched 1.5.1-test.1 install (LF and CRLF) upgrades to this candidate, idempotently', async () => {
@@ -4330,5 +4330,16 @@ test('release upgrade recognises the exact installed test.3 template in LF and C
     } finally {
       fixture.cleanup();
     }
+  }
+});
+
+test('the exact published 1.5.1 companion remains a recognised prior build in LF and CRLF', () => {
+  const lf = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.1.toml'), 'utf8').replace(/\r\n/g, '\n');
+  const forms = [[lf, '3d4fa9d8543306a10a5ac7d337d1538ebf57a20104674192de16ba13f580c0e6'], [lf.replace(/\n/g, '\r\n'), 'ad0c09209e60234d369a0589fdc61477efa20b95b02d66534901d6fbc0f4d673']];
+  for (const [text, expected] of forms) {
+    assert.equal(digest(text), expected);
+    assert.ok(KNOWN_AGENT_TEMPLATES.some(entry => entry.version === '1.5.1' && entry.sha256 === expected));
+    assert.equal(isKnownPriorTemplate(text), true);
+    assert.equal(isKnownPriorTemplate(text + '\n# operator edit\n'), false);
   }
 });
