@@ -1,31 +1,23 @@
-# Claude Code 手动接入
+# Claude Code / Claude Desktop 接入计划
 
-DSH TaskBridge 提供标准 stdio MCP 服务，Claude Code 可作为指挥端连接它。这里提供配置方法，不代表已经完成真实 Claude Code 客户端验收；目前也没有一键安装 Claude Code 智能体的按钮。
+**当前版本仅支持 Codex 端。Claude Code 和 Claude Desktop 接入预计在 2.0 版本上线。**
 
-## 连接
+TaskBridge 目前提供 Codex 智能体与 MCP 的安装、更新和修复入口。Claude Code、Claude Desktop 尚未作为当前版本的正式接入端提供；请先通过 Codex 使用现有的派工、等待、审批和审查流程。
 
-在 Claude Code 支持的 MCP 配置中登记一个 stdio 服务，`command` 指向本机 **Node.js 24 或更高版本的可执行文件**，`args` 只填写本插件实际安装目录里的 `bin/dsh-delegate-mcp.js` 的绝对路径。不要填写 `DeepSeek Harness.exe`，也不要把示例占位符直接复制为实际路径。
+## 2.0 计划
 
-```json
-{
-  "mcpServers": {
-    "dsh-taskbridge": {
-      "command": "<Node.js 可执行文件绝对路径>",
-      "args": ["<本插件安装目录>/bin/dsh-delegate-mcp.js"],
-      "env": {
-        "DSH_DELEGATE_DISCOVERY_FILE": "<DSH_HOME>/data/dsh-delegate/runtime-endpoint.json"
-      }
-    }
-  }
-}
-```
+| 客户端 | 当前状态 | 预计版本 |
+| --- | --- | --- |
+| Codex | 已支持 | 当前版本可用 |
+| Claude Code | 接入尚未上线 | 2.0 |
+| Claude Desktop | 接入尚未上线 | 2.0 |
 
-配置文件的位置和作用域按你的 Claude Code 版本选择，参见 [Claude Code 官方 MCP 文档](https://code.claude.com/docs/en/mcp)。端点文件由运行中的插件维护，端口变化时重新发现；无需把 DSH API 密钥写到 Claude Code。
+计划的目标是让 Claude Code 和 Claude Desktop 也能作为指挥端，使用 DSH 插件中配置的执行 API、模型和思考强度，并接入任务委派、静默等待、必要判断和交付审查流程。
 
-## 指挥规则
+具体配置入口、客户端操作方法与验收范围将在 2.0 发布时提供。预计版本是产品计划，实际功能以对应发布说明为准。
 
-先在 DSH 插件页选好 API、执行模型和思考强度，并开启本机调用开关。向指挥端说明：
+## 关于旧的手动 MCP 文档
 
-> 仅在我明确委派的任务中调用 DSH。你负责规划、权限判断和最终审查，DSH 负责实现。先预检授权的源仓库，提交后等待同一 taskId；普通执行期间不要反复读取结果。审批时核对准确操作与指纹，按授权决定单次允许或拒绝。交付后集中审查，有修正则通过 continueFromTaskId 续接原任务，不重复派工或自行接管实现。模型与思考强度以 DSH 插件设置为准。
+本页此前记录过标准 stdio MCP 的手动连接方案。该方案不代表 Claude 客户端已经正式上线或完成实际验收；为避免误导，本页已改为接入规划。
 
-先调用 `delegate_status` 验证连接，再以不修改文件的简短任务试运行。客户端可能提前结束等待，应继续等待原任务；不承诺某个客户端版本的 `@` 选择或完全零唤醒。
+当前安装步骤请查看 [TaskBridge 中文介绍](INTRODUCTION.zh.md) 和 [Codex 集成说明](codex-integration.md)。

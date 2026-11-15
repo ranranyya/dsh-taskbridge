@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.5.2 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
+Status: implemented in 1.5.2 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex, the currently supported client. Claude Code and Claude Desktop integration is planned for 2.0; see the separate roadmap.
 
 1.5.1 refreshes the manifest on each activation, resolves a normal linked home root, and upgrades exact shipped/candidate templates while preserving custom content. See [1.5.1 notes](releases/1.5.1.zh.md).
 

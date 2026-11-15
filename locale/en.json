@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "DSH TaskBridge",
-    "description": "Let Claude Code or Codex plan and review while DSH executes. Choose existing API connections, worker models and reasoning effort in the plugin. Includes quiet waiting, permission decisions, task workspaces, same-session follow-ups, optional model review, automatic settings saving and one-click Codex integration setup.",
+    "description": "Let Codex direct DSH with your choice of API, worker model and reasoning effort. Includes quiet waiting, per-operation approvals, review, same-session corrections, optional model review, automatic saving and Codex integration setup. Claude Code and Claude Desktop support is planned for 2.0.",
     "detail": "docs/INTRODUCTION.md"
   }
 }

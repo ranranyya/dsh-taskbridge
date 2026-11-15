@@ -811,7 +811,10 @@ test('the packed size stays bounded and contains no single-file outlier', () => 
   // The next largest packed entries are `src/jobs/engine.js` (247,676) and
   // `lib/client.js` (193,866), both unchanged by this work. The bound still fails on
   // anything that could hide a bundle, a lockfile or a fixture, which is what it exists for.
-  assert.ok(total < 2_800_000, `unpacked size grew unexpectedly: ${total} bytes`);
+  // 1.5.2 adds full bilingual product guides and two small workflow PNGs (about
+  // 100 KB combined growth). Keep a bounded allowance for those shipped docs;
+  // the single-file outlier and archive-exclusion checks still apply below.
+  assert.ok(total < 2_950_000, `unpacked size grew unexpectedly: ${total} bytes`);
   const largest = PACKED.map((path) => ({ path, size: statSync(join(ROOT, path)).size }))
     .sort((left, right) => right.size - left.size)[0];
   assert.ok(largest.size < 500_000, `unexpectedly large packed file: ${largest.path}`);
