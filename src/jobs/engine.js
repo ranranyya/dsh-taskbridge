@@ -796,10 +796,24 @@ export class JobEngine {
       // project setting changed after its parent ran, use the parent's isolation
       // so the follow-up reaches the same checkout or the same managed worktree.
       overrides.isolation = parentIsolation;
+      // The Agent Teams decision follows the same rule as isolation for a CONTINUATION:
+      // it is inherited from the parent UNLESS the dispatcher states it explicitly, so a
+      // follow-up keeps the chain's team mode instead of silently flipping it. `null`
+      // (no choice anywhere) stays `null` and the Session keeps its own mode.
+      if (overrides.agentTeams === undefined && typeof task.continuationRecord.agentTeams === 'boolean') {
+        overrides.agentTeams = task.continuationRecord.agentTeams;
+      }
     }
     let effective;
     try {
-      effective = resolveEffectiveConfig(settings, { projectPath: sourcePath, overrides });
+      // `agentTeams` is a per-run DSH Session choice, not a settings field: it is frozen
+      // on the task below and handed to the runner, and the settings validator must
+      // never see it.
+      const { agentTeams: teamChoice, ...settingsOverrides } = overrides;
+      effective = resolveEffectiveConfig(settings, { projectPath: sourcePath, overrides: settingsOverrides });
+      // Frozen on the task so the view, the run and a later continuation all state the
+      // SAME explicit decision. `null` = the commander made no choice for this task.
+      task.agentTeams = typeof teamChoice === 'boolean' ? teamChoice : null;
     } catch (error) {
       throw new JobError(JOB_CODES.routingRefused, error?.message ?? 'the effective configuration was refused', {
         cause: error?.code ?? null,
@@ -1883,8 +1897,8 @@ export class JobEngine {
    *
    * A new tree would hide the parent's uncommitted work and create a different
    * DSH Workspace, so this path never calls `prepare()`. After a plugin restart,
-   * or after explicit disposal, the in-memory registry cannot prove ownership and
-   * the continuation is refused rather than guessed from a directory name.
+   * recover only the already-authorized identity through Git's live registry.
+   * Missing, replaced or disposed trees are refused, never substituted.
    * @param {object} task - continuation with a stored parent identity.
    * @returns {Promise<object>} the existing tree metadata.
    * @throws {JobError} when the original tree cannot be proven reusable.
@@ -1903,16 +1917,25 @@ export class JobEngine {
     if (manager === null || typeof manager.get !== 'function') {
       throw refuse('the managed worktree service is unavailable, so the original tree cannot be proven reusable', 'no worktree registry');
     }
+    const expectedTreeId = identity.worktreeId ?? identity.taskId;
     let tree;
     try {
       tree = manager.get(identity.executionPath);
+      if (tree === null && typeof manager.recover === 'function') {
+        tree = await manager.recover({
+          taskId: expectedTreeId,
+          sourcePath: identity.sourcePath,
+          workspacePath: identity.executionPath,
+          state: identity.worktreeState,
+          signal: task.controller.signal,
+        });
+      }
     } catch (error) {
       throw refuse('the managed worktree service refused to report the original tree', typeof error?.code === 'string' ? error.code : 'registry read failed');
     }
     if (tree === null || typeof tree !== 'object') {
       throw refuse('the original worktree is no longer registered; a new tree will not be substituted', 'tree not managed here');
     }
-    const expectedTreeId = identity.worktreeId ?? identity.taskId;
     if (!samePath(tree.workspacePath, identity.executionPath)
       || !samePath(tree.sourcePath, identity.sourcePath)
       || (typeof expectedTreeId === 'string' && expectedTreeId !== '' && tree.taskId !== expectedTreeId)
@@ -3227,6 +3250,10 @@ export class JobEngine {
         // forwarded — there is no field in the summary they could travel in.
         // This hook is also the only execution evidence the phase trusts.
         onEvent: (event) => { this.onExecutionEvent(task, event); },
+        // The commander's DSH Agent Teams decision for THIS task's own Session. Absent
+        // when the task froze `null` (no choice): the run then keeps the Session's
+        // current mode instead of guessing one.
+        ...(task.agentTeams === null || task.agentTeams === undefined ? {} : { agentTeams: task.agentTeams }),
       });
       task.native.promise = pending;
       let run;
@@ -3256,6 +3283,10 @@ export class JobEngine {
         // armed bridge was the answerer behind it. Recorded per run so "did this
         // task ask, or did it reject without asking" is answerable from the record.
         approval: run.approval ?? null,
+        // The Agent Teams outcome: what the commander asked for and whether DSH's own
+        // service confirmed it on this run's Session. `null` for a task that made no
+        // choice, so "not asked" and "asked but unapplied" stay distinguishable.
+        team: run.team ?? null,
         // Where the conversation landed. Reported per run so an operator can tell a
         // fresh session from a continued one, and which Workspace group it is in.
         conversation: run.conversation ?? null,
@@ -3553,12 +3584,17 @@ export class JobEngine {
    *    cancels, restarts or resumes the worker, and never disturbs another
    *    observer of the same task.
    * @param {string} taskId - task to observe.
-   * @param {object} [options] - `connectionId`, `waitMs` (default 25000, max 25000), `signal`.
+   * @param {object} [options] - `connectionId`, `waitMs` (default 25000, max 25000),
+   *   `signal`, `ackFailureEventId` (acknowledge one delivered repeated-failure
+   *   reminder by its exact `eventId`).
    * @returns {Promise<{ task: object, reason: string, permission: object | null,
-   *   failure: object | null, activity: object | null,
+   *   failure: object | null, failureAck: object | null, activity: object | null,
    *   selfCheck: object | null, wait: { waitMs: number, waitedMs: number, activitySinceWait: boolean } }>} observation.
    *   `failure` is present only when `attention` reports a repeated-tool-failure
-   *   reminder; it carries a tool name, a failure code, an operation digest and counts.
+   *   reminder; it carries a stable `eventId`, a tool name, a failure code, an
+   *   operation digest and counts, and it is REDELIVERED on later observations until
+   *   it is acknowledged — a lost answer does not lose the reminder.
+   *   `failureAck` is present only when the caller asked to acknowledge.
    * @throws {JobError} `JOB_TASK_NOT_FOUND` for an unknown or foreign task.
    */
   async observeTask(taskId, options = {}) {
@@ -3566,9 +3602,18 @@ export class JobEngine {
     const waitMs = clampObserveWait(options?.waitMs);
     const signal = options?.signal ?? null;
 
-    if (this.aborted) return this.observationOf(task, OBSERVE_TASK_REASONS.interrupted, null, waitMs, 0, false);
+    // Acknowledgment is a write to the MONITOR'S reminder state only — never to the
+    // task, its worker or its deadline — and it is bound to the exact eventId the
+    // caller observed. The result travels back on this observation (`failureAck`),
+    // so the caller learns whether its ack landed even when the observation itself
+    // says nothing new. An unknown id changes nothing: a wrong ack must not
+    // silence a live notification. An EMPTY or non-string id is an explicit
+    // refusal (`event-id-required`), never a silent no-op.
+    const failureAck = this.ackObservedFailure(task, options?.ackFailureEventId);
+
+    if (this.aborted) return this.observationOf(task, OBSERVE_TASK_REASONS.interrupted, null, waitMs, 0, false, null, failureAck);
     if (signal !== null && signal.aborted === true) {
-      return this.observationOf(task, OBSERVE_TASK_REASONS.interrupted, null, waitMs, 0, false);
+      return this.observationOf(task, OBSERVE_TASK_REASONS.interrupted, null, waitMs, 0, false, null, failureAck);
     }
 
     // Exactly one monitor per task, created at most once (see `ensureMonitor`).
@@ -3585,9 +3630,9 @@ export class JobEngine {
       // timed-out review learn the outcome here, instead of re-sending a decision (or
       // believing the review vanished). The wait is bounded and the report is honest
       // either way; nothing about the task's state is touched.
-      const settledObservation = await this.awaitReviewSettlement(task, waitMs, signal);
+      const settledObservation = await this.awaitReviewSettlement(task, waitMs, signal, failureAck);
       if (settledObservation !== null) return settledObservation;
-      return this.observationOf(task, immediate, monitor, waitMs, 0, false);
+      return this.observationOf(task, immediate, monitor, waitMs, 0, false, null, failureAck);
     }
 
     // ONE bounded wait, and nothing more. `waitMs` is the caller's promise: a
@@ -3608,7 +3653,7 @@ export class JobEngine {
     // those outrank it, and a failure report must not describe a task that now needs a
     // different decision.
     const failure = reason === OBSERVE_TASK_REASONS.attention ? (outcome.failure ?? null) : null;
-    return this.observationOf(task, reason, monitor, waitMs, outcome.waitedMs, outcome.activitySinceWait, failure);
+    return this.observationOf(task, reason, monitor, waitMs, outcome.waitedMs, outcome.activitySinceWait, failure, failureAck);
   }
 
   /**
@@ -3623,7 +3668,47 @@ export class JobEngine {
    * @param {AbortSignal | null} signal - the caller's cancellation.
    * @returns {Promise<object | null>} an observation when the wait changed the answer, else null.
    */
-  async awaitReviewSettlement(task, waitMs, signal) {
+  /**
+   * Apply (or refuse) one caller acknowledgment and return the fact the observation
+   * must publish.
+   *
+   * `null` means the caller did not acknowledge anything (`ackFailureEventId`
+   * absent), in which case NO ack block appears on the observation at all — the
+   * published shape an old caller receives is unchanged. A non-empty string is
+   * forwarded to the monitor; an EMPTY string is an explicit refusal
+   * (`event-id-required`), not a silent no-op, so both surfaces answer with the
+   * same clear fact.
+   * @param {object} task - task record.
+   * @param {unknown} ackFailureEventId - the ack the caller carried, if any.
+   * @returns {object | null} the ack result to publish, or null.
+   */
+  ackObservedFailure(task, ackFailureEventId) {
+    if (ackFailureEventId === undefined || ackFailureEventId === null) return null;
+    if (typeof ackFailureEventId !== 'string' || ackFailureEventId === '') {
+      return { acknowledged: false, eventId: typeof ackFailureEventId === 'string' ? ackFailureEventId : null, reason: 'event-id-required' };
+    }
+    const monitorForAck = this.ensureMonitor(task);
+    try {
+      return monitorForAck.ackFailureReport(ackFailureEventId);
+    } catch {
+      return { acknowledged: false, eventId: ackFailureEventId, reason: 'ack-failed' };
+    }
+  }
+
+  /**
+   * The ack result of THIS observeTask call, passed explicitly into the settlement
+   * branch. The receipt belongs to the CALL, not to the monitor: a shared store on
+   * the monitor would let concurrent observations overwrite each other's verdicts
+   * (a later refusal replacing an earlier success) and answer a caller that never
+   * acked with another caller's receipt. Each settle wait therefore carries its own
+   * ack result through its own argument.
+   * @param {object} task - task record.
+   * @param {number} waitMs - the caller's own wait bound.
+   * @param {AbortSignal | null} signal - the caller's cancellation.
+   * @param {object | null} failureAck - the ack result of THIS observation, or null.
+   * @returns {Promise<object | null>} an observation when the wait changed the answer, else null.
+   */
+  async awaitReviewSettlement(task, waitMs, signal, failureAck = null) {
     const entry = this.reviewState.get(task.taskId) ?? null;
     if (entry === null) return null;
     if (entry.state !== REVIEW_PERSISTENCE_STATES.saving && entry.state !== REVIEW_PERSISTENCE_STATES.timedOut) return null;
@@ -3635,10 +3720,12 @@ export class JobEngine {
     if (outcome === REVIEW_OUTCOME_TIMEOUT) return null;
     if (signal !== null && signal.aborted === true) return null;
     // The write settled inside the wait: report the resulting fact (confirmed or failed)
-    // together with how long it took, without re-deriving the task's state.
+    // together with how long it took, without re-deriving the task's state. The ack
+    // result is THIS call's own (passed in as an argument, never read from shared
+    // state), so concurrent observations cannot cross their receipts.
     const reason = this.settleReason(task) ?? OBSERVE_TASK_REASONS.attention;
     const waitedMs = Math.max(0, this.clock() - started);
-    return this.observationOf(task, reason, this.ensureMonitor(task), waitMs, waitedMs, true, null);
+    return this.observationOf(task, reason, this.ensureMonitor(task), waitMs, waitedMs, true, null, failureAck);
   }
 
   /**
@@ -3742,9 +3829,11 @@ export class JobEngine {
    * @param {boolean} activitySinceWait - whether activity arrived during the wait.
    * @param {object | null} [failure] - the repeated-failure diagnostic, when that is
    *   what ended the wait.
+   * @param {object | null} [failureAck] - the acknowledgment result, present only when
+   *   the caller asked to acknowledge one delivered reminder by its `eventId`.
    * @returns {object} observation result.
    */
-  observationOf(task, reason, monitor, waitMs, waitedMs, activitySinceWait, failure = null) {
+  observationOf(task, reason, monitor, waitMs, waitedMs, activitySinceWait, failure = null, failureAck = null) {
     const at = this.clock();
     const summary = this.observationSummary(task, at);
     const pending = task?.permission?.pending ?? null;
@@ -3767,8 +3856,13 @@ export class JobEngine {
         : null,
       // The typed, bounded diagnostic for a repeated-failure reminder. It is the only
       // thing that distinguishes that reminder from an ordinary silence report, whose
-      // own diagnostic is `selfCheck`.
+      // own diagnostic is `selfCheck`. Its `eventId` is the identity the receiver
+      // acknowledges; the reminder is redelivered until that ack lands.
       failure: reason === OBSERVE_TASK_REASONS.attention && failure !== null ? failure : null,
+      // The acknowledgment result. Present (possibly with `acknowledged: false`) only
+      // when the caller asked to acknowledge; absent otherwise, so an old caller's
+      // observation shape is byte-for-byte unchanged.
+      ...(failureAck === null ? {} : { failureAck }),
       activity: summary.activity,
       selfCheck,
       wait: { waitMs, waitedMs: Math.max(0, Math.trunc(waitedMs)), activitySinceWait: activitySinceWait === true },
@@ -3826,6 +3920,11 @@ export class JobEngine {
       // Where that decision is in its durable write, so a waiting host can tell "not
       // reviewed" from "the review is being written right now" and does not resubmit one.
       reviewPersistence: this.reviewPersistenceView(task),
+      // The Agent Teams decision and outcome, short enough for a wait: `agentTeams` is the
+      // frozen request (or null), `team` the verified result (`applied`/`enabled`) or the
+      // reason it could not be applied. No team reasoning or task-board content travels.
+      agentTeams: task.agentTeams ?? null,
+      team: summarizedTeam(task.execution?.team ?? null),
     };
   }
 
@@ -4376,6 +4475,10 @@ export class JobEngine {
             ? worktree.worktreeId
             : (typeof worktree.taskId === 'string' ? worktree.taskId : task.taskId)),
         worktreeState: worktree === null ? null : (typeof worktree.state === 'string' ? worktree.state : null),
+        // The chain's Agent Teams decision, so a follow-up in a later process inherits the
+        // mode its parent ran with. `null` (no decision) is stored as "no decision", which
+        // is how an old row written before this field reads back too.
+        agentTeams: task.agentTeams ?? null,
       });
       task.conversationSaved = saved;
       task.conversationError = null;
@@ -4626,6 +4729,9 @@ export class JobEngine {
         conversation: task.execution.conversation ?? null,
         cancelCause: task.execution.cancelCause,
         error: task.execution.error,
+        // The Agent Teams outcome this run verified (or refuses to claim). Reported inside
+        // `execution` because it is a fact about THIS run, not about the task's intent.
+        team: task.execution.team ?? null,
       },
       // Where the run's conversation was placed in DSH. `workspaceId` is the group an
       // operator sees; `kind` is `new` or `continuation`, and `continuedFromTaskId`
@@ -4652,6 +4758,12 @@ export class JobEngine {
       // The approval stance the run installed and read back (`never` without a
       // bridge, `ask` with an armed one), recorded from the run itself.
       approval: task.execution?.approval ?? null,
+      // The Agent Teams decision: `requested` is what the dispatcher froze on the task
+      // (`null` when they made no choice) and `applied` is what DSH's own service
+      // confirmed on this run's Session. Kept as one block so "asked for teams" and
+      // "teams actually on for this run" are never conflated.
+      agentTeams: task.agentTeams ?? null,
+      team: task.execution?.team ?? null,
       // A bounded progress summary: counts, timestamps and the tool in flight. It
       // carries no model text, no reasoning, no tool arguments and no diff, so the
       // ordinary task view can show "still working, last activity 12s ago" without
@@ -4824,10 +4936,24 @@ export function sanitizeOverrides(value) {
   if (typeof value !== 'object' || Array.isArray(value)) {
     throw new JobError(JOB_CODES.overrideInvalid, 'overrides must be an object', {});
   }
-  const allowed = ['providerId', 'model', 'reasoningEffort', 'timeoutSeconds', 'isolation'];
+  // `agentTeams` is NOT part of the frozen worker configuration (it is not a settings
+  // field and never reaches the settings validator); it is carried on the overrides
+  // object only because that is the existing channel a dispatcher uses for per-task
+  // choices. It selects DSH Agent Teams for THIS run's own Session; `undefined` means
+  // the commander made no choice and the Session keeps its current mode.
+  const workerKeys = ['providerId', 'model', 'reasoningEffort', 'timeoutSeconds', 'isolation'];
   const out = {};
-  for (const key of allowed) {
+  for (const key of workerKeys) {
     if (value[key] !== undefined) out[key] = value[key];
+  }
+  if (value.agentTeams !== undefined) {
+    if (typeof value.agentTeams !== 'boolean') {
+      throw new JobError(JOB_CODES.overrideInvalid, 'overrides.agentTeams must be a boolean', {
+        field: 'agentTeams',
+        requestedType: typeof value.agentTeams,
+      });
+    }
+    out.agentTeams = value.agentTeams;
   }
   return out;
 }
@@ -4917,5 +5043,25 @@ function summarizedAcceptance(acceptance) {
     by: acceptance.by ?? null,
     noteChars: typeof acceptance.note === 'string' ? Array.from(acceptance.note).length : (acceptance.noteChars ?? 0),
     noteOmitted: true,
+  };
+}
+
+/**
+ * The Agent Teams outcome as a WAIT reports it: four booleans and one bounded reason.
+ *
+ * A waiting host must be able to answer "are teams on for this run, and if not why"
+ * without reading the full result. Nothing else from the team machinery (task board,
+ * members, messages) belongs on a wait, and its reason is a code or a one-line diagnostic.
+ * @param {object | null} team - the run's `team` fact.
+ * @returns {object | null} the short fact.
+ */
+function summarizedTeam(team) {
+  if (team === null || typeof team !== 'object') return null;
+  return {
+    requested: typeof team.requested === 'boolean' ? team.requested : null,
+    supported: team.supported === true,
+    applied: team.applied === true,
+    enabled: typeof team.enabled === 'boolean' ? team.enabled : null,
+    reason: typeof team.reason === 'string' ? diagnostic(team.reason, 200) : null,
   };
 }

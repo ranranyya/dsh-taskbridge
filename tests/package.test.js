@@ -41,7 +41,7 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
  * so asserting itself would pass for any value. `1.5.0` adds question handling and combined waits.
  */
-const DELIVERABLE_VERSION = '1.5.0';
+const DELIVERABLE_VERSION = '1.5.1';
 
 /**
  * The published build this release upgrades *from*.
@@ -50,7 +50,7 @@ const DELIVERABLE_VERSION = '1.5.0';
  * current version must be exactly one PATCH above this baseline (a correction release),
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.4.1';
+const PREVIOUS_VERSION = '1.5.0';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -571,8 +571,12 @@ test('the release metadata is one version everywhere it is written by hand', () 
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
   const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
 
-  // The runtime facts and the MCP handshake take their version from the manifest.
-  assert.match(runtimeFacts, /const PLUGIN_VERSION = reportedVersion\(\)\.version;/u);
+  // The runtime facts and the MCP handshake take their version from the manifest — and the
+  // entry takes it PER ACTIVATION (a hot update can replace the manifest under a loaded
+  // instance), never from a constant frozen at module load.
+  assert.match(runtimeFacts, /reportedVersion\(\{ refresh: true \}\)/u);
+  assert.equal(/const PLUGIN_VERSION = reportedVersion\(\)/u.test(runtimeFacts), false,
+    'src/index.js must not freeze the version at module load');
   assert.equal(/const PLUGIN_VERSION = '/u.test(runtimeFacts), false, 'src/index.js must not hard-code the version');
   assert.match(mcpServer, /version: REPORTED\.version/u);
   assert.equal(new RegExp(`version:\\s*'${escape(MANIFEST.version)}'`, 'u').test(mcpServer), false,
@@ -799,11 +803,15 @@ test('the packed size stays bounded and contains no single-file outlier', () => 
   // contents (the generated `lib/client.js` dominates it) rather than a round number,
   // so a NEW multi-hundred-kilobyte file still fails loudly.
   //
-  // Raised from 2,500,000 when the ordinary-question channel added
-  // `src/runtime/questions.js` and its execution-plane route (~87 KB of source with
-  // documentation). The bound still fails on anything that could hide a bundle, a
-  // lockfile or a fixture, which is what it exists for.
-  assert.ok(total < 2_700_000, `unpacked size grew unexpectedly: ${total} bytes`);
+  // Raised from 2,760,000 for ONE reason: `src/codex/installer.js` grew (178,274 bytes now)
+  // while adding root-link (junction) pinning for the selected Codex home — real product
+  // code that ships. The bound tracks PACKED (manifest-derived) files only; test fixtures
+  // under `tests/` are never packed (`/^tests\//u` is an EXCLUDED_PATTERN), so the new
+  // `tests/fixtures/agent-1.5.1-test.1.toml` (40,266 bytes) contributes nothing here.
+  // The next largest packed entries are `src/jobs/engine.js` (247,676) and
+  // `lib/client.js` (193,866), both unchanged by this work. The bound still fails on
+  // anything that could hide a bundle, a lockfile or a fixture, which is what it exists for.
+  assert.ok(total < 2_800_000, `unpacked size grew unexpectedly: ${total} bytes`);
   const largest = PACKED.map((path) => ({ path, size: statSync(join(ROOT, path)).size }))
     .sort((left, right) => right.size - left.size)[0];
   assert.ok(largest.size < 500_000, `unexpectedly large packed file: ${largest.path}`);

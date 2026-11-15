@@ -22,7 +22,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, posix, resolve, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,9 +77,48 @@ for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} m
     assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
   }
 });
-const DELIVERABLE_VERSION = '1.5.0';
+const DELIVERABLE_VERSION = '1.5.1';
 
-for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} companion upgrades to 1.5.0 without changing unrelated Codex settings`, async () => {
+// The 1.5.0 allow-list entries are the OLD published identity of the template. This
+// working tree's template text has grown (team, same-chain preflight, review evidence
+// rules), so the list must stay a record of the RELEASED bytes — never recomputed from
+// the current file. If someone "refreshes" them from the new text, every untouched 1.5.0
+// install would be reported `modified` and never upgraded, which is exactly the failure
+// this test exists to prevent.
+test('the 1.5.0 template allow-list keeps the PUBLISHED bytes, not the edited working-tree text', () => {
+  const released = Object.freeze([
+    '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b',
+    '253a695842e9634e28e86030c7ffb10d21b338f09451a8c13849cfce1d9d9364',
+  ]);
+  for (const sha256 of released) {
+    assert.equal(
+      KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0' && entry.sha256 === sha256),
+      true,
+      `the published 1.5.0 digest ${sha256.slice(0, 8)}… must stay enumerated`,
+    );
+  }
+  // The current template does NOT hash to either published form: the list is history,
+  // not a derivation of this file.
+  const current = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
+  const lf = current.replace(/\r\n/g, '\n');
+  for (const text of [lf, lf.replace(/\n/g, '\r\n')]) {
+    const sha256 = digest(text);
+    assert.equal(released.includes(sha256), false,
+      'the edited template must not silently be mistaken for a published build');
+    // The working-tree template is not a PUBLISHED identity: it is not one of the two
+    // released 1.5.0 byte forms.
+    assert.equal(KNOWN_AGENT_TEMPLATES
+      .filter((entry) => entry.sha256 === '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b'
+        || entry.sha256 === '253a695842e9634e28e86030c7ffb10d21b338f09451a8c13849cfce1d9d9364')
+      .length, 2, 'the two published 1.5.0 identities stay exactly as released');
+    // A LOCAL machine artifact may share this body with a stale version line; that is a
+    // local fixture, documented as such in the installer, not a published release.
+    assert.equal(typeof sha256, 'string');
+  }
+});
+
+
+for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} companion upgrades to 1.5.1 without changing unrelated Codex settings`, async () => {
   const fixture = codexHomeFixture();
   const lf = readFileSync(join(ROOT, 'tests/fixtures/codex-agent-1.4.3-test.2.toml'), 'utf8').replace(/\r\n/g, '\n');
   const prior = ending === 'CRLF' ? lf.replace(/\n/g, '\r\n') : lf;
@@ -93,7 +132,7 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
     assert.deepEqual(refreshed.changed, ['agent']);
     assert.deepEqual(refreshed.refused, []);
     assert.equal(refreshed.status.agent.state, 'installed');
-    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.5\.0"$/mu);
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.5\.1"$/mu);
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
   } finally {
     fixture.cleanup();
@@ -1927,26 +1966,112 @@ test('a linked agents directory is refused by status, install, repair and remove
   }
 });
 
-test('a linked Codex home is refused, and nothing below it is reported or created', async () => {
+// A migrated machine keeps `~/.codex` as a junction to the real store. That ROOT link is
+// the operator's own layout, not an indirection to refuse: the installer pins it to its
+// real directory and works there. (This case used to assert the refusal, which is the
+// behaviour the change replaces; the `agents/` link case below is still refused.)
+test('a linked Codex HOME root is allowed and pinned to its real directory', async () => {
   const fixture = linkedHomeFixture('home');
-  const restore = useDirectoryClassifier(nodeClassifier((path) => path === fixture.home));
+  const real = realpathSync(fixture.outside);
   try {
     const status = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
-    assert.equal(status.status.boundary.blocked, true);
-    assert.equal(status.status.boundary.link, 'codex-home');
-    // The `agents` entry is not even inspected through the link.
-    assert.equal(status.status.boundary.agents, 'unchecked');
-    assert.equal(status.status.agent.reason, 'codex-home-is-link');
-    assert.ok(status.status.notes.some((note) => note.code === 'AGENT_PATH_CONFLICT' && /Codex home 本身是链接/u.test(note.text)));
+    assert.equal(status.status.boundary.blocked, false, 'the root link is not a boundary refusal');
+    assert.equal(status.status.boundary.link, null);
+    assert.equal(status.status.codexHome, real, 'the status reports the REAL directory it uses');
+    assert.equal(status.status.codexHomeSelected, fixture.home, 'and the selected spelling for context');
+    assert.equal(status.status.codexHomeLinked, true);
+    assert.equal(status.status.agent.state, 'not-installed', 'the real target is classified, not the alias');
 
-    for (const action of ['install', 'repair', 'remove']) {
-      const outcome = await runCodexAction(action, { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
-      assert.ok(outcome.refused.some((entry) => entry.target === 'agent' && entry.code === 'AGENT_PATH_CONFLICT'));
-    }
-    assert.deepEqual(readdirSync(fixture.outside), [], 'no agents directory may be created through the home link');
+    // install writes THROUGH the root link into its real target, and the link survives.
+    const install = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    assert.deepEqual(install.refused, [], JSON.stringify(install.refused));
+    assert.equal(install.status.agent.state, 'installed');
+    assert.equal(install.status.codexHome, real);
+    assert.ok(existsSync(join(real, 'agents', AGENT_FILENAME)), 'the agent file landed in the real target');
+    assert.equal(lstatSync(fixture.home).isSymbolicLink(), true, 'the root link is untouched');
+
+    // Second install is a no-op.
+    const again = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    assert.equal(again.status.agent.state, 'installed');
+    assert.deepEqual(again.changed, [], 'a second install changes nothing');
+
+    // repair and remove act on the SAME real target and keep the root link.
+    const repair = await runCodexAction('repair', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    assert.equal(repair.refused.some((entry) => entry.reason === 'codex-home-is-link'), false);
+    assert.equal(repair.status.codexHome, real);
+    const remove = await runCodexAction('remove', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    assert.equal(remove.status.codexHome, real);
+    assert.equal(remove.status.agent.state, 'not-installed', 'removal reached the real target');
+    assert.equal(lstatSync(fixture.home).isSymbolicLink(), true, 'and the root link still survives');
   } finally {
-    restore();
     fixture.cleanup();
+  }
+});
+
+// The same support for an EXPLICITLY selected home (`CODEX_HOME`, or the settings page
+// passing a path): the root may be a link, and it is pinned the same way.
+test('an explicit CODEX_HOME that is a root link is pinned like the default one', async () => {
+  const fixture = linkedHomeFixture('home');
+  const real = realpathSync(fixture.outside);
+  try {
+    // `resolveCodexHome` keeps its public shape: it reports the SELECTED path, and the
+    // installer pins it. Asserted here so the split is stated, not implied.
+    const selected = resolveCodexHome({ env: { CODEX_HOME: fixture.home }, homeDirectory: fixture.home });
+    assert.equal(selected, resolve(fixture.home), 'the resolver still returns the selected absolute path');
+
+    const viaEnv = await runCodexAction('status', {
+      env: { ...isolatedEnv(fixture.home), CODEX_HOME: fixture.home },
+    });
+    assert.equal(viaEnv.status.codexHome, real, 'the env-selected link is pinned to its real target');
+    assert.equal(viaEnv.status.codexHomeLinked, true);
+    assert.equal(viaEnv.status.boundary.blocked, false);
+
+    const explicit = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home) });
+    assert.equal(explicit.status.codexHome, real);
+    assert.equal(explicit.status.agent.state, 'installed');
+    assert.ok(existsSync(join(real, 'agents', AGENT_FILENAME)));
+    assert.equal(lstatSync(fixture.home).isSymbolicLink(), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('a root link whose target is missing or not a directory is refused, and nothing is created', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-delegate-dangling-'));
+  try {
+    const home = join(root, 'codex');
+    const missingTarget = join(root, 'gone');
+    symlinkSync(missingTarget, home, 'junction');
+    const dangling = await runCodexAction('status', { codexHome: home, env: isolatedEnv(home) });
+    assert.equal(dangling.status.boundary.blocked, true);
+    assert.equal(dangling.status.agent.reason, 'codex-home-link-unresolvable');
+    const installDangling = await runCodexAction('install', { codexHome: home, env: isolatedEnv(home) });
+    assert.ok(installDangling.refused.length > 0, 'install refuses a dangling root link');
+    assert.equal(existsSync(missingTarget), false, 'and never creates the missing target');
+
+    // A link to a FILE is never usable as a home. On Windows a junction only targets a
+    // directory, so the outcome here is the "cannot be resolved to a real directory"
+    // refusal — what matters is that it is REFUSED and nothing is written behind it.
+    const fileTarget = join(root, 'not-a-dir.txt');
+    writeFileSync(fileTarget, 'x', 'utf8');
+    const homeToFile = join(root, 'codex-file');
+    try {
+      symlinkSync(fileTarget, homeToFile, 'junction');
+    } catch {
+      // A platform that refuses to create it is already the safe outcome; skip the probe.
+    }
+    if (existsSync(homeToFile)) {
+      const toFile = await runCodexAction('status', { codexHome: homeToFile, env: isolatedEnv(homeToFile) });
+      assert.equal(toFile.status.boundary.blocked, true, 'a root link to a file is refused');
+      assert.ok(['codex-home-target-not-a-directory', 'codex-home-link-unresolvable'].includes(toFile.status.agent.reason),
+        `the refusal states why: ${toFile.status.agent.reason}`);
+      const installToFile = await runCodexAction('install', { codexHome: homeToFile, env: isolatedEnv(homeToFile) });
+      assert.ok(installToFile.refused.length > 0);
+      assert.equal(readFileSync(fileTarget, 'utf8'), 'x', 'the file behind the link is untouched');
+      assert.equal(lstatSync(homeToFile).isSymbolicLink(), true, 'and the link survives');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -3161,25 +3286,65 @@ test('a failed install is never remembered as the target', async () => {
   }
 });
 
-test('startup refuses to upgrade through a symbolic link at the Codex home or agents directory', async () => {
+test('startup upgrades THROUGH a root link, and still refuses an agents-directory link', async () => {
   const fixture = codexHomeFixture();
   const outside = mkdtempSync(join(tmpdir(), 'dsh-delegate-outside-'));
   const backup = backupFixture();
   const prior = priorManagedConfig();
   try {
+    // A REAL managed install lives behind the root junction: the published 1.5.0 agent
+    // template plus a managed MCP entry, so "the refresh did nothing" cannot be mistaken
+    // for "there was nothing to do".
+    const published = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.0.toml'), 'utf8').replace(/\r\n/g, '\n');
     writeFileSync(join(outside, 'config.toml'), prior, 'utf8');
     mkdirSync(join(outside, 'agents'), { recursive: true });
+    writeFileSync(join(outside, 'agents', AGENT_FILENAME), published);
     const linkHome = join(fixture.home, 'linked-home');
     symlinkSync(outside, linkHome, 'junction');
-    const undo = useDirectoryClassifier(nodeClassifier((path) => path === linkHome));
+
+    // 1. Startup refresh through the ROOT link MIGRATES the real old agent file.
+    const throughRoot = await createCodexSeam({ codexHome: linkHome, env: isolatedEnv(linkHome), version: DELIVERABLE_VERSION, backupDir: backup.dir })
+      .refreshManagedIntegration();
+    assert.equal(throughRoot.refused.some((entry) => entry.reason === 'codex-home-is-link'), false,
+      JSON.stringify(throughRoot.refused));
+    assert.ok(throughRoot.changed.includes('agent'), `the agent is reported changed: ${JSON.stringify(throughRoot.changed)}`);
+    const migrated = readFileSync(join(outside, 'agents', AGENT_FILENAME), 'utf8');
+    const candidate = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
+    // Compare the BODY; the version line carries the installed package version.
+    const bodyOf = (text) => text.replace(/\r\n/g, '\n').replace(/^version[ \t]*=[ \t]*"[^"]*"\r?$/mu, 'version = "<rendered>"');
+    assert.equal(bodyOf(migrated), bodyOf(candidate),
+      'the old body was replaced by THIS candidate template, not by a same-version lookalike');
+    assert.ok(migrated.includes('AGENT TEAMS IS YOUR DECISION'), 'and it carries the new rules');
+    assert.notEqual(migrated, published, 'the old published bytes are gone');
+    assert.equal(lstatSync(linkHome).isSymbolicLink(), true, 'the root link is still there');
+
+    // Second startup refresh is idempotent: nothing changes, nothing is refused.
+    const again = await createCodexSeam({ codexHome: linkHome, env: isolatedEnv(linkHome), version: DELIVERABLE_VERSION, backupDir: backup.dir })
+      .refreshManagedIntegration();
+    assert.deepEqual(again.changed, [], `the second refresh changes nothing: ${JSON.stringify(again.changed)}`);
+    assert.equal(readFileSync(join(outside, 'agents', AGENT_FILENAME), 'utf8'), migrated, 'and leaves the file alone');
+
+    // A customised old file is the operator's: preserved, reported `modified`.
+    const customised = `${published.trimEnd()}\n# my own note\n`;
+    writeFileSync(join(outside, 'agents', AGENT_FILENAME), customised);
+    const refusedCustom = await createCodexSeam({ codexHome: linkHome, env: isolatedEnv(linkHome), version: DELIVERABLE_VERSION, backupDir: backup.dir })
+      .refreshManagedIntegration();
+    assert.deepEqual(refusedCustom.changed, [], 'a customised agent is never rewritten');
+    assert.equal(readFileSync(join(outside, 'agents', AGENT_FILENAME), 'utf8'), customised, 'and stays byte-identical');
+
+    // 2. An AGENTS-directory link is still a refusal, even though the root is fine.
+    rmSync(join(outside, 'agents'), { recursive: true, force: true });
+    const agentsOutside = mkdtempSync(join(tmpdir(), 'dsh-delegate-agents-'));
     try {
+      symlinkSync(agentsOutside, join(outside, 'agents'), 'junction');
       const outcome = await createCodexSeam({ codexHome: linkHome, env: isolatedEnv(linkHome), version: DELIVERABLE_VERSION, backupDir: backup.dir })
         .refreshManagedIntegration();
-      assert.deepEqual(outcome.changed, [], 'a linked home is never written through');
-      assert.ok(outcome.refused.some((entry) => entry.code === 'AGENT_PATH_CONFLICT'), JSON.stringify(outcome.refused));
-      assert.equal(readFileSync(join(outside, 'config.toml'), 'utf8'), prior, 'the linked config is untouched');
+      assert.deepEqual(outcome.changed, [], 'an agents link is never written through');
+      assert.ok(outcome.refused.some((entry) => entry.code === 'AGENT_PATH_CONFLICT' && entry.reason === 'agents-dir-is-link'),
+        JSON.stringify(outcome.refused));
+      assert.deepEqual(readdirSync(agentsOutside), [], 'and nothing lands behind it');
     } finally {
-      undo();
+      rmSync(agentsOutside, { recursive: true, force: true });
     }
   } finally {
     fixture.cleanup();
@@ -3932,3 +4097,238 @@ test('the LEGACY 1.0.0 identities are retained and labelled, never claimed as gi
   );
 });
 
+
+// The PUBLISHED 1.5.0 template, byte for byte as the release committed it
+// (`git show 6d1eef92d3ddb00ca133149047894c464825d769:codex/dsh-taskbridge.toml`).
+// Its digest must be one of the enumerated 1.5.0 identities, so the migration contract is
+// exercised against the real old bytes instead of a synthetic facsimile.
+test('the published 1.5.0 bytes are a real, enumerated prior build', () => {
+  const published = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.0.toml'));
+  const lf = published.toString('utf8').replace(/\r\n/g, '\n');
+  assert.equal(lf.includes('\r'), false, 'the fixture is the LF form of the published blob');
+  assert.equal(digest(lf), '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b',
+    'the fixture is the committed 1.5.0 blob, not this working tree');
+  assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0' && entry.sha256 === digest(lf)), true);
+  const crlf = lf.replace(/\n/g, '\r\n');
+  assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0' && entry.sha256 === digest(crlf)), true,
+    'the CRLF form a Windows install writes is enumerated too');
+});
+
+test('a real published 1.5.0 install (LF and CRLF) is refreshed to this candidate, idempotently', async () => {
+  const published = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.0.toml'), 'utf8').replace(/\r\n/g, '\n');
+  for (const [label, text] of [['LF', published], ['CRLF', published.replace(/\n/g, '\r\n')]]) {
+    const fixture = codexHomeFixture();
+    try {
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      writeFileSync(fixture.agentPath, text);
+
+      const before = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      assert.equal(before.status.agent.state, 'outdated', `${label}: an untouched published build is OUTDATED, not modified`);
+
+      const install = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      assert.equal(install.status.agent.state, 'installed', `${label}: refreshed to this candidate`);
+      const upgraded = readFileSync(fixture.agentPath, 'utf8');
+      const candidate = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
+      assert.equal(upgraded.replace(/\r\n/g, '\n'), candidate.replace(/\r\n/g, '\n'),
+        `${label}: the file now holds exactly the candidate template text`);
+      assert.ok(upgraded.includes('AGENT TEAMS IS YOUR DECISION'), `${label}: and it carries the new rules`);
+
+      // Idempotent: a second install changes nothing.
+      const again = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      assert.equal(again.status.agent.state, 'installed');
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), upgraded, `${label}: the second install is a no-op`);
+
+      // A user line inside the OLD template makes it theirs: never rewritten, byte-identical.
+      writeFileSync(fixture.agentPath, `${text.trimEnd()}\n# my own note\n`);
+      const edited = readFileSync(fixture.agentPath, 'utf8');
+      const statusEdited = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      assert.equal(statusEdited.status.agent.state, 'modified', `${label}: a customised old build is MODIFIED`);
+      const refused = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+      assert.ok(refused.refused.some((entry) => entry.target === 'agent' && entry.code === 'AGENT_USER_MODIFIED'));
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), edited, `${label}: the customised file is not touched`);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The INSTALLED local test build `1.5.1-test.1` -> this candidate (`1.5.1-test.2`).
+// ---------------------------------------------------------------------------
+// The reference bytes are not a guess: they are the template the installed test.1 product
+// package shipped, rendered by this module's own renderer, and compared byte-for-byte with
+// the file actually installed on the operator's machine. Both forms are enumerated, so an
+// untouched test.1 install is `outdated` (upgradable) instead of `modified`.
+
+test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () => {
+  const reference = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.1-test.1.toml'));
+  assert.equal(reference.length, 40_266, 'the reference is the CRLF form actually installed on Windows');
+  assert.equal(digest(reference.toString('utf8')),
+    '287be66fb4e9d4623d4384545a990c267bf5f5aeede68acc9965c1b442d38ceb');
+  const lf = reference.toString('utf8').replace(/\r\n/g, '\n');
+  assert.equal(digest(lf), '1995032ab0794404d243f34d97478021c435fda1d584254cb1b70fcbe5432970');
+  for (const [label, text] of [['CRLF', reference.toString('utf8')], ['LF', lf]]) {
+    assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.1-test.1' && entry.sha256 === digest(text)), true,
+      `${label}: the installed build is enumerated`);
+    assert.equal(isKnownPriorTemplate(text), true);
+    assert.equal(isKnownPriorTemplate(`${text}\n# edit\n`), false, `${label}: any edit stops being a known build`);
+  }
+  // The published 1.5.0 identities are NOT removed by adding the test build.
+  assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0'
+    && entry.sha256 === '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b'), true);
+  // The public version matches the formal release; test identity registration is separate.
+  assert.equal(DELIVERABLE_VERSION, '1.5.1');
+});
+
+test('an untouched 1.5.1-test.1 install (LF and CRLF) upgrades to this candidate, idempotently', async () => {
+  const reference = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.1-test.1.toml'), 'utf8');
+  const candidate = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
+  for (const [label, text] of [['CRLF', reference], ['LF', reference.replace(/\r\n/g, '\n')]]) {
+    const fixture = codexHomeFixture();
+    try {
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      writeFileSync(fixture.agentPath, text);
+
+      // The exact symptom the operator hit: untouched installed bytes reported `modified`.
+      const before = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.2' });
+      assert.equal(before.status.agent.state, 'outdated',
+        `${label}: an untouched test.1 build must be upgradable, not ${before.status.agent.state}/${before.status.agent.reason}`);
+
+      const install = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.2' });
+      assert.equal(install.status.agent.state, 'installed', `${label}: now the candidate`);
+      const upgraded = readFileSync(fixture.agentPath, 'utf8');
+      // The BODY must be this candidate's; the version LINE is rendered from the package
+      // version being installed (`1.5.1-test.2` here), so it is compared separately. The
+      // shipped template file itself keeps the formal release version, not the simulated test version.
+      const bodyOf = (text) => text.replace(/\r\n/g, '\n').replace(/^version[ \t]*=[ \t]*"[^"]*"\r?$/mu, 'version = "<rendered>"');
+      assert.equal(bodyOf(upgraded), bodyOf(candidate), `${label}: the candidate body`);
+      assert.ok(upgraded.includes('version = "1.5.1-test.2"'), `${label}: rewrote the version line`);
+      assert.ok(upgraded.includes('AGENT TEAMS IS YOUR DECISION'), `${label}: and the current rules`);
+
+      const again = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.2' });
+      assert.equal(again.status.agent.state, 'installed');
+      assert.deepEqual(again.changed, [], `${label}: the second install is a no-op`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), upgraded);
+
+      // Custom protection survives: one added line is the operator's file.
+      writeFileSync(fixture.agentPath, `${text.trimEnd()}\n# my own note\n`);
+      const edited = readFileSync(fixture.agentPath, 'utf8');
+      const statusEdited = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.2' });
+      assert.equal(statusEdited.status.agent.state, 'modified', `${label}: a customised test.1 file is MODIFIED`);
+      const refused = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.2' });
+      assert.ok(refused.refused.some((entry) => entry.code === 'AGENT_USER_MODIFIED'), `${label}: and refused`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), edited, `${label}: byte-identical after the refusal`);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A LOCAL artifact of THIS machine, not a published release identity.
+// ---------------------------------------------------------------------------
+// `agent-local-test2-stale-version.reference.toml` is the test.2 product template rendered
+// with `version = "1.5.0"` — what the hot-updated plugin actually wrote while its version
+// memo was stale. It was compared byte-for-byte with the file installed on this machine.
+// It is NOT an official 1.5.0 build: the official bytes are enumerated separately above
+// and stay enumerated. Matching is exact-content only, so the operator's own edits remain
+// theirs.
+
+test('the LOCAL stale-version artifact is enumerated by its own exact bytes, and the real 1.5.0 identities stay', () => {
+  const reference = readFileSync(join(ROOT, 'tests/fixtures/agent-local-test2-stale-version.toml'));
+  assert.equal(reference.length, 40_259, 'the installed CRLF form of this machine');
+  assert.equal(digest(reference.toString('utf8')),
+    'f55893e7605627c6f0c9a4c55f58a5a1956d4c11b8c03c99569dca241842d8bb');
+  const lf = reference.toString('utf8').replace(/\r\n/g, '\n');
+  assert.equal(digest(lf), 'da2f428f726ae64b6895941d5238516346af91b63b038b1d57787be327fb28ee');
+  for (const [label, text] of [['CRLF', reference.toString('utf8')], ['LF', lf]]) {
+    assert.equal(isKnownPriorTemplate(text), true, `${label}: a byte-exact local artifact is migratable`);
+    assert.equal(isKnownPriorTemplate(`${text}\n# edit\n`), false, `${label}: one added line is not`);
+  }
+  // It is DISTINCT from every published 1.5.0 build: same version line, different body.
+  assert.notEqual(digest(lf), '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b');
+  // The real published identities are still enumerated.
+  for (const sha256 of [
+    '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b',
+    '253a695842e9634e28e86030c7ffb10d21b338f09451a8c13849cfce1d9d9364',
+  ]) {
+    assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0' && entry.sha256 === sha256), true);
+  }
+  // And the local artifact did not replace or absorb the official ones.
+  assert.ok(KNOWN_AGENT_TEMPLATES.filter((entry) => entry.version === '1.5.0').length >= 4);
+});
+
+test('the LOCAL stale-version file upgrades to 1.5.1-test.3, idempotently, and a customised one is kept', async () => {
+  const reference = readFileSync(join(ROOT, 'tests/fixtures/agent-local-test2-stale-version.toml'), 'utf8');
+  const candidate = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
+  const bodyOf = (text) => text.replace(/\r\n/g, '\n').replace(/^version[ \t]*=[ \t]*"[^"]*"\r?$/mu, 'version = "<rendered>"');
+  for (const [label, text] of [['CRLF', reference], ['LF', reference.replace(/\r\n/g, '\n')]]) {
+    const fixture = codexHomeFixture();
+    try {
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      writeFileSync(fixture.agentPath, text);
+
+      // The false conflict this artifact caused: a freshly written file read as `modified`.
+      const before = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.3' });
+      assert.equal(before.status.agent.state, 'outdated',
+        `${label}: the local artifact must be upgradable, not ${before.status.agent.state}`);
+
+      const install = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.3' });
+      assert.equal(install.status.agent.state, 'installed');
+      const upgraded = readFileSync(fixture.agentPath, 'utf8');
+      assert.equal(bodyOf(upgraded), bodyOf(candidate), `${label}: the candidate body`);
+      assert.ok(upgraded.includes('version = "1.5.1-test.3"'), `${label}: the new version line`);
+
+      const again = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.3' });
+      assert.deepEqual(again.changed, [], `${label}: idempotent`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), upgraded);
+
+      writeFileSync(fixture.agentPath, `${text.trimEnd()}\n# my own note\n`);
+      const edited = readFileSync(fixture.agentPath, 'utf8');
+      const statusEdited = await runCodexAction('status', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.3' });
+      assert.equal(statusEdited.status.agent.state, 'modified', `${label}: a customised local artifact is MODIFIED`);
+      const refused = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.3' });
+      assert.ok(refused.refused.some((entry) => entry.code === 'AGENT_USER_MODIFIED'), `${label}: refused`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), edited, `${label}: byte-identical`);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+
+test('release upgrade recognises the exact installed test.3 template in LF and CRLF without overwriting edits', async () => {
+  const lf = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.1-test.3.toml'), 'utf8').replace(/\r\n/g, '\n');
+  const releaseVersion = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version;
+  const forms = [
+    ['LF', lf, 'dc1c17f3bdfe171d3c1e7f943d569b12ffe12d6b25190fffe1c8c9550446f29d'],
+    ['CRLF', lf.replace(/\n/g, '\r\n'), '06e13895f6df3ec9fbf48b1b40af42940f3ddf2b3afad356751dbd11e1205ff4'],
+  ];
+  for (const [label, text, expectedHash] of forms) {
+    assert.equal(digest(text), expectedHash, label + ': the actual test.3 identity');
+    assert.ok(KNOWN_AGENT_TEMPLATES.some(x => x.version === '1.5.1-test.3' && x.sha256 === expectedHash));
+    const fixture = codexHomeFixture();
+    const options = {codexHome: fixture.home, env: isolatedEnv(fixture.home), version: releaseVersion};
+    try {
+      mkdirSync(dirname(fixture.agentPath), {recursive: true});
+      writeFileSync(fixture.agentPath, text);
+      const before = await runCodexAction('status', options);
+      assert.equal(before.status.agent.state, 'outdated', label + ': recognised prior candidate');
+      const installed = await runCodexAction('install', options);
+      assert.equal(installed.status.ready, true, label + ': complete integration');
+      assert.deepEqual(installed.refused, []);
+      const body = readFileSync(fixture.agentPath, 'utf8');
+      assert.ok(body.includes('version = "' + releaseVersion + '"'));
+      const repeated = await runCodexAction('install', options);
+      assert.deepEqual(repeated.changed, [], label + ': repeated install is idempotent');
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), body);
+      const custom = text + '\n# operator custom note\n';
+      writeFileSync(fixture.agentPath, custom);
+      const refused = await runCodexAction('install', options);
+      assert.ok(refused.refused.some(x => x.code === 'AGENT_USER_MODIFIED'));
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), custom, label + ': preserve edited candidate');
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});

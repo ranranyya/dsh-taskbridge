@@ -365,6 +365,61 @@ export const KNOWN_AGENT_TEMPLATES = [
   // Exact installed test.2 package verified by the coordinator before 1.5.0.
   { version: '1.4.3-test.2', sha256: 'a761461a769b8f297be0e4b7bb68de591918d5afa74a8348e9d475c87011a967' },
   { version: '1.4.3-test.2', sha256: '75ee69400e040d8e18542121a0a49467539368cc0205cc120785b62b6692e16d' },
+  // Exact published 1.5.0 template — the file an existing 1.5.0 installation holds when
+  // the build that teaches the repeated-failure acknowledgment starts. The instruction
+  // body changed in this working tree (the `failure` block gained its `eventId`, the
+  // redelivery rule and the `ackFailureEventId` acknowledgment), so 1.5.0's bytes are a
+  // DISTINCT published build that has to be enumerated: without them every untouched
+  // 1.5.0 install would be reported `modified` ("somebody else's file") and never
+  // refreshed. Both byte forms are enumerated, exactly like every other release:
+  //
+  // * `4af78cd2…` — the LF form as the release committed it (`git show
+  //   6d1eef9:codex/dsh-taskbridge.toml`, 32100 bytes, version = "1.5.0").
+  // * `253a6958…` — the same text with every `\n` turned into `\r\n` (32521 bytes), the
+  //   uniform CRLF form a Windows install writes.
+  //
+  // Both are exact content identities computed from the committed blob, never derived
+  // from the NEW template: an operator-edited file still hashes to something unknown and
+  // is left alone.
+  { version: '1.5.0', sha256: '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b' },
+  { version: '1.5.0', sha256: '253a695842e9634e28e86030c7ffb10d21b338f09451a8c13849cfce1d9d9364' },
+  // The INSTALLED local test build `1.5.1-test.1`. Its identity is not a guess: the bytes
+  // are the template that build's own product package shipped, rendered by the SAME
+  // renderer this module uses, and they were compared byte-for-byte with the file actually
+  // installed on the operator's machine.
+  //
+  //   * `1995032a…` — the LF form (40220 bytes, `version = "1.5.1-test.1"`).
+  //   * `287be66f…` — the same text with every `\n` turned into `\r\n` (40266 bytes), which
+  //     is exactly what is installed on Windows.
+  //
+  // Without these two, an untouched test.1 install hashes to "unknown content" and is
+  // reported `modified`, which is what made the upgrade to test.2 impossible. Only these
+  // exact bytes qualify: a single edited character still hashes to something unknown and
+  // stays the operator's file.
+  { version: '1.5.1-test.1', sha256: '1995032ab0794404d243f34d97478021c435fda1d584254cb1b70fcbe5432970' },
+  { version: '1.5.1-test.1', sha256: '287be66fb4e9d4623d4384545a990c267bf5f5aeede68acc9965c1b442d38ceb' },
+  // A LOCAL artifact of this operator's machine, NOT a published release identity.
+  //
+  // What it is: when this machine's plugin was upgraded to `1.5.1-test.2`, the running
+  // module still answered the CACHED old version, so the integration was written with the
+  // CURRENT template body but `version = "1.5.0"` stamped in it. The reference is that
+  // product template rendered by this module's own renderer with that stale version, and
+  // it was compared byte-for-byte with the file actually installed here.
+  //
+  // Why it must be enumerated: the next start reads the REAL manifest, so without these
+  // bytes the operator's freshly written file would be classified `modified` — a
+  // self-inflicted false conflict after every update. The version line is the ONLY thing
+  // that makes it distinct from a real 1.5.0 build, which is exactly why it is matched by
+  // exact content and nothing else: any edit (or any other template) still hashes to an
+  // unknown value and stays the operator's file.
+  //
+  //   * `da2f428f…` — LF form (39,743 bytes).
+  //   * `f55893e7…` — the installed CRLF form (40,259 bytes).
+  { version: '1.5.0', sha256: 'da2f428f726ae64b6895941d5238516346af91b63b038b1d57787be327fb28ee' },
+  { version: '1.5.0', sha256: 'f55893e7605627c6f0c9a4c55f58a5a1956d4c11b8c03c99569dca241842d8bb' },
+  // Exact locally installed test.3 product template, verified before preparing 1.5.1.
+  { version: '1.5.1-test.3', sha256: 'dc1c17f3bdfe171d3c1e7f943d569b12ffe12d6b25190fffe1c8c9550446f29d' },
+  { version: '1.5.1-test.3', sha256: '06e13895f6df3ec9fbf48b1b40af42940f3ddf2b3afad356751dbd11e1205ff4' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */
@@ -480,6 +535,123 @@ export function requireCodexHome(codexHome) {
     throw new CodexInstallError('CODEX_HOME_INVALID', 'the Codex home must be an absolute path');
   }
   return resolve(codexHome);
+}
+
+/**
+ * Resolve the SELECTED Codex home to the REAL directory it names, pinning it once.
+ *
+ * Why this exists: a migrated machine commonly keeps `~/.codex` as a junction (Windows) or
+ * symlink pointing at the real store (for example `E:\Codex\Data\.codex`). That root link
+ * is the operator's own layout, not a hostile indirection: refusing it made every update
+ * report a false conflict and forced a manual fix. So the ROOT may be a link — it is
+ * resolved ONCE here and every later read, classification, write, repair, refresh and
+ * removal uses the resolved target, which means an alias retargeted mid-operation can
+ * never redirect a write to a new place.
+ *
+ * What is NOT relaxed:
+ *   * `<home>/agents`, the agent file and `config.toml` are still inspected and refused
+ *     when THEY are links (see {@link inspectCodexBoundary});
+ *   * a target that is missing, not a directory, or unreadable is refused with a clear
+ *     reason rather than created or followed further;
+ *   * the root link itself is never deleted, moved or rewritten.
+ * @param {string} selected - the selected home (already absolute; may be a link).
+ * @returns {Promise<{ selected: string, real: string, linked: boolean, linkTarget: string | null,
+ *   error: null | { code: string, reason: string, message: string } }>} pinned home facts.
+ */
+async function pinCodexHome(selected) {
+  const selectedPath = selected;
+  const linkedInfo = await inspectDirectory(selectedPath).catch(() => ({ kind: 'unknown' }));
+  // A missing root is the ordinary first-install case: it is created by the writer, and
+  // its parent is what must be a real directory.
+  if (linkedInfo.kind === 'missing') {
+    return { selected: selectedPath, real: selectedPath, linked: false, linkTarget: null, error: null };
+  }
+  if (linkedInfo.kind === 'unknown') {
+    // The platform could not classify the root. That is NOT "unusable": it is the
+    // existing `boundary-unverified` diagnosis, which the boundary inspection below owns.
+    // Pinning leaves the path alone and lets that check report the refusal.
+    return { selected: selectedPath, real: selectedPath, linked: false, linkTarget: null, error: null };
+  }
+  if (linkedInfo.kind !== 'link') {
+    // A real directory (including a junction that `lstat`/attributes prove is one is
+    // handled by the link branch below): nothing to resolve.
+    if (linkedInfo.kind === 'directory') {
+      return { selected: selectedPath, real: selectedPath, linked: false, linkTarget: null, error: null };
+    }
+    // A DANGLING Windows junction is the awkward case: `lstat` reports an ordinary
+    // directory (the target is never reached), so it lands here as `directory`-less and
+    // `realpath` fails. Resolve it as a link attempt: if `realpath` cannot answer, the
+    // selected root exists but does not lead to a usable directory, and nothing may be
+    // created at the alias.
+    let dangling = null;
+    try {
+      dangling = await realpath(selectedPath);
+    } catch {
+      dangling = null;
+    }
+    if (dangling === null) {
+      return {
+        selected: selectedPath,
+        real: selectedPath,
+        linked: false,
+        linkTarget: null,
+        error: {
+          code: 'CODEX_HOME_UNUSABLE',
+          reason: 'codex-home-link-unresolvable',
+          message: 'the Codex home cannot be resolved to a real directory (its target is missing)',
+        },
+      };
+    }
+    return {
+      selected: selectedPath,
+      real: selectedPath,
+      linked: false,
+      linkTarget: null,
+      error: {
+        code: 'CODEX_HOME_UNUSABLE',
+        reason: 'codex-home-not-a-directory',
+        message: 'the Codex home exists but is not a directory, so nothing was read or written',
+      },
+    };
+  }
+  // The ROOT is a link/junction: resolve it once and classify what it really names.
+  let resolved;
+  try {
+    resolved = await realpath(selectedPath);
+  } catch {
+    return {
+      selected: selectedPath,
+      real: selectedPath,
+      linked: true,
+      linkTarget: null,
+      error: {
+        code: 'CODEX_HOME_UNUSABLE',
+        reason: 'codex-home-link-unresolvable',
+        message: 'the Codex home is a link whose target cannot be resolved (missing or dangling)',
+      },
+    };
+  }
+  const realInfo = await inspectDirectory(resolved).catch(() => ({ kind: 'unknown' }));
+  if (realInfo.kind !== 'directory') {
+    return {
+      selected: selectedPath,
+      real: resolved,
+      linked: true,
+      linkTarget: linkedInfo.target ?? null,
+      error: {
+        code: 'CODEX_HOME_UNUSABLE',
+        reason: 'codex-home-target-not-a-directory',
+        message: 'the Codex home link does not point at a real directory, so nothing was read or written',
+      },
+    };
+  }
+  return {
+    selected: selectedPath,
+    real: resolved,
+    linked: true,
+    linkTarget: linkedInfo.target ?? null,
+    error: null,
+  };
 }
 
 /**
@@ -990,8 +1162,11 @@ export async function inspectCodexBoundary(home) {
   const agentsPath = join(home, 'agents');
   const homeInfo = await inspectDirectory(home);
   if (homeInfo.kind === 'link') {
-    // The agents path is resolved through the link; do not inspect it further, and
-    // do not report whether anything below it exists.
+    // Reached only when the caller did NOT pin the root first (a direct caller of this
+    // public helper). The installer's own entries resolve a selected root link through
+    // {@link pinCodexHome} and then inspect the REAL directory, so this branch keeps the
+    // conservative answer for an unpinned call: below an unresolved link nothing is
+    // written and nothing below it is even inspected.
     return { blocked: true, link: 'codex-home', unknown: false, home: homeInfo, agents: { kind: 'unchecked' } };
   }
   const agentsInfo = homeInfo.kind === 'directory'
@@ -2069,21 +2244,33 @@ export async function readCodexStatus({
   version = null,
   hostNode = null,
 } = {}) {
-  const home = codexHome === null ? resolveCodexHome({ env }) : requireCodexHome(codexHome);
+  const selected = codexHome === null ? resolveCodexHome({ env }) : requireCodexHome(codexHome);
+  // A link/JUNCTION at the ROOT is the operator's own layout and is allowed: it is pinned
+  // to its real directory ONCE here, and everything below reads, classifies and writes
+  // against that real path.
+  const pinned = await pinCodexHome(selected);
+  const home = pinned.real;
   const agentPath = join(home, 'agents', AGENT_FILENAME);
   const configPath = join(home, 'config.toml');
   const packageVersionValue = version ?? await readPackageVersion();
   const template = renderAgentFile(await readAgentTemplate(), packageVersionValue);
   // The boundary first: a link at the Codex home or at `agents` means the agent path
   // does not name a file this plugin may touch, whatever `lstat` would say about it.
-  const boundary = await inspectCodexBoundary(home);
+  const boundary = pinned.error === null
+    ? await inspectCodexBoundary(home)
+    // A root that could not be pinned is refused WITHOUT inspecting anything below it:
+    // the alias does not lead to a usable directory, so there is nothing to classify and
+    // nothing may be created through it.
+    : { blocked: true, link: null, unknown: false, home: { kind: 'link' }, agents: { kind: 'unchecked' } };
   const agent = boundary.blocked
     ? {
       state: AGENT_STATES.conflict,
       present: false,
       reason: boundary.unknown === true
         ? 'boundary-unverified'
-        : boundary.link === 'codex-home' ? 'codex-home-is-link' : 'agents-dir-is-link',
+        // A selected ROOT that could not be pinned reports WHY (missing target, not a
+        // directory) instead of the generic "is a link".
+        : (pinned.error?.reason ?? (boundary.link === 'codex-home' ? 'codex-home-is-link' : 'agents-dir-is-link')),
       contents: null,
     }
     : await readAgentState(agentPath, template);
@@ -2168,7 +2355,13 @@ export async function readCodexStatus({
   }
 
   return buildStatus({
+    // The REAL directory every action uses, plus the selected spelling so an operator who
+    // configured a junction can recognise it. `codexHome` is always the path actually
+    // read and written.
     codexHome: home,
+    codexHomeSelected: pinned.selected,
+    codexHomeLinked: pinned.linked,
+    codexHomeLinkTarget: pinned.linkTarget,
     agentPath,
     configPath,
     packageVersionValue,
@@ -2204,6 +2397,9 @@ function defaultDiscoveryPath(env) {
  */
 function buildStatus({
   codexHome,
+  codexHomeSelected = null,
+  codexHomeLinked = false,
+  codexHomeLinkTarget = null,
   agentPath,
   configPath,
   packageVersionValue,
@@ -2223,6 +2419,11 @@ function buildStatus({
   const mcpOk = mcp.state === MCP_STATES.configured;
   return {
     codexHome,
+    // The selected spelling and whether it was a root link, kept beside the REAL path so
+    // an operator who configured a junction recognises the answer without guessing.
+    codexHomeSelected: codexHomeSelected ?? codexHome,
+    codexHomeLinked: codexHomeLinked === true,
+    codexHomeLinkTarget,
     packageVersion: packageVersionValue,
     // Whether the two directories that bound every write are real directories. A link
     // at either one is a stable diagnosis, not an installation state: install, repair
@@ -2404,10 +2605,28 @@ export async function runCodexAction(action, {
   if (codexHome !== null && (typeof codexHome !== 'string' || codexHome.trim() === '' || !isAbsolute(codexHome))) {
     throw new CodexInstallError('CODEX_HOME_INVALID', 'the Codex home must be an absolute path');
   }
-  const home = codexHome === null ? resolveCodexHome({ env }) : requireCodexHome(codexHome);
+  const selected = codexHome === null ? resolveCodexHome({ env }) : requireCodexHome(codexHome);
+  // Pin the selected root ONCE, so install, repair and remove all act on the same real
+  // directory even if the alias is retargeted while this action runs.
+  const pinned = await pinCodexHome(selected);
+  const home = pinned.real;
+  /**
+   * Attach the SELECTED spelling to a status document read from the pinned real path.
+   *
+   * `readCodexStatus` was handed the real directory, so its own "selected" is that
+   * directory; the operator's spelling comes from here.
+   * @param {object} status - status read against `home`.
+   * @returns {object} the same status, annotated.
+   */
+  const annotated = (status) => ({
+    ...status,
+    codexHomeSelected: pinned.selected,
+    codexHomeLinked: pinned.linked,
+    codexHomeLinkTarget: pinned.linkTarget,
+  });
   if (action === 'status') {
     const status = await readCodexStatus({ codexHome: home, env, discoveryFile, version, hostNode });
-    return { action, changed: [], refused: [], status };
+    return { action, changed: [], refused: [], status: annotated(status) };
   }
 
   const before = await readCodexStatus({ codexHome: home, env, discoveryFile, version, hostNode });
@@ -2424,7 +2643,7 @@ export async function runCodexAction(action, {
     : null;
   if (linked !== null) {
     refused.push(linked);
-    return { action, changed, refused, status: before };
+    return { action, changed, refused, status: annotated(before) };
   }
 
   if (action === 'remove') {
@@ -2440,7 +2659,7 @@ export async function runCodexAction(action, {
   }
 
   const status = await readCodexStatus({ codexHome: home, env, discoveryFile, version, hostNode });
-  return { action, changed, refused, status };
+  return { action, changed, refused, status: annotated(status) };
 }
 
 /**
@@ -2501,8 +2720,14 @@ export async function refreshKnownAgentTemplate(options = {}) {
   if (codexHome !== null && (typeof codexHome !== 'string' || codexHome.trim() === '' || !isAbsolute(codexHome))) {
     throw new CodexInstallError('CODEX_HOME_INVALID', 'the Codex home must be an absolute path');
   }
-  const home = codexHome === null ? resolveCodexHome({ env }) : requireCodexHome(codexHome);
-  const before = plan ?? await readCodexStatus({ codexHome: home, env, discoveryFile, version, hostNode });
+  // A selected ROOT link is allowed and pinned here too, so a startup refresh migrates the
+  // same real directory the settings page installs into (and a `plan` captured by the
+  // caller was itself read through the same pin).
+  const selectedRoot = codexHome === null ? resolveCodexHome({ env }) : requireCodexHome(codexHome);
+  const home = (await pinCodexHome(selectedRoot)).real;
+  const before = (plan === undefined || plan === null)
+    ? await readCodexStatus({ codexHome: home, env, discoveryFile, version, hostNode })
+    : plan;
   const changed = [];
   const refused = [];
 

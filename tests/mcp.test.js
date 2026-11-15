@@ -170,7 +170,7 @@ test('no tool argument can carry a connection token, a credential value or a set
   }
 });
 
-test('every tool carries accurate MCP annotations, and the long wait is marked read-only', () => {
+test('every tool carries accurate MCP annotations, and the long wait is not announced read-only', () => {
   // 1.2.0: the catalog states what each tool DOES, so a concurrency-aware client can
   // tell a long read from a mutation. The annotations are a description, not a fix: a
   // serialising host ignores them, which is why the independent control binary exists.
@@ -189,8 +189,10 @@ test('every tool carries accurate MCP annotations, and the long wait is marked r
     }
   }
   const byName = new Map(TOOLS.map((tool) => [tool.name, tool.annotations]));
-  // The one call that may legitimately be held for an hour is a READ.
-  assert.equal(byName.get('delegate_wait').readOnlyHint, true);
+  // The one call that may legitimately be held for an hour CAN also acknowledge a
+  // reminder (clearing the monitor's reminder state), so it is not announced as a
+  // pure read — but it destroys nothing.
+  assert.equal(byName.get('delegate_wait').readOnlyHint, false);
   assert.equal(byName.get('delegate_wait').destructiveHint, false);
   assert.equal(byName.get('delegate_status').readOnlyHint, true);
   assert.equal(byName.get('delegate_result').readOnlyHint, true);
@@ -217,7 +219,7 @@ test('every tool carries accurate MCP annotations, and the long wait is marked r
       ['delegate_status', true],
       ['delegate_submit', false],
       ['delegate_result', true],
-      ['delegate_wait', true],
+      ['delegate_wait', false],
       ['delegate_cancel', false],
       ['delegate_permission_decide', false],
       ['delegate_question_answer', false],

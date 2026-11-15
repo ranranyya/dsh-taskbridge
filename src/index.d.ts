@@ -381,6 +381,15 @@ export interface DelegateTaskActivity {
 export interface DelegateRepeatedFailure {
   /** Fixed discriminator, so a client can tell this apart from a silence report. */
   kind: 'repeated-tool-failure';
+  /**
+   * The stable identity of THIS notification: 16 hex chars digesting the episode's
+   * own hashed identity under a per-monitor 16-byte random nonce — never the raw
+   * arguments or error prose. The reminder is redelivered with the SAME eventId
+   * until the receiver acknowledges it by this id, so a lost answer is recoverable
+   * and one repeated failure is one notification; two tasks failing identically at
+   * the same instant never share an identity.
+   */
+  eventId: string;
   /** The native tool name. */
   toolName: string;
   /**
@@ -453,9 +462,39 @@ export interface DelegateObservationSummary {
   connectionId: string | null;
   /** Always false: execution completion is not host acceptance. */
   selfApproved: false;
+  /**
+   * The commander's DSH Agent Teams decision frozen on the task at admission
+   * (`true`/`false`), or `null` when they made no choice (the Session keeps its own
+   * mode). This is the REQUEST, never the applied state — read `team` for that.
+   */
+  agentTeams: boolean | null;
+  /** What DSH's own Agent Teams service confirmed for the run, or `null` when unasked. */
+  team: DelegateAgentTeamsOutcome | null;
   /** The commander's recorded delivery review, or null while none exists. */
   hostAcceptance: DelegateCompactHostAcceptance | null;
   reviewPersistence: DelegateReviewPersistence;
+}
+
+/**
+ * The outcome of one run's Agent Teams selection.
+ *
+ * DSH owns the switch: the run's own root Session stores `team/mode`, the same selection
+ * the model menu's「Use Agent Teams」control writes. `requested` is what the dispatcher
+ * asked for, `applied` is what the service CONFIRMED by reading the saved selection back,
+ * and `reason` explains every non-application (`not-requested`,
+ * `agent-teams-unavailable`, `agent-teams-failed: …`, `agent-teams-unconfirmed`,
+ * `agent-teams-mismatch: …`, `aborted`) so an operator can tell "asked and on" from
+ * "asked and could not be applied".
+ */
+export interface DelegateAgentTeamsOutcome {
+  requested: boolean | null;
+  /** Whether this harness composed the Agent Teams service at all. */
+  supported: boolean;
+  /** True only after the service's own read-back agreed with the request. */
+  applied: boolean;
+  /** The selection the Session reports, or `null` when it could not be read. */
+  enabled: boolean | null;
+  reason: string | null;
 }
 
 /**
@@ -731,6 +770,29 @@ export interface DelegateObservation {
    * keeps the two distinguishable without a new reason value.
    */
   failure?: DelegateRepeatedFailure | null;
+  /**
+   * Present only when the caller asked to acknowledge one delivered reminder by its
+   * `eventId` (an `ackFailureEventId` on the observe/wait call). `acknowledged` is
+   * `true` when the exact pending event was cleared (or had already been cleared by
+   * an idempotent repeat); `false` with a `reason` (`unknown-event`, `superseded`,
+   * `no-pending`, `event-id-required`) when nothing was cleared — a wrong ack never
+   * silences a live reminder.
+   */
+  /**
+   * Present only when the caller asked to acknowledge one delivered reminder by its
+   * `eventId` (an `ackFailureEventId` on the observe/wait call). `acknowledged` is
+   * `true` when the exact pending event was cleared (or had already been cleared by
+   * an idempotent repeat); `false` with a `reason` (`unknown-event`, `superseded`,
+   * `no-pending`, `event-id-required`) when nothing was cleared — a wrong ack never
+   * silences a live reminder, and an empty id is refused, not ignored. The FIRST
+   * verdict reported on a wait is frozen for that call: later observations do not
+   * overwrite it with an `unknown-event` from a disposed monitor or a settled task.
+   */
+  failureAck?: {
+    acknowledged: boolean;
+    eventId: string | null;
+    reason: string | null;
+  };
   activity: DelegateTaskActivity | null;
   selfCheck: { episode: number | null; checkedAt: number | null; verdict: string | null } | null;
   /**

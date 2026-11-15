@@ -39,15 +39,34 @@ let cached = null;
 /**
  * Read the manifest this build belongs to.
  *
- * Memoised: the answer cannot change while the process runs, and the handshake may be
- * asked for it repeatedly by an MCP host that reconnects.
+ * Memoised: a normal process cannot change its own manifest while it runs, and the
+ * handshake may be asked for it repeatedly by an MCP host that reconnects.
+ *
+ * `refresh: true` bypasses (and replaces) that memo. It exists for the ONE case where the
+ * manifest DOES change under a live module instance: the host replaces the installed
+ * package on disk while this module stays loaded (a DSH hot update), so a stale answer
+ * would make the plugin write a Codex integration stamped with the PREVIOUS version — and
+ * the next start, reading the real manifest, would then call that fresh file custom.
+ * Every other caller keeps the process-lifetime cache.
+ * @param {{ refresh?: boolean }} [options] - `refresh: true` re-reads the manifest once.
  * @returns {{ ok: true, name: string, version: string, path: string }
  *   | { ok: false, reason: string, path: string }} the manifest facts, or why not.
  */
-export function readPackageManifest() {
-  if (cached !== null) return cached;
+export function readPackageManifest({ refresh = false } = {}) {
+  if (refresh !== true && cached !== null) return cached;
   cached = loadPackageManifest();
   return cached;
+}
+
+/**
+ * Forget the memoised manifest, so the NEXT read goes back to disk.
+ *
+ * Kept as its own function for callers that want to invalidate without reading, while
+ * {@link readPackageManifest} with `refresh: true` is the ordinary "re-read now" path.
+ * @returns {void}
+ */
+export function refreshPackageManifest() {
+  cached = null;
 }
 
 /**
@@ -87,11 +106,14 @@ function loadPackageManifest() {
  * is the true fact, instead of being told a version that belongs to a different build.
  * The fallback NAME is this package's own name, so an unreadable manifest still reports
  * the right package rather than a historical alias.
+ * @param {{ refresh?: boolean }} [options] - forwarded to {@link readPackageManifest};
+ *   `refresh: true` is what a plugin activation uses, because a host may have replaced the
+ *   installed package while this module stayed loaded.
  * @returns {{ name: string, version: string, source: string }} reported identity.
  *   `source` is `package.json` when the manifest was read, `fallback` otherwise.
  */
-export function reportedVersion() {
-  const manifest = readPackageManifest();
+export function reportedVersion(options = {}) {
+  const manifest = readPackageManifest(options);
   if (manifest.ok) {
     return { name: manifest.name, version: manifest.version, source: 'package.json' };
   }

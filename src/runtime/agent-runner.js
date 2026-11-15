@@ -653,6 +653,9 @@ export async function driveAgent(deps, request) {
   const state = {
     abortRequested: false,
     abortCause: null,
+    // The caller's own cancellation, so a pre-prompt step (the Agent Teams selection) can
+    // pass a real AbortSignal to the native service and honour the run's deadline/cancel.
+    signal: request?.signal ?? null,
     handle: null,
     handleDisposed: false,
     // A resolved Agent is driven through the same handle shape a created one
@@ -689,6 +692,9 @@ export async function driveAgent(deps, request) {
     // an armed permission bridge is why the Session asks instead of rejecting.
     // Reported as a verified fact, never as a configuration value.
     approval: null,
+    // The Agent Teams selection this run applied to its own root Session, or null when
+    // the caller made no team choice at all.
+    team: null,
     // Removes the `approval/request` answerer when the run ends. Null when the run
     // had no bridge, which is the ordinary worker run.
     permissionAnswerer: null,
@@ -853,6 +859,37 @@ export async function driveAgent(deps, request) {
     if (state.abortRequested) {
       await releaseHandle(state, handle);
       return finish(state, state.abortCause === 'timeout' ? RUN_OUTCOMES.timedOut : RUN_OUTCOMES.cancelled);
+    }
+
+    // Agent Teams selection, applied to THIS run's own Session before any model step.
+    //
+    // DSH owns the switch: `ctx.agentTeams.setEnabled(rootAgent, enabled, signal)` appends
+    // the Session's `team/mode` selection and flushes it, which is exactly what the model
+    // menu's "Use Agent Teams" control does. The plugin never guesses the value (no
+    // keyword heuristics) and never opens the global default.
+    //
+    // A REQUESTED team mode that cannot be applied STOPS the run here, before the prompt:
+    // continuing with the Session's old mode would silently do the opposite of what the
+    // commander asked. Only an ABSENT choice (`null`) keeps the Session as it is.
+    state.team = await applyTeamSelection(deps, handle.agent, request?.agentTeams ?? null, state, { aborted });
+    if (state.team !== null && typeof state.team.refuseReason === 'string') {
+      // A requested mode that could not be applied is a REFUSAL, not a downgrade: the
+      // worker is released without ever receiving the prompt, so nothing runs under the
+      // Session's old mode while the commander believes teams are on. The failure is
+      // stated on the run so the task record explains WHY nothing executed. A run that
+      // was cancelled or timed out while waiting ends as cancelled/timedOut instead.
+      if (state.team.refuseReason === 'agent-teams-aborted') {
+        await releaseHandle(state, handle);
+        return finish(state, state.abortCause === 'timeout' ? RUN_OUTCOMES.timedOut : RUN_OUTCOMES.cancelled);
+      }
+      state.error = {
+        code: 'RUN_AGENT_TEAMS_UNAVAILABLE',
+        message: `Agent Teams could not be applied before the prompt (${state.team.refuseReason}); `
+          + 'the worker was not started under the Session\u2019s previous mode',
+        details: { team: state.team },
+      };
+      await releaseHandle(state, handle);
+      return finish(state, RUN_OUTCOMES.failed);
     }
 
     handle.agent.followup(userMessage(prompt));
@@ -1413,7 +1450,135 @@ export async function driveAgent(deps, request) {
       // armed bridge is the answerer behind it. `null` for a run that never had a
       // delegated policy installed (the review, an ordinary session).
       approval: target.approval ?? null,
+      // The Agent Teams selection this run asked for and what actually happened.
+      // `requested: null` means the caller made no choice (the run keeps whatever the
+      // Session already had); `applied: true` is only claimed after the native service
+      // confirmed the Session's saved selection. `refuseReason` is INTERNAL (the runner
+      // branches on it before the prompt) and never leaves the run.
+      team: state.team === null || state.team === undefined
+        ? null
+        : {
+          requested: state.team.requested,
+          supported: state.team.supported,
+          applied: state.team.applied,
+          enabled: state.team.enabled,
+          reason: state.team.reason,
+        },
     };
+  }
+
+  /**
+   * Apply the commander's Agent Teams choice to THIS run's own root Session.
+   *
+   * The switch is DSH's, not this plugin's: `ctx.agentTeams.setEnabled(agent, enabled)`
+   * appends the Session's `team/mode` selection and flushes it — the same call the model
+   * menu's「Use Agent Teams」control makes through `remote.agentTeams.setEnabled`. So:
+   *
+   *   * the value is NEVER guessed. `null`/absent means "no choice": the Session keeps
+   *     whatever selection it already has and the run reports `requested: null`;
+   *   * nothing global is opened. Only this run's own root Session is written, so no
+   *     other conversation and no future task inherits it;
+   *   * a REQUESTED mode that cannot be applied stops the run BEFORE the prompt (the
+   *     caller treats `refuseReason` as terminal); an ABSENT choice never does;
+   *   * the wait is BOUNDED by the run itself: it races the caller's own `aborted` latch
+   *     (internal deadline or cancellation), so a service that never resolves cannot hold
+   *     the run past its budget, and a late settle never reaches the prompt.
+   * @param {object} deps - run dependencies (`policyServices`).
+   * @param {object} agent - the live root Agent this run drives.
+   * @param {boolean | null} requested - the commander's choice, or null.
+   * @param {object} state - the run state carrying the abort latch.
+   * @param {{ aborted: Promise<string> }} hooks - the run's own abort latch promise.
+   * @returns {Promise<object>} `{ requested, supported, applied, enabled, reason, refuseReason }`
+   *   where `refuseReason` is non-null exactly when the run must NOT proceed.
+   */
+  async function applyTeamSelection(deps, agent, requested, state, hooks = {}) {
+    const base = {
+      requested: requested === true ? true : requested === false ? false : null,
+      supported: false,
+      applied: false,
+      enabled: null,
+      reason: null,
+      refuseReason: null,
+    };
+    // An ABSENT choice is fully compatible: nothing is written and the run proceeds with
+    // the Session's own selection.
+    if (base.requested === null) return { ...base, reason: 'not-requested' };
+    const refuse = (reason, extra = {}) => ({
+      ...base,
+      ...extra,
+      // The same word in both fields: `reason` is what a reader displays, `refuseReason`
+      // is what the runner branches on. Keeping them identical avoids a record that says
+      // "unavailable" in one place and nothing in the other.
+      reason,
+      refuseReason: reason,
+    });
+    let service = null;
+    try {
+      const services = typeof deps?.policyServices === 'function' ? deps.policyServices() : null;
+      service = services?.agentTeams ?? null;
+    } catch {
+      service = null;
+    }
+    if (service === null || typeof service.setEnabled !== 'function') {
+      return refuse('agent-teams-unavailable');
+    }
+    if (state.abortRequested === true) return refuse('agent-teams-aborted');
+    // The real service accepts an AbortSignal. Both the caller's signal and the run's own
+    // latch (internal deadline, disposal) abort it, so a slow persist is told to stop.
+    const controller = new AbortController();
+    const onAbort = () => { try { controller.abort(); } catch { /* idempotent */ } };
+    const signal = state.signal;
+    if (signal !== null && signal !== undefined) signal.addEventListener?.('abort', onAbort, { once: true });
+    const latchPromise = hooks?.aborted;
+    const latched = typeof latchPromise?.then === 'function' ? latchPromise.then(() => 'latched') : null;
+    // NEVER leave a rejection unhandled: a late reject from a losing timer is swallowed
+    // here, and the winner is decided by which of the two settles first.
+    const settled = Promise.resolve()
+      .then(() => service.setEnabled(agent, base.requested, controller.signal))
+      .then(() => ({ ok: true }), (error) => ({ ok: false, error }));
+    try {
+      const winner = latched === null
+        ? await settled
+        : await Promise.race([settled, latched]);
+      if (winner === 'latched') {
+        // The run's own deadline or cancellation ended while the write was outstanding:
+        // the native call is told to abort and this run must not continue to the prompt.
+        onAbort();
+        // Keep the abandoned promise observed so a late settle cannot become an
+        // unhandled rejection; its result is ignored on purpose.
+        void Promise.resolve(settled).catch(() => {});
+        return refuse('agent-teams-aborted');
+      }
+      if (winner.ok === false) {
+        if (state.abortRequested === true) return refuse('agent-teams-aborted');
+        return refuse(`agent-teams-failed: ${diagnostic(winner.error?.message ?? String(winner.error), 200) ?? 'error'}`, {
+          supported: true,
+        });
+      }
+    } finally {
+      signal?.removeEventListener?.('abort', onAbort);
+    }
+    // A run cancelled while the selection was being written must not continue either: the
+    // caller already asked for it to stop, and the prompt must not be delivered late.
+    if (state.abortRequested === true) return refuse('agent-teams-aborted');
+    // Read back from the SERVICE, not from what we just asked for: `isEnabled` resolves
+    // the runtime root and returns the saved projection, so this is the applied fact.
+    let enabled = null;
+    try {
+      enabled = typeof service.isEnabled === 'function' ? service.isEnabled(agent) === true : null;
+    } catch {
+      enabled = null;
+    }
+    if (enabled === null) {
+      return refuse('agent-teams-unconfirmed', { supported: true });
+    }
+    if (enabled !== base.requested) {
+      return refuse(`agent-teams-mismatch: requested ${String(base.requested)}, session reports ${String(enabled)}`, {
+        supported: true,
+        enabled,
+      });
+    }
+    return { ...base, supported: true, applied: true, enabled, reason: null };
   }
 
   /**

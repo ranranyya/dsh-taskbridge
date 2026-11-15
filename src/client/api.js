@@ -1830,6 +1830,39 @@ export function describeError(error) {
 export function createStore(options = {}) {
   const api = options.api ?? createApi();
   const now = typeof options.now === 'function' ? options.now : () => Date.now();
+  // Debounce for the automatic save. Text inputs arrive one keystroke at a time, so a
+  // short quiet period merges them into ONE whole-document PUT; switches and selects
+  // are single discrete actions and are saved on the next tick (0 delay).
+  const saveDebounceMs = Number.isFinite(options.saveDebounceMs) && options.saveDebounceMs >= 0
+    ? Math.trunc(options.saveDebounceMs)
+    : 700;
+  const scheduleImpl = typeof options.schedule === 'function'
+    ? options.schedule
+    : (fn, ms) => setTimeout(fn, ms);
+  const cancelScheduleImpl = typeof options.cancelSchedule === 'function'
+    ? options.cancelSchedule
+    : (handle) => clearTimeout(handle);
+  /**
+   * The serialization gate for whole-document PUTs.
+   *
+   * At most ONE settings PUT is in flight at any time. Further edits (during the
+   * debounce window OR while a PUT is in flight) only mark `saveAgainSince` and are
+   * merged into the NEXT PUT, whose body is taken from the LATEST draft at send time.
+   * That is what makes a slow response unable to overwrite a newer edit.
+   */
+  let saveInFlight = false;
+  /** Every draft edit bumps this; a straggler response may only clear `dirty` for it. */
+  let draftGeneration = 0;
+  /** Pending debounce handle, or null. */
+  let saveTimer = null;
+  /** Explicit discard marker: the next debounce tick must not resurrect edits. */
+  let saveSuppressed = false;
+  /**
+   * Sequence of `openTask` calls. A detail read may only publish its answer if no
+   * NEWER read started meanwhile, so a slow response for an old row cannot replace the
+   * detail the operator is looking at now.
+   */
+  let openTaskRequest = 0;
 
   let state = {
     revision: 0,
@@ -1841,6 +1874,13 @@ export function createStore(options = {}) {
     settings: null,
     draft: null,
     dirty: false,
+    // Automatic-save state for the settings document. `idle` before any change, then
+    // `pending` (debounce window or waiting for the in-flight PUT), `saving`, `saved`,
+    // `invalid` (local precheck refused the draft; the LAST VALID document stays
+    // committed) or `failed` (the host refused / the transport failed).
+    saveState: 'idle',
+    saveError: null,
+    saveProblems: [],
     catalog: null,
     catalogError: null,
     modelCatalog: {},
@@ -1849,6 +1889,17 @@ export function createStore(options = {}) {
     grants: [],
     tasks: [],
     taskDetail: null,
+    // Visible feedback for the detail click: a spinner flag, and the refusal itself so
+    // the panel can say WHY nothing opened instead of staying silent.
+    taskDetailLoading: false,
+    taskDetailError: null,
+    /**
+     * Monotonic count of SUCCESSFUL `openTask` calls. The page focuses and scrolls to the
+     * detail on every change of this number — and only on that — so a repeated open of
+     * the same task behaves like the first one, while a background list refresh (which
+     * recomposes `taskDetail`) never steals focus.
+     */
+    taskDetailView: 0,
     token: null,
     tokenConnectionId: null,
     credentials: {},
@@ -1902,6 +1953,117 @@ export function createStore(options = {}) {
       return await work();
     } finally {
       if (!disposed) patch({ loading: { ...state.loading, [key]: false } });
+    }
+  }
+
+  /** Drop a pending debounce tick, if any. */
+  function cancelPendingSave() {
+    if (saveTimer === null) return;
+    const handle = saveTimer;
+    saveTimer = null;
+    try {
+      cancelScheduleImpl(handle);
+    } catch {
+      // A cancelled timer that already fired is harmless: the tick re-checks state.
+    }
+  }
+
+  /**
+   * Schedule the automatic save after `ms`.
+   *
+   * A later edit REPLACES the earlier tick, so a burst of keystrokes becomes one PUT.
+   * @param {number} ms - debounce delay.
+   * @returns {void}
+   */
+  function scheduleAutoSave(ms) {
+    cancelPendingSave();
+    if (saveSuppressed) return;
+    if (saveInFlight) {
+      // A PUT is already running: it will pick this edit up in its follow-up pass.
+      patch({ saveState: 'pending' });
+      return;
+    }
+    saveTimer = scheduleImpl(() => {
+      saveTimer = null;
+      void runSave();
+    }, Math.max(0, ms));
+  }
+
+  /**
+   * Validate the CURRENT draft and write the whole document, serialized.
+   *
+   * Rules this implements, each one a consequence of a real failure mode:
+   *   * an INVALID draft is never sent: the last valid document stays committed, the
+   *     draft is kept so the operator can fix it, and the exact reason is published;
+   *   * at most one PUT is in flight; the body is read from the LATEST draft at the
+   *     moment of the send, so a slow response cannot overwrite a newer edit;
+   *   * the response never replaces newer local edits: it only clears `dirty` when the
+   *     generation it saved is still the newest one;
+   *   * a throwing transport/refusal leaves the draft and reports the failure;
+   *   * while more edits arrived during the PUT, a follow-up save is scheduled.
+   * @returns {Promise<{ ok: boolean, error?: unknown, problems?: string[] }>} outcome.
+   */
+  async function runSave() {
+    if (disposed) return { ok: false, error: new Error('disposed') };
+    if (state.draft === null) return { ok: false };
+    if (saveInFlight) {
+      // Someone asked to save while another PUT runs: let that PUT finish and let its
+      // follow-up pass cover the newer draft. Nothing is dropped.
+      return { ok: false, pending: true };
+    }
+    const problems = precheckDraft(state.draft);
+    if (problems.length > 0) {
+      // The invalid draft is PRESERVED (never silently replaced by the saved values)
+      // so the operator can keep fixing it, and the last valid config stays live.
+      patch({ saveState: 'invalid', saveProblems: problems.slice(0, 4), saveError: null });
+      return { ok: false, problems };
+    }
+    const generationAtSend = draftGeneration;
+    const document = documentFromDraft(state.draft);
+    saveInFlight = true;
+    patch({ loading: { ...state.loading, save: true }, saveState: 'saving', saveError: null, saveProblems: [] });
+    try {
+      const body = await api.putSettings(document);
+      const stillCurrent = draftGeneration === generationAtSend;
+      // `settings` is ALWAYS the host's normalized answer (the host is the authority on
+      // what was stored), while the draft is re-seeded from it ONLY when this save still
+      // covers the newest edit: the normalized document is the truth for that generation,
+      // and keeping a draft that disagrees with what the host stored would leave the page
+      // showing values nobody saved. A newer edit made during the PUT is kept untouched
+      // and written by the follow-up save.
+      const next = {
+        settings: body.settings ?? null,
+        saveState: stillCurrent ? 'saved' : 'pending',
+        saveError: null,
+        saveProblems: [],
+      };
+      if (stillCurrent) {
+        next.draft = body.settings === null || body.settings === undefined
+          ? state.draft
+          : draftFromSettings(body.settings);
+        next.dirty = false;
+      }
+      patch(next);
+      return { ok: true };
+    } catch (error) {
+      // The refusals arrive verbatim (the host is the authority); nothing is guessed.
+      patch({ saveState: 'failed', saveError: error });
+      return { ok: false, error };
+    } finally {
+      saveInFlight = false;
+      if (!disposed) {
+        patch({
+          loading: { ...state.loading, save: false },
+          ...(draftGeneration !== generationAtSend && !saveSuppressed
+            ? { saveState: 'pending' }
+            : {}),
+        });
+      }
+      // Edits that arrived while this PUT was in flight are written by a follow-up
+      // save, debounced again so a burst of typing still merges.
+      if (!disposed && !saveSuppressed && draftGeneration !== generationAtSend) {
+        scheduleAutoSave(saveDebounceMs);
+      }
     }
   }
 
@@ -2163,42 +2325,67 @@ export function createStore(options = {}) {
     },
 
     /**
-     * Apply an edit to the draft.
+     * Apply an edit to the draft and schedule the automatic save.
+     *
+     * The edit itself is synchronous and safe during a save: it bumps the draft
+     * generation, so a response that arrives later can only confirm the document it
+     * actually wrote and can never replace this newer draft.
      * @param {(draft: object) => void} mutate - edits the cloned draft in place.
+     * @param {{ immediate?: boolean }} [editOptions] - `immediate: true` skips the
+     *   debounce window (used by switches and selects, which are discrete actions).
      */
-    editDraft(mutate) {
+    editDraft(mutate, editOptions = {}) {
       const draft = clone(state.draft ?? defaultDraft());
       mutate(draft);
-      patch({ draft, dirty: true });
+      draftGeneration += 1;
+      saveSuppressed = false;
+      patch({ draft, dirty: true, saveState: 'pending', saveError: null, saveProblems: [] });
+      scheduleAutoSave(editOptions?.immediate === true ? 0 : saveDebounceMs);
     },
 
-    /** Discard uncommitted edits. */
+    /**
+     * Run the automatic save now, cancelling any pending debounce.
+     * @returns {Promise<{ ok: boolean, error?: unknown, problems?: string[] }>} outcome.
+     */
+    async saveNow() {
+      cancelPendingSave();
+      return await runSave();
+    },
+
+    /**
+     * Discard uncommitted edits (an explicit operator action; never automatic).
+     *
+     * Discarding is a real state change, so it bumps the draft generation: an
+     * in-flight PUT that finishes afterwards sees `draftGeneration !== generationAtSend`
+     * and must NOT re-seed the draft nor schedule a follow-up write. The UI additionally
+     * disables the control while a save is running, so the two can never disagree about
+     * what the operator is looking at.
+     * @returns {void}
+     */
     resetDraft() {
-      patch({ draft: draftFromSettings(state.settings), dirty: false });
+      cancelPendingSave();
+      draftGeneration += 1;
+      saveSuppressed = true;
+      patch({
+        draft: draftFromSettings(state.settings),
+        dirty: false,
+        saveState: 'idle',
+        saveError: null,
+        saveProblems: [],
+      });
     },
 
     /**
      * Validate the draft locally, then replace the stored document.
-     * @returns {Promise<{ ok: boolean, error?: unknown }>} outcome.
+     *
+     * Kept as the explicit "flush now" entry point (and the contract older callers
+     * used); under automatic saving the same serialization gate applies, so calling it
+     * while a PUT is in flight waits for that PUT instead of racing it.
+     * @returns {Promise<{ ok: boolean, error?: unknown, problems?: string[] }>} outcome.
      */
     async saveSettings() {
-      if (state.draft === null) return { ok: false };
-      const problems = precheckDraft(state.draft);
-      if (problems.length > 0) {
-        notify('error', `未保存：${problems.slice(0, 4).join('；')}`);
-        return { ok: false, problems };
-      }
-      return await track('save', async () => {
-        try {
-          const body = await api.putSettings(documentFromDraft(state.draft));
-          patch({ settings: body.settings ?? null, draft: draftFromSettings(body.settings), dirty: false });
-          notify('success', '设置已保存。');
-          return { ok: true };
-        } catch (error) {
-          notify('error', describeError(error));
-          return { ok: false, error };
-        }
-      });
+      cancelPendingSave();
+      return await runSave();
     },
 
     /**
@@ -2495,6 +2682,14 @@ export function createStore(options = {}) {
      * Order matters: the RAW block is validated first and only then normalized for the
      * wire. Validating the normalized block would accept a cleared field, because
      * `monitoringOf` replaces it with the documented default.
+     *
+     * KNOWN BOUNDARY (stated rather than hidden): this is a LEGACY compatibility entry
+     * point. The settings page no longer calls it — the monitoring fields are ordinary
+     * draft edits saved by the whole-document queue — so nothing in the UI can race it.
+     * A caller that still uses it writes through the NARROW `/monitoring` route, which is
+     * a different write from the whole-document PUT; it therefore takes the same
+     * `saveInFlight` gate (a narrow write never overlaps a whole-document write) but it
+     * cannot merge partial documents. Prefer `editDraft` + `saveNow` for anything new.
      * @param {{ selfCheckSeconds: number, attentionSeconds: number, repeatFailureThreshold: number }} monitoring - the block as the operator typed it.
      * @returns {Promise<{ ok: boolean, error?: unknown }>} outcome.
      */
@@ -2504,7 +2699,9 @@ export function createStore(options = {}) {
         notify('error', `未保存：${problems.join('；')}`);
         return { ok: false, problems };
       }
+      if (saveInFlight) return { ok: false, pending: true };
       const normalized = monitoringOf({ monitoring });
+      saveInFlight = true;
       return await track('monitoring', async () => {
         try {
           const body = await api.putMonitoring(normalized);
@@ -2518,6 +2715,8 @@ export function createStore(options = {}) {
         } catch (error) {
           notify('error', describeError(error));
           return { ok: false, error };
+        } finally {
+          saveInFlight = false;
         }
       });
     },
@@ -2542,9 +2741,31 @@ export function createStore(options = {}) {
         // The selected detail is refreshed from the SAME list snapshot rather than a
         // second request, so the panel never shows a detail older than its row, and
         // the operator's selection is never changed by a background read.
+        //
+        // The row is MERGED onto the open detail, and the review conclusion is merged
+        // one level deeper: a list row may carry `hostAcceptance` in a COMPACT shape
+        // (`noteOmitted`, no body), and a plain shallow spread would replace the loaded
+        // full note with that compact block — silently emptying the text the operator
+        // was reading. Only the SAME recorded conclusion reuses the loaded body; a
+        // DIFFERENT conclusion (a new decision) never inherits the old text.
         const detail = state.taskDetail === null
           ? null
-          : tasks.find((task) => task.taskId === state.taskDetail.taskId) ?? state.taskDetail;
+          : (() => {
+            const row = tasks.find((task) => task.taskId === state.taskDetail.taskId);
+            if (row === undefined) return state.taskDetail;
+            const merged = { ...state.taskDetail, ...row };
+            const loaded = state.taskDetail.hostAcceptance ?? null;
+            const incoming = row.hostAcceptance ?? null;
+            if (loaded !== null && incoming !== null
+              && loaded.state === incoming.state
+              && loaded.acceptedAt === incoming.acceptedAt
+              && typeof loaded.note === 'string'
+              && (incoming.noteOmitted === true || typeof incoming.note !== 'string')) {
+              // Same conclusion, compact row: keep the body that was already read.
+              merged.hostAcceptance = { ...incoming, note: loaded.note };
+            }
+            return merged;
+          })();
         patch({ tasks, taskDetail: detail });
         return { ok: true, tasks, reason };
       } catch (error) {
@@ -2571,19 +2792,52 @@ export function createStore(options = {}) {
 
     /**
      * Read one task with its prompt and evidence.
+     *
+     * A click must ALWAYS produce visible feedback: the detail panel appears as soon as
+     * the request is acknowledged, and a refusal is reported with its own reason instead
+     * of leaving the previous view silently unchanged. The last successful detail is
+     * kept while a new read is in flight, so the panel does not blink empty.
      * @param {string} taskId - task identity.
+     * @returns {Promise<{ ok: boolean, task?: object, error?: unknown }>} outcome.
      */
     async openTask(taskId) {
-      return await track('taskDetail', async () => {
-        try {
-          const body = await api.getTask(taskId);
-          patch({ taskDetail: body.task ?? null });
-          return { ok: true, task: body.task };
-        } catch (error) {
-          notify('error', describeError(error));
-          return { ok: false, error };
-        }
-      });
+      const requested = typeof taskId === 'string' ? taskId : '';
+      if (requested === '') {
+        notify('error', '无法打开详情：缺少任务标识。');
+        return { ok: false };
+      }
+      // A stale response for an EARLIER selection must not replace the newer detail.
+      openTaskRequest += 1;
+      const request = openTaskRequest;
+      patch({ taskDetailLoading: true, taskDetailError: null });
+      try {
+        const body = await api.getTask(requested);
+        if (request !== openTaskRequest) return { ok: false, stale: true };
+        // `taskDetailView` counts SUCCESSFUL opens. It only changes when the operator
+        // opened a detail (first open, a repeat open of the same task, or a different
+        // task) — never on a background list refresh, which is what makes it the right
+        // dependency for "focus and scroll to the newly opened detail".
+        patch({
+          taskDetail: body.task ?? null,
+          taskDetailLoading: false,
+          taskDetailError: null,
+          taskDetailView: state.taskDetailView + 1,
+        });
+        return { ok: true, task: body.task };
+      } catch (error) {
+        if (request !== openTaskRequest) return { ok: false, stale: true };
+        // The refusal is stated in the panel AND in the notices: an operator who clicked
+        // must never be left guessing whether the click registered.
+        patch({ taskDetailLoading: false, taskDetailError: error });
+        notify('error', `打开任务详情失败：${describeError(error)}`);
+        return { ok: false, error };
+      }
+    },
+
+    /** Close the open task detail (a pure view change, no request). */
+    closeTask() {
+      openTaskRequest += 1;
+      patch({ taskDetail: null, taskDetailLoading: false, taskDetailError: null });
     },
 
     /**
@@ -2618,6 +2872,7 @@ export function createStore(options = {}) {
 
     /** Release subscriptions and drop the one-time token. */
     dispose() {
+      cancelPendingSave();
       disposed = true;
       state = { ...state, token: null, tokenConnectionId: null };
       listeners.clear();

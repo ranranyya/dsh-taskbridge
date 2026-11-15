@@ -130,3 +130,85 @@ test('the manifest and its module are published, so an installed copy can read t
   // never has to hide a malformed field.
   assert.equal(MANIFEST.version, MANIFEST.version.trim());
 });
+
+// ---------------------------------------------------------------------------
+// Hot update: the manifest changes on disk while the SAME module instance lives.
+// ---------------------------------------------------------------------------
+// A DSH hot update replaces the installed package under a running process: the module
+// object (and its memo) is the one already loaded, while `package.json` on disk is the
+// new build. The plugin activation must therefore be able to re-read it, or it stamps the
+// Codex integration with the PREVIOUS version and the next start calls that fresh file
+// "custom".
+
+/**
+ * An installed-shaped copy of `src/version.js` whose manifest can be rewritten in place.
+ * @param {string} version - initial `version` value.
+ * @returns {Promise<object>} sandbox with the imported module and a rewrite helper.
+ */
+async function hotUpdateSandbox(version) {
+  const { cp, mkdir, mkdtemp, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { pathToFileURL } = await import('node:url');
+  const sandbox = await mkdtemp(join(tmpdir(), 'dsh-version-hot-'));
+  const packageRoot = join(sandbox, 'node_modules', 'dsh-taskbridge');
+  await mkdir(join(packageRoot, 'src'), { recursive: true });
+  await cp(join(ROOT, 'src', 'version.js'), join(packageRoot, 'src', 'version.js'));
+  const manifestPath = join(packageRoot, 'package.json');
+  const writeManifest = async (next) => {
+    await writeFile(manifestPath, `${JSON.stringify({ name: 'dsh-taskbridge', version: next }, null, 2)}\n`, 'utf8');
+  };
+  await writeManifest(version);
+  const module = await import(pathToFileURL(join(packageRoot, 'src', 'version.js')).href);
+  return {
+    module,
+    writeManifest,
+    async cleanup() { await rm(sandbox, { recursive: true, force: true }); },
+  };
+}
+
+test('a hot update is seen by a FORCED re-read, while the ordinary call keeps its memo', async () => {
+  const box = await hotUpdateSandbox('1.5.0');
+  try {
+    const first = box.module.reportedVersion();
+    assert.equal(first.version, '1.5.0', 'the loaded build');
+
+    // The host replaces the package on disk; this module instance does NOT reload.
+    await box.writeManifest('1.5.1-test.2');
+
+    // Ordinary calls stay memoised: that is the documented process-lifetime semantics
+    // every MCP handshake relies on.
+    assert.equal(box.module.reportedVersion().version, '1.5.0', 'the memo still answers the old value');
+    assert.equal(box.module.readPackageManifest().version, '1.5.0');
+
+    // The activation path forces one read and sees the new build.
+    assert.equal(box.module.reportedVersion({ refresh: true }).version, '1.5.1-test.2',
+      'refresh: true reads the manifest on disk');
+    // ...and the refreshed answer becomes the memo, so later ordinary calls agree.
+    assert.equal(box.module.reportedVersion().version, '1.5.1-test.2');
+
+    // `refreshPackageManifest()` invalidates without reading: the next ordinary call
+    // goes back to disk rather than answering from the old memo.
+    await box.writeManifest('1.5.1-test.3');
+    box.module.refreshPackageManifest();
+    assert.equal(box.module.readPackageManifest().version, '1.5.1-test.3');
+  } finally {
+    await box.cleanup();
+  }
+});
+
+test('a forced re-read still fails SAFELY when the manifest is broken', async () => {
+  const box = await hotUpdateSandbox('1.5.0');
+  try {
+    assert.equal(box.module.reportedVersion().version, '1.5.0');
+    const { unlink } = await import('node:fs/promises');
+    const { join: joinPath } = await import('node:path');
+    // Point at a package whose manifest is gone.
+    await unlink(joinPath(box.module.PACKAGE_ROOT, 'package.json'));
+    const fallback = box.module.reportedVersion({ refresh: true });
+    assert.deepEqual(fallback, { name: 'dsh-taskbridge', version: '0.0.0-unknown', source: 'fallback' });
+    assert.equal(box.module.readPackageManifest().ok, false, 'and the failure is memoised as the answer');
+    assert.equal(box.module.readPackageManifest().reason, 'manifest-missing');
+  } finally {
+    await box.cleanup();
+  }
+});

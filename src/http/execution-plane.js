@@ -36,8 +36,16 @@ export const EXECUTION_PREFIX = '/dsh-delegate/x';
  */
 export const MAX_OBSERVE_WAIT_MS = 25_000;
 
-/** Body fields `POST /tasks/observe` accepts. Everything else is refused. */
-const OBSERVE_FIELDS = Object.freeze(['taskId', 'waitMs']);
+/**
+ * Body fields `POST /tasks/observe` accepts. Everything else is refused.
+ *
+ * `ackFailureEventId` acknowledges one delivered repeated-failure reminder by its
+ * exact `eventId`; the acknowledgment result is echoed back as `failureAck`. It is
+ * OPTIONAL and was added after 1.5.0: a caller that does not send it gets exactly
+ * the old body shape and the old answer shape (no `failureAck` field), and its
+ * absence never acknowledges anything.
+ */
+const OBSERVE_FIELDS = Object.freeze(['taskId', 'waitMs', 'ackFailureEventId']);
 
 /**
  * Build a node-style handler for the execution plane.
@@ -221,13 +229,22 @@ async function submitTask({ req, res, connection, deps }) {
   const continueFromTaskId = body.continueFromTaskId === undefined || body.continueFromTaskId === null
     ? undefined
     : body.continueFromTaskId;
+  // The Agent Teams decision travels as the commander's own field and is folded into the
+  // existing overrides channel (the engine's per-task choice path). A non-boolean is
+  // refused here rather than reaching the engine's sanitiser as a coercible value.
+  if (body.agentTeams !== undefined && typeof body.agentTeams !== 'boolean') {
+    throw new HttpError(400, 'AGENT_TEAMS_INVALID', 'agentTeams must be a boolean');
+  }
+  const overrides = body.agentTeams === undefined
+    ? body.overrides
+    : { ...(body.overrides ?? {}), agentTeams: body.agentTeams };
   if (deps.engine.authorizationMode === 'switch') {
     const task = await deps.engine.start({
       connectionId: connection.connectionId,
       workspacePath: body.workspacePath,
       prompt: body.prompt,
       ...(body.title === undefined ? {} : { title: body.title }),
-      overrides: body.overrides,
+      overrides,
       ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
     });
     sendJson(res, 202, { ok: true, task });
@@ -245,7 +262,7 @@ async function submitTask({ req, res, connection, deps }) {
     workspacePath: body.workspacePath,
     prompt: body.prompt,
     ...(body.title === undefined ? {} : { title: body.title }),
-    overrides: body.overrides,
+    overrides,
     ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
   });
   sendJson(res, 202, { ok: true, task });
@@ -519,6 +536,19 @@ async function observeTask({ req, res, connection, deps }) {
   if (typeof body.taskId !== 'string' || body.taskId.trim() === '') {
     throw new HttpError(400, 'TASK_ID_REQUIRED', 'taskId is required');
   }
+  // An ack is optional; when the field is present it must be a NON-EMPTY bounded
+  // string so a caller cannot smuggle an unbounded or meaningless value into the
+  // engine. A wrong type, an empty string, or an overlong value is REFUSED — the
+  // same policy the MCP schema enforces (`minLength: 1`) — never silently treated
+  // as absent. A `null` ack is read as "the field was not supplied" (the JSON way
+  // to omit an optional value), which keeps old callers unaffected.
+  let ackFailureEventId;
+  if (body.ackFailureEventId !== undefined && body.ackFailureEventId !== null) {
+    if (typeof body.ackFailureEventId !== 'string' || body.ackFailureEventId === '' || body.ackFailureEventId.length > 64) {
+      throw new HttpError(400, 'OBSERVE_ACK_INVALID', 'ackFailureEventId must be a non-empty string of at most 64 characters');
+    }
+    ackFailureEventId = body.ackFailureEventId;
+  }
   let waitMs = MAX_OBSERVE_WAIT_MS;
   if (body.waitMs !== undefined && body.waitMs !== null) {
     if (!Number.isInteger(body.waitMs) || body.waitMs < 0) {
@@ -534,6 +564,9 @@ async function observeTask({ req, res, connection, deps }) {
       connectionId: connection.connectionId,
       waitMs,
       signal: abandonment.signal,
+      // The exact event the caller observed and now acknowledges. Ownership is
+      // proven by the connection above; the eventId binding is the engine's.
+      ...(ackFailureEventId === undefined ? {} : { ackFailureEventId }),
     });
     // The reader left while the engine was settling: there is nothing to answer,
     // and writing to a closed response would only throw into the refusal path.
@@ -546,7 +579,17 @@ async function observeTask({ req, res, connection, deps }) {
     // request can never be decided, so this must not enter a wait loop.
     const observation = await historyObservation(deps, body.taskId, connection);
     if (abandonment.abandoned() || !isWritable(res)) return;
-    sendJson(res, 200, { ok: true, wait: { waitMs, waitedMs: 0, activitySinceWait: false }, ...observation });
+    // A settled stored task has no live reminder to acknowledge; an ack against one
+    // is answered honestly as not-acknowledged instead of pretending success.
+    const failureAck = ackFailureEventId === undefined
+      ? undefined
+      : { acknowledged: false, eventId: ackFailureEventId, reason: 'no-pending' };
+    sendJson(res, 200, {
+      ok: true,
+      wait: { waitMs, waitedMs: 0, activitySinceWait: false },
+      ...observation,
+      ...(failureAck === undefined ? {} : { failureAck }),
+    });
   } finally {
     abandonment.dispose();
   }

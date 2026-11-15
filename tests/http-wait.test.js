@@ -305,6 +305,13 @@ test('observe refuses an unknown field, a wrong type and a negative wait before 
     [{ taskId: 'task-1', waitMs: 1000.5 }, 'OBSERVE_WAIT_INVALID'],
     [{ taskId: 'task-1', waitMs: -1 }, 'OBSERVE_WAIT_INVALID'],
     [{ taskId: 'task-1', waitMs: true }, 'OBSERVE_WAIT_INVALID'],
+    // The ack field is validated like any other: a wrong type, an EMPTY string and
+    // an overlong value are all refused before the engine sees it — the same
+    // policy the MCP schema enforces (minLength 1, maxLength 64). A `null` ack is
+    // the JSON way to omit the field and is accepted as absent.
+    [{ taskId: 'task-1', ackFailureEventId: 42 }, 'OBSERVE_ACK_INVALID'],
+    [{ taskId: 'task-1', ackFailureEventId: '' }, 'OBSERVE_ACK_INVALID'],
+    [{ taskId: 'task-1', ackFailureEventId: 'x'.repeat(65) }, 'OBSERVE_ACK_INVALID'],
   ];
   for (const [body, code] of cases) {
     const result = await callPlane(handler, { body });

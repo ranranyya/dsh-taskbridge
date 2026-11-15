@@ -110,6 +110,11 @@ export function policyServicesOf(ctx) {
   return {
     sandboxPolicy: readOptionalService(ctx, 'sandboxPolicy'),
     approval: readOptionalService(ctx, 'approval'),
+    // The DSH Agent Teams service (the feature behind the model menu's 「Use Agent Teams」
+    // switch). Read live like the others: a composition may mount it after this plugin
+    // activated, and its ABSENCE must be reported as "not available" rather than
+    // silently turning a requested team run into an ordinary one.
+    agentTeams: readOptionalService(ctx, 'agentTeams'),
   };
 }
 

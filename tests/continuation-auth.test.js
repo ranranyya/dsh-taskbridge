@@ -39,6 +39,8 @@ import { JobEngine, JOB_CODES, TASK_STATES } from '../src/jobs/engine.js';
 import { SessionStore } from '../src/runtime/session-placement.js';
 import { isPathDigest, pathDigest, recordedPathIsMasked } from '../src/jobs/continuation-identity.js';
 import { WorkspaceLocks } from '../src/workspace/locks.js';
+import { createGitRunner } from '../src/workspace/audit.js';
+import { WorktreeManager } from '../src/workspace/worktrees.js';
 import {
   cleanup,
   fakeAgents,
@@ -162,7 +164,10 @@ async function bootProcess(options) {
     settings,
     auth: options.auth,
     locks: new WorkspaceLocks(),
-    runGit: auditGit(),
+    runGit: options.runGit ?? auditGit(),
+    ...(options.worktreeRoot === undefined ? {} : {
+      worktrees: new WorktreeManager({ runGit: options.runGit }, { rootDir: options.worktreeRoot }),
+    }),
     providerRegistry: providerRegistry(),
     history,
     sessionStore,
@@ -293,14 +298,32 @@ async function runOne(process, credentials, prompt, extra = {}) {
  * native policy services, plus the two booted processes a restart needs.
  * @returns {Promise<object>} fixture.
  */
-async function fixture() {
+async function fixture(options = {}) {
   const root = await makeTempDir();
   const workspace = await realpath(
     await mkdir(join(root, 'workspace'), { recursive: true }).then(() => join(root, 'workspace')),
   );
   const dir = join(root, 'data');
   const auth = new AuthorizationRegistry();
-  const policyServices = await nativePolicyServices();
+  // A RECORDING Agent Teams service: `options.agentTeams` (a boolean) is what it reports
+  // for every Session, and every `setEnabled` call is kept so a test can assert the value
+  // the run actually asked DSH for. Omitted => the harness has no team service at all,
+  // which is the "absent capability" case every other test in this file runs in.
+  const teamCalls = [];
+  let teamMode = typeof options.agentTeams === 'boolean' ? options.agentTeams : null;
+  const agentTeams = options.agentTeams === undefined
+    ? undefined
+    : {
+      async setEnabled(agent, enabled) {
+        teamCalls.push({ agent, enabled });
+        if (typeof options.onSetEnabled === 'function') await options.onSetEnabled(enabled, agent);
+        teamMode = enabled;
+      },
+      isEnabled() { return teamMode === true; },
+    };
+  const policyServices = await nativePolicyServices(
+    agentTeams === undefined ? {} : { agentTeams },
+  );
   // The host: one set of native controllers and one agent registry, shared by every
   // plugin process in a test, because DSH owns them and a plugin reload does not
   // recreate a Workspace, a Session or a live Agent.
@@ -308,6 +331,20 @@ async function fixture() {
   const sessionController = fakeSessionController({ workspaces, respond: { text: 'implemented the change' } });
   const agents = fakeAgents({ respond: { text: 'implemented the change' } });
   const host = { workspaces, sessionController, agents };
+  if (options.realGit === true) {
+    host.runGit = createGitRunner({ timeoutMs: 20000 });
+    host.worktreeRoot = join(root, 'trees');
+    host.settings = validSettings({ worker: { isolation: 'worktree' } });
+    const git = async (args) => {
+      const result = await host.runGit(workspace, args);
+      assert.equal(result.code, 0, `fixture git ${args.join(' ')}: ${result.stderr}`);
+    };
+    await git(['init', '-q', '.']);
+    await writeFile(join(workspace, 'README.md'), '# recovery fixture\n');
+    await git(['add', 'README.md']);
+    await git(['-c', 'user.name=TaskBridge test', '-c', 'user.email=test@example.invalid',
+      '-c', 'commit.gpgsign=false', 'commit', '-qm', 'fixture']);
+  }
   const before = await bootWithHolder({ dir, workspace, auth, policyServices, ...host });
   return {
     root,
@@ -315,6 +352,9 @@ async function fixture() {
     dir,
     auth,
     policyServices,
+    teamCalls,
+    /** @returns {boolean|null} the mode the fake team service currently reports. */
+    teamMode: () => teamMode,
     ...host,
     before,
     /**
@@ -480,6 +520,32 @@ test('same process: connection B cannot continue connection A\'s finished task',
 });
 
 // --- After a restart ---------------------------------------------------------
+
+test('restart: an isolated continuation recovers the original Git tree and its uncommitted work', async () => {
+  const h = await fixture({ realGit: true });
+  let after;
+  try {
+    const owner = authorize(h.auth, h.workspace, 'tree-owner');
+    const parentId = await runOne(h.before, owner, 'make a change');
+    const original = await h.before.sessionStore.get(parentId);
+    await writeFile(join(original.executionPath, 'candidate.txt'), 'uncommitted candidate\n');
+    await writeFile(join(h.workspace, 'source-note.txt'), 'source edits stay intact\n');
+    after = await h.restart();
+    assert.equal(after.engine.deps.worktrees.get(original.executionPath), null);
+    const childId = await runOne(after, owner, 'improve the same change', { continueFromTaskId: parentId });
+    const child = await after.sessionStore.get(childId);
+    assert.equal(child.executionPath, original.executionPath);
+    assert.equal(child.sessionId, original.sessionId);
+    assert.equal(child.workspaceId, original.workspaceId);
+    assert.equal(child.worktreeId, original.worktreeId);
+    assert.equal(after.engine.get(childId).conversation.kind, 'continuation');
+    assert.equal(await readFile(join(child.executionPath, 'candidate.txt'), 'utf8'), 'uncommitted candidate\n');
+    assert.equal(await readFile(join(h.workspace, 'source-note.txt'), 'utf8'), 'source edits stay intact\n');
+  } finally {
+    await (after ?? h.before).engine.dispose();
+    await h.close();
+  }
+});
 
 test('restart: connection B cannot continue connection A\'s task, and A\'s Session is never resolved', async () => {
   const h = await fixture();
@@ -1773,5 +1839,125 @@ test('acceptance: an unreadable identity store is a refusal, never a path substi
   } finally {
     await h.close();
     await plain.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Agent Teams across a continuation (real engine.start, real durable stores)
+// ---------------------------------------------------------------------------
+//
+// The team selection is DSH's Session-level `team/mode`. What TaskBridge adds is a
+// per-TASK decision frozen at admission, inherited by a follow-up unless the dispatcher
+// states a new one. These cases drive the REAL `engine.start` and admission, so they also
+// prove the value survives the durable session map (which strips unknown fields), the
+// restart, and that the follow-up keeps the parent's Session/checkout and its own
+// provider/model/effort.
+
+/**
+ * The route a task actually ran on, as the record states it.
+ *
+ * `execution.selection` is the read-back fact the runner installed on the Agent it drove;
+ * its field is `provider` (NOT `providerId`). Reading `providerId` would only ever produce
+ * `null`, and `null === null` would "prove" equality without observing anything.
+ * @param {object} task - task view.
+ * @returns {{ provider: string|null, model: string|null, reasoningEffort: string|null }} route triple.
+ */
+function routeOf(task) {
+  const selection = task.execution?.selection ?? {};
+  return {
+    provider: selection.provider ?? null,
+    model: selection.model ?? null,
+    reasoningEffort: selection.reasoningEffort ?? null,
+  };
+}
+
+test('team: a follow-up with no stated choice INHERITS the parent true, keeps its Session and its route', async () => {
+  // `realGit: true` gives a real managed worktree, so this case also covers inheriting the
+  // team decision across a genuinely ISOLATED checkout (not just a shared source tree).
+  const h = await fixture({ agentTeams: false, realGit: true });
+  try {
+    const a = authorize(h.auth, h.workspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work', { overrides: { agentTeams: true } });
+    const parent = h.before.engine.get(parentId);
+    assert.equal(parent.agentTeams, true, 'the parent froze the request');
+    assert.equal(parent.execution.team.applied, true, 'and DSH confirmed it for the run');
+    // The parent's REAL route, stated EXACTLY: the fixture configures provider `relay`
+    // (routes to the native `relay-native`), model `deepseek-chat` and effort `medium`.
+    // An expectation of "some non-empty string" would pass for the wrong route too.
+    const parentRoute = routeOf(parent);
+    assert.deepEqual(parentRoute, { provider: 'relay-native', model: 'deepseek-chat', reasoningEffort: 'medium' },
+      `the parent route must be the configured one, saw ${JSON.stringify(parent.execution.selection)}`);
+    const parentSession = parent.execution.conversation.sessionId;
+    assert.equal(parent.effective.worker.isolation, 'worktree', 'the parent really ran in a managed worktree');
+
+    // The durable identity row is what a restart reads, and it must carry the decision.
+    const row = await h.before.sessionStore.get(parentId);
+    assert.equal(row.agentTeams, true, 'the session map persisted the team decision');
+
+    const after = await h.restart();
+    try {
+      const rowAfterRestart = await after.sessionStore.get(parentId);
+      assert.equal(rowAfterRestart.agentTeams, true, 'and it survived the restart');
+      const childId = await runOne(after, a, 'keep going', { continueFromTaskId: parentId });
+      const child = after.engine.get(childId);
+      assert.equal(child.agentTeams, true, 'the follow-up inherited the parent\u2019s team decision');
+      assert.equal(child.execution.team.applied, true, 'and it was applied for the follow-up run too');
+      assert.equal(child.execution.conversation.sessionId, parentSession, 'same DSH Session');
+      assert.equal(child.executionWorkspacePath, parent.executionWorkspacePath, 'same isolated checkout');
+      assert.equal(child.effective.worker.isolation, 'worktree', 'and it stayed in a managed worktree');
+      // Compared only now that the parent triple is proven non-null: the equality is an
+      // observation, not two nulls agreeing.
+      assert.deepEqual(routeOf(child), parentRoute, 'provider/model/effort unchanged');
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('team: a follow-up inherits the parent false, and an explicit choice overrides it', async () => {
+  const h = await fixture({ agentTeams: true });
+  try {
+    const a = authorize(h.auth, h.workspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work', { overrides: { agentTeams: false } });
+    const parent = h.before.engine.get(parentId);
+    assert.equal(parent.agentTeams, false);
+    assert.equal(await h.before.sessionStore.get(parentId).then((row) => row.agentTeams), false);
+
+    const after = await h.restart();
+    try {
+      const inherited = await runOne(after, a, 'keep going', { continueFromTaskId: parentId });
+      assert.equal(after.engine.get(inherited).agentTeams, false, 'false is inherited as false, not as "unset"');
+      assert.equal(after.engine.get(inherited).execution.team.applied, true,
+        'and it was applied (the Session had been true)');
+
+      // An explicit choice on the follow-up WINS over the inherited one.
+      const overridden = await runOne(after, a, 'switch it on for this one', {
+        continueFromTaskId: parentId, overrides: { agentTeams: true },
+      });
+      assert.equal(after.engine.get(overridden).agentTeams, true, 'the explicit decision overrode the chain');
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('team: no choice anywhere means NO write to the Session, and the run still executes', async () => {
+  const h = await fixture({ agentTeams: false });
+  try {
+    const a = authorize(h.auth, h.workspace, 'A');
+    const callsBefore = h.teamCalls.length;
+    const taskId = await runOne(h.before, a, 'do work');
+    const task = h.before.engine.get(taskId);
+    assert.equal(task.agentTeams, null, 'nothing was frozen');
+    assert.equal(task.execution.team.requested, null);
+    assert.equal(task.execution.team.reason, 'not-requested');
+    assert.equal(h.teamCalls.length, callsBefore, 'and no Session write was made');
+    assert.equal(task.state, TASK_STATES.awaitingHostReview, 'the run executed normally');
+  } finally {
+    await h.close();
   }
 });

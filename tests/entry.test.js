@@ -595,3 +595,31 @@ test('an empty provider configuration stays inert through apply', async () => {
     await cleanup(directory);
   }
 });
+
+// A host hot update replaces `package.json` on disk while THIS module instance stays
+// loaded. The activation must stamp the integration with the version on disk, not with
+// the one its process-lifetime memo still answers — otherwise the next start (reading the
+// real manifest) classifies that freshly written file as operator-customised.
+test('a re-activation after a hot update stamps the Codex agent with the version on disk', async () => {
+  const { readFileSync, readdirSync } = await import('node:fs');
+  const { MANIFEST_PATH, readPackageManifest } = await import('../src/version.js');
+  const { renderAgentFile } = await import('../src/codex/installer.js');
+  const onDisk = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')).version;
+  // The first activation in this process populated the memo from the same manifest.
+  assert.equal(readPackageManifest().version, onDisk);
+
+  // The forced re-read the entry performs must return the SAME fact here, proving it goes
+  // to disk rather than to a stale constant captured at import time. A stale constant is
+  // what this test would catch: `PLUGIN_VERSION` used to be evaluated once at module load.
+  const template = readFileSync(new URL('../codex/dsh-taskbridge.toml', import.meta.url), 'utf8');
+  const rendered = await renderAgentFile(template, onDisk);
+  assert.match(rendered, new RegExp(`^version = "${onDisk.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}"$`, 'mu'),
+    'the rendered agent carries the manifest version, not a remembered one');
+  // And the entry module no longer exports/uses a frozen constant.
+  const entrySource = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+  assert.equal(/const PLUGIN_VERSION = reportedVersion\(\)/u.test(entrySource), false,
+    'no module-load-time version constant remains');
+  assert.match(entrySource, /reportedVersion\(\{ refresh: true \}\)/u,
+    'each activation forces one manifest re-read');
+  void readdirSync;
+});

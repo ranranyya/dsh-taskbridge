@@ -9,6 +9,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import {
   TomlDocument,
@@ -279,4 +280,79 @@ test('a CR inside a line is still a control character, so a broken document is r
   assert.throws(() => new TomlDocument('a = 1\rb = 2\n'), TomlSyntaxError);
   // A CRLF document with a NUL is still refused for the NUL.
   assert.throws(() => new TomlDocument('a = 1\r\nb = "\u0000"\r\n'), TomlSyntaxError);
+});
+
+// ---------------------------------------------------------------------------
+// The shipped dispatch rules must not contradict each other.
+// ---------------------------------------------------------------------------
+// The template is an operator-facing contract. These assertions pin the three decisions
+// that used to be ambiguous: agentTeams belongs to the COMMANDER per task, preflight is
+// per CHAIN (a verified continuation reuses its facts), and a review only counts once the
+// write is durable.
+
+/** The instruction body of the template shipped in this repository. */
+function templateText() {
+  return readFileSync(new URL('../codex/dsh-taskbridge.toml', import.meta.url), 'utf8');
+}
+
+test('the template states agentTeams as the commander\u2019s per-task decision, never the operator\u2019s', () => {
+  const text = templateText();
+  assert.match(text, /AGENT TEAMS IS YOUR DECISION, NOT THE OPERATOR'S/u);
+  assert.match(text, /Simple single-file or strongly sequential work: turn it OFF EXPLICITLY/u);
+  assert.match(text, /Say the\n\s+reason in the dispatch text|reason in the dispatch text/u);
+  assert.match(text, /never overrides them/u, 'the team choice never overrides provider/model/effort');
+  assert.match(text, /never fake success|never fake success,/u, 'an older tool must not be pretended to work');
+  assert.match(text, /A continuation does not re-decide it/u);
+  assert.doesNotMatch(text, /ask the operator to (?:choose|decide) (?:the )?team/i,
+    'the operator never chooses team mode per dispatch');
+});
+
+// OMITTING the field is not "off": `editDraft`/`openTask`-style omission means "no new
+// decision", and the run keeps (or inherits) the Session's selection. The template once
+// said "omit the field, or send false" as if both meant off, which is wrong.
+test('the template never presents OMITTING agentTeams as equivalent to turning it off', () => {
+  const text = templateText();
+  assert.match(text, /OMITTING the field\s+is NOT "off"/u);
+  assert.match(text, /makes no new decision/u);
+  assert.match(text, /turn it OFF EXPLICITLY with\s+`agentTeams: false`/u);
+  assert.match(text, /must send `false` and state which actions/u, 'a no-redelegation repository must send false');
+  assert.match(text, /omitted value on a follow-up keeps the parent's mode/u);
+  // The removed, wrong phrasing must not come back.
+  assert.doesNotMatch(text, /leave it off \(omit the field, or\s+send `false`\)/u);
+  assert.doesNotMatch(text, /omit the field[^.]*is the default|that is the default[^.]*omit/u);
+});
+
+test('rule 4b defers preflight to 2a instead of demanding it every round', () => {
+  const text = templateText();
+  assert.match(text, /re-run `delegate_preflight` only when needed under 2a/u);
+  assert.match(text, /NOT\s+preflighted mechanically every round/u);
+  assert.doesNotMatch(text, /For an explicit follow-up, use the parent's original source `workspacePath` for\s+preflight and/u);
+});
+
+test('the template makes preflight per chain, and does not demand it again for a verified continuation', () => {
+  const text = templateText();
+  assert.match(text, /PREFLIGHT IS PER CHAIN, NOT PER DISPATCH/u);
+  assert.match(text, /reuse the\s+already-verified preflight facts/u);
+  assert.match(text, /engine still re-checks ownership, paths, the\s+original checkout and the\s+Session/u);
+  // The old unconditional demand is gone: step 1 now says "FOR A NEW TASK".
+  assert.match(text, /1\. PREFLIGHT FACTS FIRST — FOR A NEW TASK/u);
+  assert.doesNotMatch(text, /1\. PREFLIGHT FACTS FIRST\. Call/u);
+});
+
+test('the template requires a durable review write and one consolidated correction round', () => {
+  const text = templateText();
+  assert.match(text, /THE REVIEW WRITE IS THE RECORD/u);
+  assert.match(text, /ONE ROUND PER DELIVERY/u);
+  assert.match(text, /`reviewPersistence`\s*`state: "saved"`/u);
+});
+
+test('the template keeps approval anchored on the concrete operation, and reading source needs none', () => {
+  const text = templateText();
+  assert.match(text, /CLAIM awaiting verification/u);
+  assert.match(text, /Reading source does not need approval/u);
+  assert.match(text, /plain PowerShell built-in/u);
+  assert.match(text, /must not start\s+`node`, Electron/u);
+  assert.match(text, /A test writing into its own temporary directory is NOT a source commit/u);
+  assert.match(text, /worker implements/u);
+  assert.match(text, /your only operation is `delegate_wait`/u);
 });

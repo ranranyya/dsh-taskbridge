@@ -112,6 +112,15 @@ export const Config = z.object({
 export async function apply(ctx, config = {}) {
   const logger = ctx.logger;
   const dataDir = await resolveDataDir(ctx, config);
+  // Re-read THIS build's manifest on every activation.
+  //
+  // A host can replace the installed package on disk while this module stays loaded (a
+  // DSH hot update: `package.json` becomes 1.5.1-test.2, the code that is running is the
+  // new one). The process-lifetime manifest memo then still answers the PREVIOUS version,
+  // and this activation would stamp the Codex integration with it — so the next start,
+  // reading the real manifest, sees a freshly written file as operator-customised. One
+  // forced read per activation is the whole fix; nothing else bypasses the cache.
+  const pluginVersion = reportedVersion({ refresh: true }).version;
 
   const settings = new SettingsService(dataDir);
   // Read once at load so an unusable document fails the plugin loudly instead of
@@ -234,7 +243,7 @@ export async function apply(ctx, config = {}) {
     // Startup only refreshes an agent file whose bytes match a shipped template.
     // Agent creation and MCP registration remain explicit settings-page actions.
     codex: resolveCodexActionSeam({
-      version: PLUGIN_VERSION,
+      version: pluginVersion,
       // The automatic upgrade's protected backup location, inside this activation's own
       // data directory: never the package, never the Codex home, never a user home. The
       // seam supplies it to a caller that does not pass one, so the unattended MCP write
@@ -296,7 +305,7 @@ export async function apply(ctx, config = {}) {
       logger?.info?.(`dsh-delegate: Codex integration check skipped (${target.reason})`);
     }
     if (migration?.changed.includes('agent')) {
-      logger?.info?.(`dsh-delegate: refreshed a managed Codex agent template to ${PLUGIN_VERSION}`);
+      logger?.info?.(`dsh-delegate: refreshed a managed Codex agent template to ${pluginVersion}`);
     }
     if (migration?.changed.includes('mcp')) {
       logger?.info?.('dsh-delegate: upgraded a stale managed Codex MCP entry in place');
@@ -421,7 +430,7 @@ export async function apply(ctx, config = {}) {
   deps.engine = engine;
   deps.describeRuntime = () => ({
     plugin: name,
-    version: PLUGIN_VERSION,
+    version: pluginVersion,
     schemaVersion: SCHEMA_VERSION,
     // Facts an operator needs to reason about exposure. Never a secret.
     bind: ctx.webServer?.host ?? null,
@@ -523,13 +532,17 @@ export async function apply(ctx, config = {}) {
 }
 
 /**
- * Version reported by the runtime facts block.
+ * Version reported by the runtime facts block and stamped into the Codex integration.
  *
  * Read from the package manifest this build ships in, never written as a literal: two
  * copies of one fact drift, and a host asking a pre-release build which version it is
  * must not be told the last released number.
+ *
+ * There is deliberately NO module-level constant: a host hot update replaces the manifest
+ * under a running instance, so the value is taken per activation
+ * (`reportedVersion({ refresh: true })` at the top of {@link apply}) rather than frozen
+ * when this module was first loaded.
  */
-const PLUGIN_VERSION = reportedVersion().version;
 
 /**
  * Read the native approval service without turning absence into a throw.

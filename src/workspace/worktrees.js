@@ -21,7 +21,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, realpath } from 'node:fs/promises';
-import { isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
 import { AUDIT_CODES, AUDIT_LIMITS, AuditError, probeRepository, readRepositoryTopLevel, readStatus } from './audit.js';
 import { isInside } from './locks.js';
@@ -127,9 +127,9 @@ async function pathExists(target) {
  * Owns plugin-created detached worktrees.
  *
  * One manager per plugin instance. The manager keeps metadata in memory only: a
- * restart forgets the registry, which is honest — a forgotten tree is still on
- * disk and still reviewable, and the alternative (silently deleting trees at
- * startup) would destroy evidence.
+ * restart forgets the registry. A validated continuation may recover its ONE
+ * recorded tree through Git's live registry; startup never scans, deletes or
+ * adopts arbitrary directories.
  */
 export class WorktreeManager {
   /**
@@ -523,6 +523,72 @@ export class WorktreeManager {
   get(workspacePath) {
     const record = this.trees.get(normalizeKey(workspacePath));
     return record === undefined ? null : this.view(record);
+  }
+
+  /**
+   * Recover one original tree after a restart, without creating or changing it.
+   * The engine has already verified the caller, task history and Session identity.
+   * Here the stored tree identity must also agree with real paths and Git's live
+   * registration. A directory name alone is never evidence of a managed tree.
+   * @param {object} request - original taskId, sourcePath, workspacePath, state and signal.
+   * @returns {Promise<object>} verified metadata, or a refusal.
+   */
+  async recover(request) {
+    const { taskId, sourcePath, workspacePath, signal } = request;
+    const refuse = (reason) => new WorktreeError(WORKTREE_CODES.unknownTree,
+      'the original worktree could not be verified after restart', { reason });
+    this.throwIfAborted(signal, { taskId, phase: 'recover' });
+    if (request.state === WORKTREE_STATES.disposed || safeTaskSegment(taskId) === ''
+      || typeof sourcePath !== 'string' || !isAbsolute(sourcePath)
+      || typeof workspacePath !== 'string' || !isAbsolute(workspacePath)) {
+      throw refuse('invalid recorded tree');
+    }
+    const present = this.get(workspacePath);
+    if (present !== null) return present;
+
+    const [root, source, workspace] = await Promise.all([
+      realpath(this.rootDir), realpath(sourcePath), realpath(workspacePath),
+    ]);
+    const key = (path) => normalizeKey(resolve(path));
+    const prefix = `${safeTaskSegment(taskId)}-`;
+    const name = basename(workspace);
+    if (key(source) !== key(sourcePath) || key(workspace) !== key(workspacePath)
+      || key(dirname(workspace)) !== key(root) || !name.startsWith(prefix)
+      || !/^[A-Za-z0-9]{1,12}$/.test(name.slice(prefix.length)) || key(source) === key(workspace)) {
+      throw refuse('recorded tree path mismatch');
+    }
+
+    const results = await Promise.all([
+      this.deps.runGit(source, ['worktree', 'list', '--porcelain', '-z']),
+      this.deps.runGit(source, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
+      this.deps.runGit(workspace, ['rev-parse', '--path-format=absolute', '--git-common-dir']),
+      this.deps.runGit(workspace, ['rev-parse', '--show-toplevel']),
+    ]);
+    const [listing, sourceCommon, treeCommon, top] = results.map((result) => requireResult(result, 'recover worktree'));
+    if ([listing, sourceCommon, treeCommon, top].some((result) => result.code !== 0)
+      || !isAbsolute(sourceCommon.stdout.trim()) || !isAbsolute(treeCommon.stdout.trim())
+      || key(sourceCommon.stdout.trim()) !== key(treeCommon.stdout.trim())
+      || key(top.stdout.trim()) !== key(workspace)) {
+      throw refuse('tree repository mismatch');
+    }
+    const registrations = listing.stdout.split('\0\0').filter(Boolean).map((block) => block.split('\0'));
+    const registration = registrations.find((fields) => fields.some((field) =>
+      field.startsWith('worktree ') && key(field.slice(9)) === key(workspace)));
+    const head = registration?.find((field) => field.startsWith('HEAD '))?.slice(5) ?? '';
+    if (!registration?.includes('detached') || !/^[a-f0-9]{40,64}$/i.test(head)
+      || registration.some((field) => field === 'prunable' || field.startsWith('prunable '))) {
+      throw refuse('original detached tree is not registered');
+    }
+    this.throwIfAborted(signal, { taskId, phase: 'recover' });
+    // Unknown original timestamps and source dirtiness stay unknown. The next
+    // run captures its own audit baseline; recovery never cleans either checkout.
+    const record = {
+      taskId, workspacePath: workspace, sourcePath: source, baseHead: head,
+      isolated: true, detachedVerified: true, state: WORKTREE_STATES.awaitingHostReview,
+      createdAt: null, completedAt: null, sourcePreexistingChanges: null,
+    };
+    this.trees.set(normalizeKey(workspace), record);
+    return this.view(record);
   }
 
   /**

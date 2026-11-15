@@ -97,6 +97,11 @@ const TASK_FIELDS = Object.freeze([
   'selfApproved',
   'hostAcceptance',
   'cancelledBy',
+  // The Agent Teams decision and its outcome, so a wait answer alone says whether teams
+  // are on for this run (`applied`/`enabled`) or why they are not (`reason`) without
+  // reading the full result. Four booleans plus a bounded reason — no team content.
+  'agentTeams',
+  'team',
 ]);
 
 /**
@@ -404,10 +409,18 @@ export function resolveInterruption(observation) {
  * `skipQuestion` is the same rollover for an ANSWERED question: the just-answered set can
  * still occupy the engine's slot for a moment. A DIFFERENT request id is never skipped, so
  * a genuinely new question returns at once.
+ *
+ * `ackFailureEventId` is the receiver's acknowledgment of ONE repeated-failure reminder
+ * observed earlier (by its `eventId`). It rides the FIRST internal observation; the
+ * engine's verdict (`failureAck`) is frozen at the first report and attached to every
+ * answer and every thrown refusal of this call, so the host always learns whether its
+ * acknowledgment landed. After a verdict exists the loop stops carrying the ack, so a
+ * disposed monitor or a settled task cannot answer a stale ack and overwrite the fact.
  * @param {object} options - `callExecution`, `taskId`, `waitMs` (deadline), `signal`,
  *   `observeWaitMs` (per-request bound), `now`, `sleep`, optional `waitMetrics`
  *   (`(summary) => void`), optional `correlation` facts to echo back, optional
- *   `skipPermission` / `skipQuestion` (`(observation) => boolean`).
+ *   `skipPermission` / `skipQuestion` (`(observation) => boolean`), optional
+ *   `ackFailureEventId` (string).
  * @returns {Promise<object>} the compact wait answer (without `ok`).
  */
 export async function waitForTask(options) {
@@ -421,6 +434,26 @@ export async function waitForTask(options) {
   const waitMetrics = typeof options.waitMetrics === 'function' ? options.waitMetrics : null;
   const skipPermission = typeof options.skipPermission === 'function' ? options.skipPermission : null;
   const skipQuestion = typeof options.skipQuestion === 'function' ? options.skipQuestion : null;
+  // The receiver's ack, bound to the exact reminder it observed. Carried only until
+  // a verdict exists: the FIRST observation applies it, later observations of this
+  // call carry no ack field, and only a transport retry that has never seen a
+  // verdict still carries the same id.
+  const ackFailureEventId = typeof options.ackFailureEventId === 'string' && options.ackFailureEventId !== ''
+    ? options.ackFailureEventId
+    : null;
+  /**
+   * The ack verdict this call has learned, or `undefined` while none was reported.
+   *
+   * Once a verdict EXISTS it is frozen: the loop stops carrying the ack on later
+   * observations (so a disposed monitor or a settled task cannot answer a stale
+   * ack with `unknown-event` and overwrite a confirmed fact), and the stored
+   * verdict — confirmed, refused or uncertain, exactly as the engine stated it —
+   * is attached to every answer and every thrown error.
+   * @type {object | undefined}
+   */
+  let ackFailureResult;
+  /** Whether the caller asked this call to acknowledge at all. */
+  const ackRequested = ackFailureEventId !== null;
 
   const startedAt = now();
 
@@ -492,11 +525,17 @@ export async function waitForTask(options) {
    * The measurement is of the ANSWER OBJECT (the data the host receives), serialized
    * once — the envelope a client prints has no bearing on how much data was handed
    * back, and counting it here keeps `returnedBytes` and the published `metrics` in
-   * agreement.
+   * agreement. The engine's ack verdict (when this call carried an
+   * `ackFailureEventId` and an observation reported one) is attached here so EVERY
+   * answer shape — attention, wait-limit, ready, an interruption resolution —
+   * carries the same fact the host must see.
    * @param {object} answerValue - the compact answer.
    * @returns {object} the same answer.
    */
   const finish = (answerValue) => {
+    if (ackFailureResult !== undefined && answerValue !== null && typeof answerValue === 'object') {
+      answerValue.failureAck = ackFailureResult;
+    }
     returnedReason = typeof answerValue.reason === 'string' ? answerValue.reason : null;
     if (returnedReason === null) failureCode = answerValue.error?.code ?? 'MCP_CALL_FAILED';
     report(returnedReason);
@@ -514,19 +553,44 @@ export async function waitForTask(options) {
       observationRequests += 1;
       let observation;
       try {
-        observation = await callExecution('observe', { taskId, waitMs: perRequest }, { signal });
+        // The ack rides only until a verdict exists. Once the engine has reported
+        // one (confirmed, refused, or superseded), later observations in this call
+        // carry NO ack field: re-acking a settled/disposed monitor would answer
+        // `unknown-event` and overwrite an already-established fact with a worse
+        // one. Only a TRANSPORT retry that has never seen a verdict still carries
+        // the same id — that is the recovery path the redelivery exists for.
+        observation = await callExecution('observe', {
+          taskId,
+          waitMs: perRequest,
+          ...(ackFailureEventId === null || ackFailureResult !== undefined
+            ? {}
+            : { ackFailureEventId }),
+        }, { signal });
       } catch (error) {
         if (error?.code === 'MCP_REQUEST_CANCELLED') throw error;
         // A refusal is the harness's own answer and is returned as such: an unknown
         // task must read as "no such task", never as an invented completion or as a
-        // retry loop against a task that does not exist here.
+        // retry loop against a task that does not exist here. The ack verdict (when
+        // one exists) rides at the TOP LEVEL of this answer, exactly where the
+        // server's waitAnswer reads it.
         return finish({
           ...failureAnswer(error),
+          ...(ackFailureResult === undefined ? {} : { failureAck: ackFailureResult }),
           wait: metrics(0),
         });
       }
       lastObservation = observation;
       countObserved(observation);
+      // The engine's ack verdict for THIS call's acknowledgment. The FIRST reported
+      // verdict is frozen — later observations carry no ack field (see above), so a
+      // disposed monitor or a settled task cannot answer a stale ack and overwrite
+      // a confirmed fact with `unknown-event`. Kept verbatim, never rewritten. The
+      // assignment is explicitly gated on `undefined` (not on "truthy"), so a later
+      // observation that unexpectedly carried SOME ack block could still not replace
+      // a verdict this call already holds.
+      if (ackFailureResult === undefined && observation?.failureAck !== undefined && observation?.failureAck !== null) {
+        ackFailureResult = observation.failureAck;
+      }
       const reason = reasonOf(observation);
       // The post-decision rollover: the request this call already decided may still occupy
       // the engine's slot until the paused native call resumes. It is not a new question,
@@ -608,6 +672,15 @@ export async function waitForTask(options) {
     // reported, so the caller can tell a cancelled call (0 returns) from one that
     // answered — and the error is rethrown untouched, so the refusal path stays the
     // only thing that describes it.
+    //
+    // An ack verdict this call has already learned is attached to the rethrown error
+    // as `failureAck`: a wait that errors or is cancelled after a successful (or
+    // refused) acknowledgment still hands the host that fact, instead of leaving it
+    // to guess whether the ack landed. It is carried exactly as the engine stated it
+    // — never rewritten into a success.
+    if (ackFailureResult !== undefined && error !== null && typeof error === 'object') {
+      error.failureAck = ackFailureResult;
+    }
     failureCode = typeof error?.code === 'string' ? error.code : 'MCP_CALL_FAILED';
     report(null);
     throw error;

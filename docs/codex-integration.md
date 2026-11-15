@@ -1,6 +1,8 @@
 # Codex integration contract
 
-Status: implemented in 1.5.0 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
+Status: implemented in 1.5.1 (1.1.0 introduced wait rules, 1.2.0 added installed-integration upgrades, 1.4.0 clarifies outer long waits and explicit host-review recording). This automatic installer covers Codex. Claude Code uses the separate manual MCP guide.
+
+1.5.1 refreshes the manifest on each activation, resolves a normal linked home root, and upgrades exact shipped/candidate templates while preserving custom content. See [1.5.1 notes](releases/1.5.1.zh.md).
 
 1.5.0 adds `delegate_question_answer`, combined decision/answer-and-wait flows and program metrics. Managed upgrades recognize the exact published 1.4.2 and verified local test.1/test.2 companions; customized files remain operator-owned. See the [1.5.0 release notes](releases/1.5.0.zh.md).
 
@@ -52,7 +54,7 @@ not apply to custom wrappers, other directories, or automatic startup refresh.
 | --- | --- | --- | --- |
 | `$CODEX_HOME/agents/dsh-taskbridge.toml` | managed copy of `codex/dsh-taskbridge.toml` | create it **exclusively** on explicit install when absent; refresh a byte-exact known build during plugin startup or explicit install; delete it on `remove` only after re-reading it and finding the same bytes it classified | overwrite or delete a file that is not that exact build — including a file with an old version line whose body was edited, and including a file that changed in the window between the status read and the write/removal |
 | `$CODEX_HOME/config.toml`, table `mcp_servers.dsh-delegate` | operator, with one managed entry | add the entry when absent; update `command`/`args`/its own `env.DSH_DELEGATE_DISCOVERY_FILE` when the entry carries **the plugin marker** *and* is the exact shape this plugin writes; on an explicit `install`/`repair` only, adopt a recorded `args[0]` that is a PROVED real installation of this package (manifest `name` + `bin["dsh-delegate-mcp"]` mapping) | touch any other key, table, comment or ordering; adopt, update or delete an unmarked same-name entry, even one whose values coincide; adopt a differing script path from the automatic startup check |
-| `$CODEX_HOME` and `$CODEX_HOME/agents` | Codex | read them (lstat **and** the Windows file attributes); create `agents` (`0700`) when both are real directories | create them relative to the process working directory; **follow a link at either level** (POSIX symlink, Windows junction/reparse point) for any read-through, write or delete |
+| `$CODEX_HOME` and `$CODEX_HOME/agents` | Codex | resolve and pin a normal root symlink/junction to its real directory; inspect the real root and agents directory; create missing agents (`0700`) | retarget or delete the root alias; follow a link in the agents subdirectory or final file; write through an unusable or unverified target |
 | DSH local-call switch | operator | report it | change it |
 
 `$CODEX_HOME` resolution: `CODEX_HOME` when set and absolute; otherwise
@@ -64,15 +66,14 @@ nobody named.
 
 `lstat` on the final file is not enough: if `$CODEX_HOME/agents` is a junction,
 `mkdir -p` and the file create walk *through* it and write
-`agents/dsh-taskbridge.toml` outside the Codex home entirely. Both directories are
-therefore inspected as *boundaries*:
+`agents/dsh-taskbridge.toml` outside the Codex home entirely. Since 1.5.1 the selected HOME root is first pinned to its real directory; that real root and the agents subdirectory are then inspected as boundaries:
 
 | `$CODEX_HOME` | `$CODEX_HOME/agents` | result |
 | --- | --- | --- |
 | real directory | missing | normal: install creates `agents` (`0700`) |
 | real directory | real directory | normal |
 | real directory | link (symlink or junction) | `agent.state = conflict`, `reason = agents-dir-is-link`; install/repair/remove all refuse with `AGENT_PATH_CONFLICT` |
-| link | not inspected (nothing below a link is examined) | `agent.state = conflict`, `reason = codex-home-is-link`; same refusal |
+| root symlink/junction with a real directory target | checked under the pinned real target | normal root alias; alias preserved, agents/file links still refused |
 | could not be verified | — | `agent.state = conflict`, `reason = boundary-unverified`; same refusal |
 
 A **junction** is the case `lstat` cannot see: Windows reports it as an ordinary
@@ -441,12 +442,7 @@ A successful `install` records the directory even when it wrote nothing because 
 installation was already exactly right: `changed: []` is a success, not "nothing happened".
 A REFUSED install records nothing, so a refusal cannot become the remembered target.
 
-A default that is a link (or cannot be verified) is reported as `default-is-link` /
-`default-unverified`; a home that does not exist is `no-codex-home`. When no supported
-directory applies, `status()` and the actions REFUSE with `CODEX_HOME_INVALID` instead of
-falling back, and so does `refreshManagedIntegration` when the caller passes a
-`startupTarget` whose `home` is `null` — the plugin never walks a junction and never
-substitutes a tree nobody named.
+In 1.5.1 the selected home root is pinned by the installer to its real target after this precedence resolution. A normal root symlink/junction is supported; an unresolvable or unverifiable target is refused. A missing home remains `no-codex-home`; a null startup target does not silently fall back to another tree. The root alias is preserved, and links below it in agents or the final files remain forbidden.
 
 The explicit 安装 / 更新 TaskBridge 智能体 button (action `install`) is unchanged and remains
 the way to *create* the two managed targets. `status` reports the drift (`mcp.drift`)
@@ -530,7 +526,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.5.0",
+  "packageVersion": "1.5.1",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,
@@ -942,7 +938,7 @@ session (or a restart) is required to load the new file and the new MCP entry.
 | --- | --- |
 | `CODEX_HOME` relative | 400 `CODEX_HOME_INVALID`; nothing read or written |
 | `CODEX_HOME` unset | diagnosed against `~/.codex` |
-| `$CODEX_HOME` is a symlink or a Windows junction | `conflict` (`codex-home-is-link`); nothing below it is inspected, written or deleted |
+| `$CODEX_HOME` is a normal symlink or Windows junction | pin and verify its real directory target, preserve the root alias, then apply the same managed-content checks; broken or unverifiable targets are refused |
 | `$CODEX_HOME/agents` is a symlink or a Windows junction | `conflict` (`agents-dir-is-link`); install/repair/remove refuse with `AGENT_PATH_CONFLICT` and no file is created outside the home |
 | an ordinary real Windows directory | `directory` in every spelling of the helper's boolean (`dir/False`, `dir/false`); never reported as a link |
 | `repair` with the agent file missing or `outdated` | `changed: ["mcp"]` or `[]`; the agent file is not created and not refreshed, and `agents/` is not created |

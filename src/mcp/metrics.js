@@ -246,9 +246,22 @@ export function createCallMetrics(options = {}) {
 
     /**
      * The census, as a bounded read-only answer.
+     *
+     * The audit SAMPLE is capped well below the internal ring buffer: a long session
+     * (hundreds of waits and decisions) must still be able to ANSWER, and the sample
+     * lists were the one part `boundedJson` cannot shrink — without this cap they
+     * grew the whole answer past the tool-text bound and the caller received
+     * `MCP_RESULT_OVER_BUDGET` instead of even the totals. The cap keeps only the
+     * MOST RECENT entries and STATES how many were omitted, so a reader can always
+     * tell a partial view from the full history; the cumulative counters above are
+     * exact regardless of the sample.
      * @returns {object} snapshot with no content and no credentials.
      */
     snapshot() {
+      /** How many recent entries the published sample keeps, per list. */
+      const sampleLimit = 8;
+      const keptWaits = recentWaits.slice(-sampleLimit);
+      const keptDecisions = recentDecisions.slice(-sampleLimit);
       return {
         schemaVersion: 1,
         // What each counter MEANS, stated where the numbers are, so no reader can take
@@ -307,9 +320,19 @@ export function createCallMetrics(options = {}) {
           waitsAfterDecisions,
           waitQuestionsAnswered,
           // The bounded sample is what makes the counts auditable: one identifier per wait,
-          // its reason, its duration, and the decision it followed.
-          recentWaits: recentWaits.map((entry) => ({ ...entry })),
-          recentDecisions: recentDecisions.map((entry) => ({ ...entry })),
+          // its reason, its duration, and the decision it followed. Published with an
+          // explicit omission statement, so a partial sample is never mistaken for the
+          // full history. The omission counts are measured against the CUMULATIVE
+          // histories (waits; decisions PLUS question answers, which share one sample
+          // list), never against the internal ring buffer — so the statement is exactly
+          // "how many of the recorded facts this answer does not show", even on a
+          // session shorter than the ring.
+          recentWaits: keptWaits.map((entry) => ({ ...entry })),
+          recentDecisions: keptDecisions.map((entry) => ({ ...entry })),
+          omitted: {
+            waits: waits - keptWaits.length,
+            decisions: (decisions + questionAnswers) - keptDecisions.length,
+          },
         },
       };
     },

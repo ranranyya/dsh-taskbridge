@@ -904,13 +904,20 @@ test('the same tool, operation and failure three times reports once and leaves t
   assert.equal(outcome.failure.toolName, 'bash');
   assert.equal(outcome.failure.failureCode, 'ENOENT');
   assert.equal(outcome.failure.consecutive, 3);
+  assert.match(outcome.failure.eventId, /^[0-9a-f]{16}$/u, 'the reminder carries a stable event identity');
   assert.equal(task.state, 'running', 'a reminder never changes the task state');
 
-  // Delivered once: the next observation sees nothing, even with more identical failures.
+  // Delivered once is NOT taken once: the reminder is redelivered with the SAME
+  // eventId until a receiver acknowledges it, so a lost answer is recoverable.
   repeatFailure(monitor, clock.clockMs, { callId: 'c4' });
   const again = await monitor.observe({ waitMs: 1 });
-  assert.equal(again.failure, null, 'an already reported episode is not re-reported');
-  assert.equal(monitor.pendingFailure, null);
+  assert.equal(again.failure.eventId, outcome.failure.eventId, 'one repeated failure is ONE notification identity');
+
+  // The ack clears it by its exact eventId; further observations stay quiet.
+  const ack = monitor.ackFailureReport(outcome.failure.eventId);
+  assert.equal(ack.acknowledged, true);
+  const quiet = await monitor.observe({ waitMs: 1 });
+  assert.equal(quiet.failure, null, 'acknowledged, then quiet — even with more identical failures');
 });
 
 test('fewer than the threshold, a different operation, a different failure or a success all reset the count', async () => {
@@ -951,12 +958,14 @@ test('a duplicate result for the same callId is counted once', async () => {
   assert.equal(monitor.pendingFailure, null, 'one failure of a two-failure threshold is not a reminder');
 });
 
-test('a run whose failures persisted past the threshold reminds once, and a new episode may remind again', async () => {
+test('a run whose failures persisted past the threshold reminds until acknowledged, and a new episode may remind again', async () => {
   const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 3 });
   for (const id of ['e1', 'e2', 'e3', 'e4', 'e5']) repeatFailure(monitor, clock.clockMs, { callId: id });
   const first = await monitor.observe({ waitMs: 1 });
   assert.equal(first.failure.consecutive, 3, 'the reminder names the count it first reached');
-  assert.equal((await monitor.observe({ waitMs: 1 })).failure, null, 'continuous failures do not re-wake the host');
+  const redelivered = await monitor.observe({ waitMs: 1 });
+  assert.equal(redelivered.failure.eventId, first.failure.eventId, 'continuous failures redeliver the SAME notification');
+  monitor.ackFailureReport(first.failure.eventId);
 
   // The run recovers and then fails identically again: that is a NEW episode, and it
   // is reported again — once, not per failure.
@@ -966,6 +975,8 @@ test('a run whose failures persisted past the threshold reminds once, and a new 
   const second = await monitor.observe({ waitMs: 1 });
   assert.equal(second.reason, OBSERVE_REASONS.attention);
   assert.equal(second.failure.consecutive, 3, 'the new episode reports its own count');
+  assert.notEqual(second.failure.eventId, first.failure.eventId, 'a new episode has its own identity');
+  monitor.ackFailureReport(second.failure.eventId);
   assert.equal((await monitor.observe({ waitMs: 1 })).failure, null);
   assert.equal(monitor.failures.reported.length, 2, 'a later episode can report again');
 });
@@ -1163,7 +1174,59 @@ test('claimFailureReport returns null once the episode has changed, even if stil
   // parked: only the episode identity changes, nothing else about the object does.
   monitor.failures.episode.sequence = monitor.failures.nextEpisode();
   assert.equal(monitor.claimFailureReport(), null, 'a stale episode is never delivered');
-  assert.equal(monitor.pendingFailure, null, 'and it is dropped');
+  // The parked object stays where it is (claiming is no longer a take-once consume:
+  // delivery is gated by `isCurrent` on every observation), but it can never reach a
+  // caller while its episode is stale, and a genuinely new episode replaces it.
+  assert.ok(monitor.pendingFailure !== null, 'the stale object is parked harmlessly');
+  repeatFailure(monitor, clock.clockMs, { callId: 'g3', reason: 'B' });
+  repeatFailure(monitor, clock.clockMs, { callId: 'g4', reason: 'B' });
+  const fresh = await monitor.observe({ waitMs: 1 });
+  assert.ok(fresh.failure, 'the new episode is delivered');
+  assert.notEqual(fresh.failure.eventId, undefined);
+});
+
+test('ackFailureReport is bound to the exact event and is idempotent', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 2 });
+  for (const id of ['b1', 'b2']) repeatFailure(monitor, clock.clockMs, { callId: id, reason: 'A' });
+  const delivered = await monitor.observe({ waitMs: 1 });
+  const eventId = delivered.failure.eventId;
+
+  // A wrong id, an empty id, a non-string: none of them clears the reminder.
+  for (const bad of ['deadbeef'.repeat(2), '', null, undefined, 42]) {
+    const refused = monitor.ackFailureReport(bad);
+    assert.equal(refused.acknowledged, false, `an ack of ${JSON.stringify(bad)} must fail`);
+    assert.equal(monitor.pendingFailure !== null, true, 'the reminder survives a wrong ack');
+  }
+  // And the next observation still carries the SAME notification.
+  const redelivered = await monitor.observe({ waitMs: 1 });
+  assert.equal(redelivered.failure.eventId, eventId);
+
+  // The right ack clears it; a repeat is an idempotent success.
+  const ack = monitor.ackFailureReport(eventId);
+  assert.equal(ack.acknowledged, true);
+  assert.equal(ack.eventId, eventId);
+  assert.equal(monitor.pendingFailure, null);
+  const repeat = monitor.ackFailureReport(eventId);
+  assert.equal(repeat.acknowledged, true, 'a repeated ack of a cleared event is an idempotent success');
+  assert.equal((await monitor.observe({ waitMs: 1 })).failure, null);
+});
+
+test('an ack that arrives after the episode was superseded is honest but inert', async () => {
+  const { monitor, clock } = monitorFixture({ repeatFailureThreshold: 2 });
+  for (const id of ['y1', 'y2']) repeatFailure(monitor, clock.clockMs, { callId: id, reason: 'A' });
+  const delivered = await monitor.observe({ waitMs: 1 });
+  const eventId = delivered.failure.eventId;
+  // The episode then switches to a different failure: the parked reminder is gone.
+  repeatFailure(monitor, clock.clockMs, { callId: 'y3', reason: 'B' });
+  assert.equal(monitor.pendingFailure, null);
+  const ack = monitor.ackFailureReport(eventId);
+  assert.equal(ack.acknowledged, false, 'a stale event cannot be acknowledged as pending');
+  assert.equal(ack.reason, 'unknown-event');
+  // The NEW episode is unaffected and still deliverable.
+  repeatFailure(monitor, clock.clockMs, { callId: 'y4', reason: 'B' });
+  const next = await monitor.observe({ waitMs: 1 });
+  assert.ok(next.failure, 'a superseded ack never silences the new notification');
+  assert.notEqual(next.failure.eventId, eventId);
 });
 
 test('an arbitrary error code or name is never published, even when it is identifier-shaped', async () => {

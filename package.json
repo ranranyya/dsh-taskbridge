@@ -1,6 +1,6 @@
 {
   "name": "dsh-taskbridge",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "让 Claude Code 或 Codex 指挥 DSH 完成任务；在 DSH 插件中配置 API、执行模型、思考强度、权限审批与集中审查。",
   "license": "MIT",
   "repository": {
@@ -78,7 +78,8 @@
     "docs/releases/1.4.1.zh.md",
     "docs/releases/1.4.2.zh.md",
     "docs/releases/1.5.0.zh.md",
-    "docs/releases/1.5.0-token-benchmark.zh.md"
+    "docs/releases/1.5.0-token-benchmark.zh.md",
+    "docs/releases/1.5.1.zh.md"
   ],
   "dsh": {
     "manifestVersion": 1,
@@ -117,7 +118,10 @@
     "@deepseek-ai/dsh-user-approval": "0.2.0-rc.2",
     "@deepseek-ai/schemastery": "~3.18.4",
     "@earendil-works/pi-ai": "^0.87.1",
-    "esbuild": "0.25.11"
+    "esbuild": "0.25.11",
+    "jsdom": "25.0.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 tests/*.test.js",

@@ -321,6 +321,17 @@ export const TOOLS = Object.freeze([
           description: 'Optional per-task overrides (model/effort/timeout). Validated by the harness.',
           additionalProperties: true,
         },
+        agentTeams: {
+          type: 'boolean',
+          description: 'OPTIONAL. Your Agent Teams decision for THIS task\u2019s own DSH Session: the same switch the '
+            + 'DSH model menu exposes as \u300cUse Agent Teams\u300d/\u300c\u542f\u7528\u667a\u80fd\u4f53\u56e2\u961f\u534f\u4f5c\u300d. '
+            + 'The plugin applies it to this run only and never opens a global default. Use `true` only when independent '
+            + 'modules can proceed in parallel and the gain covers the coordination cost; single-file work and '
+            + 'strongly ordered changes should stay `false`. Omit it to make no choice: the run then keeps whatever '
+            + 'selection the Session already has. Teams never replaces your approval or your final review, and this '
+            + 'flag never selects a model or an effort \u2014 those come from the task\u2019s frozen configuration. The task '
+            + 'record reports `agentTeams` (your request) and `team` (what DSH confirmed, or why it could not).',
+        },
         continueFromTaskId: {
           type: 'string',
           description: 'Task id of the earlier delegated task this submission continues. '
@@ -387,8 +398,10 @@ export const TOOLS = Object.freeze([
       + 'the configured inactivity threshold, ten minutes by default, so it may be stuck), `ready` (the run '
       + 'ended and is awaiting host review), `failed`, `cancelled` or `interrupted`. '
       + 'An `attention` answer may instead carry a `failure` block (kind `repeated-tool-failure`, with '
-      + 'toolName/failureCode/consecutive): the worker repeated the SAME operation and failed the same way '
-      + 'several times in a row. It is a question for the host, reported once; nothing is cancelled, retimed '
+      + 'a stable `eventId`, toolName/failureCode/consecutive): the worker repeated the SAME operation and failed the same way '
+      + 'several times in a row. It is a question for the host, and it is REDELIVERED until you acknowledge it with '
+      + '`ackFailureEventId` (the eventId you saw), so a lost answer is never a lost reminder; acknowledging stops the '
+      + 'redelivery and does not decide anything about the task. Nothing is cancelled, retimed '
       + 'or reconfigured automatically. '
       + '`reason: "wait-limit"` means only that this call\u2019s own budget ran out with nothing changed: it is '
       + 'reported with `actionable: false` and `terminal: false`. Call delegate_wait again with the same '
@@ -431,9 +444,15 @@ export const TOOLS = Object.freeze([
     // concurrency-aware client this call may be held for an hour without being a
     // mutating operation. A serialising host still ignores it; the independent
     // `dsh-delegate-control` channel is the answer there.
+    // A LONG read of the task that can also ACKNOWLEDGE a reminder: the
+    // `ackFailureEventId` argument clears the monitor's reminder state, which is a
+    // state change even though it never touches the task, a decision or a run — so
+    // `readOnlyHint` is FALSE and must stay false. `destructiveHint` stays false:
+    // acknowledging stops nothing, decides nothing and rewinds nothing. The
+    // annotations are a description of the tool, not an execution-permission guard.
     annotations: Object.freeze({
       title: 'Wait for a task to need you',
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
@@ -450,6 +469,17 @@ export const TOOLS = Object.freeze([
             + 'Set it only for a shorter, one-off diagnostic you were explicitly asked to make. It cannot '
             + 'extend a wait beyond 3600. A returned `wait-limit` with `actionable: false` means this '
             + 'deadline was reached, not that the task stalled or ended.',
+        },
+        ackFailureEventId: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 64,
+          description: 'OPTIONAL. The `failure.eventId` from an earlier delegate_wait answer. A repeated-failure '
+            + 'reminder is redelivered until you acknowledge it: pass its eventId here to say you received it. '
+            + 'Acknowledging does not decide anything about the task and does not stop the run, but it DOES '
+            + 'clear the reminder state, which is why this tool is not announced read-only. A wrong eventId is '
+            + 'refused in the answer (`failureAck.acknowledged: false`) and changes nothing. An empty string is '
+            + 'refused, not ignored.',
         },
       },
       required: ['taskId'],
@@ -945,6 +975,12 @@ function validateArgs(tool, args) {
       } else if (typeof declared.maxLength === 'number' && field.length > declared.maxLength) {
         throw new McpError('MCP_ARGUMENT_RANGE', `${tool.name}.${key} must be at most ${declared.maxLength} characters`);
       }
+      // A declared minLength is enforced too: an empty string is REFUSED with the field
+      // named, never silently ignored — an ack whose id is empty is a caller bug, and
+      // letting it through would answer "nothing to acknowledge" instead of the truth.
+      if (typeof declared.minLength === 'number' && field.length < declared.minLength) {
+        throw new McpError('MCP_ARGUMENT_REQUIRED', `${tool.name}.${key} must not be empty`);
+      }
       out[key] = field;
     } else if (declared.type === 'boolean') {
       // Strict: a model that sends the string "true" gets a refusal naming the
@@ -1355,6 +1391,11 @@ function pathsFor(value) {
  */
 function projectWithStage(value, stage, collect) {
   const projected = structuredCloneSafe(value);
+  // The acknowledgment verdict is a fact the engine already acted on. Whatever a stage
+  // trims elsewhere, this trio is restored verbatim on every stage so a compressed or
+  // skeletonised answer cannot turn an applied confirmation into an unknown outcome.
+  const projectedAck = minimalFailureAck(projected.failureAck);
+  if (projectedAck !== null) projected.failureAck = projectedAck;
   for (const key of ['decisionReceipt', 'answerReceipt']) {
     const receipt = minimalReceipt(projected[key]);
     if (receipt !== null) {
@@ -1464,7 +1505,10 @@ function skeletonize(task, path, cap, collect) {
   const pick = (key) => (key in task ? boundValue(task[key], `${path}.${key}`, cap, collect) : undefined);
   const out = {};
   for (const key of ['taskId', 'state', 'phase', 'route', 'reviewRoute', 'reviewRouteError', 'execution', 'error',
-    'hostAcceptance', 'selfApproved', 'cancelledBy', 'createdAt', 'endedAt']) {
+    'hostAcceptance', 'selfApproved', 'cancelledBy', 'createdAt', 'endedAt',
+    // The Agent Teams verdict is four booleans and a short reason: it survives every
+    // bound so a compressed answer still says whether teams are on for this run.
+    'agentTeams', 'team']) {
     const value = pick(key);
     if (value === undefined) continue;
     if (key === 'execution' && value !== null && typeof value === 'object') {
@@ -1915,11 +1959,41 @@ function boundedJson(value) {
   if (refusedReceipt !== null) identity.decisionReceipt = refusedReceipt;
   const refusedAnswer = minimalReceipt(value?.answerReceipt);
   if (refusedAnswer !== null) identity.answerReceipt = refusedAnswer;
+  // "The answer did not fit" must never mean "the acknowledgement is lost": the same
+  // rule the decision receipt obeys above applies to the ack verdict, which the engine
+  // has already acted on.
+  const refusedAck = minimalFailureAck(value?.failureAck);
+  if (refusedAck !== null) identity.failureAck = refusedAck;
   return refuseResult(
     'MCP_RESULT_OVER_BUDGET',
     'the critical fields alone exceed the tool-text bound, so no usable projection could be produced',
     { ...identity, fullTextChars: compact.length, boundChars: MAX_TOOL_TEXT_CHARS },
   );
+}
+
+/**
+ * The minimum facts a failure acknowledgment must keep under ANY bound.
+ *
+ * A `failureAck` is the producer's verdict on the receiver's `ackFailureEventId`: the
+ * reminder was cleared (or refused) at the engine, and the host that does not learn
+ * this fact may resend the ack or assume an unknown outcome. So the exact `eventId`,
+ * `acknowledged` and `reason` are carried VERBATIM — never rewritten, never invented —
+ * and this projection is applied wherever an answer is compressed, refused or reduced
+ * to its critical fields.
+ * @param {object} ack - the engine's ack result.
+ * @returns {object | null} the verbatim trio, or null when there is nothing to keep.
+ */
+function minimalFailureAck(ack) {
+  if (ack === null || typeof ack !== 'object' || Array.isArray(ack)) return null;
+  const out = {
+    acknowledged: ack.acknowledged === true,
+    eventId: typeof ack.eventId === 'string' ? ack.eventId : null,
+    reason: typeof ack.reason === 'string' ? ack.reason : null,
+  };
+  // A result with no verdict at all is not an acknowledgment fact: do not publish
+  // a fabricated `acknowledged: false`.
+  if (ack.acknowledged !== true && ack.acknowledged !== false) return null;
+  return out;
 }
 
 /**
@@ -1978,6 +2052,13 @@ function rescueQuestion(value, fullTextChars) {
     for (const key of ['decisionReceipt', 'answerReceipt']) {
       const receipt = minimalReceipt(value[key]);
       if (receipt !== null) payload[key] = receipt;
+    }
+    // A long QUESTION answer can equally follow an applied acknowledgment: the rescue
+    // must keep that verdict verbatim, or the host re-asks what already happened.
+    const questionRescueAck = minimalFailureAck(value.failureAck);
+    if (questionRescueAck !== null) {
+      records.push({ path: 'failureAck', field: 'ack', detail: 'the acknowledgment verdict is retained verbatim' });
+      payload.failureAck = questionRescueAck;
     }
     const redacted = redactDeepStrings(payload);
     const pretty = JSON.stringify(redacted, null, 2);
@@ -2045,7 +2126,11 @@ function permissionRescue(value, fullTextChars) {
   }
   const receipt = minimalReceipt(value?.decisionReceipt);
   const answerReceipt = minimalReceipt(value?.answerReceipt);
-  if (entries.length === 0 && receipt === null && answerReceipt === null) return null;
+  // The acknowledgment verdict is critical for the same reason a receipt is: the engine
+  // already acted on it, so a rescue that dropped it would report an applied confirmation
+  // as unknown. It is kept verbatim and counted as part of what "survived".
+  const failureAck = minimalFailureAck(value?.failureAck);
+  if (entries.length === 0 && receipt === null && answerReceipt === null && failureAck === null) return null;
   return (cap) => {
     const records = [];
     const render = (entry) => {
@@ -2068,12 +2153,19 @@ function permissionRescue(value, fullTextChars) {
       }
       return pending;
     };
-    /** Attach the receipt, with the omission stated where it happened. */
+    /** Attach the receipt(s) and the failure acknowledgment, with the omission stated where it happened. */
     const withReceipt = (payload) => {
       for (const [key, item] of [['decisionReceipt', receipt], ['answerReceipt', answerReceipt]]) {
         if (item === null) continue;
         records.push({ path: key, field: 'receipt', detail: 'identity and application facts retained; bulky evidence omitted' });
         payload[key] = item;
+      }
+      // The ack verdict is a fact about what ALREADY happened at the producer. Losing it
+      // here made the host believe an applied confirmation was unknown (TB151-01), so it
+      // is carried verbatim at the same top-level place the normal answer publishes it.
+      if (failureAck !== null) {
+        records.push({ path: 'failureAck', field: 'ack', detail: 'the acknowledgment verdict is retained verbatim' });
+        payload.failureAck = failureAck;
       }
       return payload;
     };
@@ -2351,9 +2443,19 @@ export function createMcpServer(options) {
       const details = error instanceof McpError && error.details !== null && error.details !== undefined
         ? error.details
         : undefined;
+      // An acknowledgment verdict the wait loop already learned survives this refusal:
+      // whether the host's ack landed (or was refused) is a fact about the past that a
+      // transport failure or a cancellation must not erase, and the host must never
+      // have to resend an ack blindly. Attached verbatim as `details.failureAck`.
+      const ackFact = error !== null && typeof error === 'object' && error.failureAck !== undefined
+        ? error.failureAck
+        : (details !== undefined && details.failureAck !== undefined ? details.failureAck : undefined);
+      const boundedDetails = ackFact !== undefined
+        ? { ...(details ?? {}), failureAck: ackFact }
+        : details;
       producedText = boundedJson({
         ok: false,
-        error: { code, message, ...(details === undefined ? {} : { details }) },
+        error: { code, message, ...(boundedDetails === undefined ? {} : { details: boundedDetails }) },
       }).text;
       return {
         content: [{ type: 'text', text: producedText }],
@@ -2380,6 +2482,12 @@ export function createMcpServer(options) {
    */
   async function waitAnswer(payload, context, options = {}) {
     const waitSeconds = payload.waitSeconds ?? DEFAULT_WAIT_SECONDS;
+    // The receiver's acknowledgment of an earlier reminder. It is consumed HERE and
+    // forwarded to the internal observations; it never reaches the plane as part of
+    // any other tool call.
+    const ackFailureEventId = typeof payload.ackFailureEventId === 'string' && payload.ackFailureEventId !== ''
+      ? payload.ackFailureEventId
+      : null;
     const correlation = {
       waitId: nextCorrelationId('wait'),
       afterDecisionId: options.afterDecisionId ?? null,
@@ -2394,6 +2502,7 @@ export function createMcpServer(options) {
       correlation,
       skipPermission: options.skipPermission,
       skipQuestion: options.skipQuestion,
+      ...(ackFailureEventId === null ? {} : { ackFailureEventId }),
       // The loop reports its own accounting once, on every exit path, so a wait that
       // threw is counted too. Counting lives HERE, not in the answer: a thrown call has
       // no answer to carry a count.
@@ -2402,7 +2511,15 @@ export function createMcpServer(options) {
     if (result?.error !== undefined) {
       // The loop could not obtain an observation at all. That is a refusal with the
       // harness's own code, raised so the standard refusal path shapes it — never an
-      // answer that would look like a task state.
+      // answer that would look like a task state. An ack verdict the loop already
+      // learned survives the refusal: the wait loop attaches it at the TOP LEVEL of
+      // the refusal answer (`result.failureAck`); older shapes that carried it inside
+      // `result.error.failureAck` are still honoured, so the host learns from the
+      // refusal whether its acknowledgment landed instead of guessing.
+      const ackFact = result.failureAck ?? result.error?.failureAck;
+      if (ackFact !== null && ackFact !== undefined) {
+        throw new McpError(result.error.code, result.error.message, { details: { failureAck: ackFact } });
+      }
       throw new McpError(result.error.code, result.error.message);
     }
     return { ok: true, ...result };
@@ -2842,7 +2959,8 @@ export function createMcpServer(options) {
               + 'no zero-wake guarantee across clients — state that plainly instead of inventing a wake-up. '
               + 'An `attention` answer that carries a `failure` '
               + 'block means the worker repeated the same failed operation several times while still running: '
-              + 'it is a question for the host, sent once, and nothing is cancelled or reconfigured for it. '
+              + 'it is a question for the host, redelivered with the SAME eventId until you acknowledge it via '
+              + '`ackFailureEventId`, and nothing is cancelled or reconfigured for it. '
               + 'If a host serialises tool calls so that this '
               + 'connection is blocked by a long wait, the independently installed `dsh-delegate-control` '
               + 'binary can report or cancel one task from a separate process; it cannot submit, configure or '

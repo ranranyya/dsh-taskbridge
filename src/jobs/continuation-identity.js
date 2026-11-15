@@ -230,7 +230,8 @@ export function recordedDirectoryIs(recorded, directory) {
  * @param {string | null} isolation - the isolation the run used.
  * @returns {{ taskId: string, sourcePath: string | null, executionPath: string | null,
  *   sourcePathDigest: string | null, executionPathDigest: string | null,
- *   workspaceId: string, sessionId: string, isolation: string | null } | null} identity, or null.
+ *   workspaceId: string, sessionId: string, isolation: string | null,
+ *   agentTeams: boolean | null } | null} identity, or null.
  */
 export function continuationIdentityOf(task, placement, isolation) {
   const taskId = typeof task?.taskId === 'string' ? task.taskId.trim() : '';
@@ -246,6 +247,10 @@ export function continuationIdentityOf(task, placement, isolation) {
     workspaceId: typeof placement?.workspaceId === 'string' ? placement.workspaceId.trim() : '',
     sessionId: typeof placement?.sessionId === 'string' ? placement.sessionId.trim() : '',
     isolation: typeof isolation === 'string' && isolation !== '' ? isolation : null,
+    // The chain's Agent Teams decision, so a follow-up inherits the mode its parent ran
+    // with unless the dispatcher states a new one explicitly. `null` = no decision was
+    // recorded for the parent (the Session keeps its own mode).
+    agentTeams: typeof task?.agentTeams === 'boolean' ? task.agentTeams : null,
   };
 }
 

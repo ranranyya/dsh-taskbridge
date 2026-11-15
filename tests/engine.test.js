@@ -2019,13 +2019,33 @@ test('repeated identical tool failures reach the host once as a typed failure di
     // The task is still running: a reminder is not a verdict.
     assert.equal(h.engine.get(task.taskId).state, TASK_STATES.running);
 
-    // Nothing secret reaches the answer, and the next observation is quiet again.
+    // Nothing secret reaches the answer, and the reminder carries its stable identity.
     const serialized = JSON.stringify(observation);
     for (const secret of ['SECRET BODY', 'npm test', 'the tool said so']) {
       assert.equal(serialized.includes(secret), false, `the observation must not carry ${secret}`);
     }
+    assert.match(observation.failure.eventId, /^[0-9a-f]{16}$/u, 'the reminder has a stable event identity');
+
+    // The reminder is redelivered with the SAME identity until a receiver acks it —
+    // the server's having answered once proves nothing about what the receiver got.
     const again = await h.engine.observeTask(task.taskId, { connectionId: task.connectionId, waitMs: 1 });
-    assert.equal(again.failure, null, 'reported once, then quiet');
+    assert.equal(again.failure.eventId, observation.failure.eventId, 'one repeated failure is ONE notification identity');
+
+    // A wrong eventId never clears anything; the ack result is echoed honestly.
+    const wrongAck = await h.engine.observeTask(task.taskId, {
+      connectionId: task.connectionId, waitMs: 1, ackFailureEventId: '0'.repeat(16),
+    });
+    assert.equal(wrongAck.failureAck.acknowledged, false);
+    assert.equal(wrongAck.failureAck.reason, 'unknown-event');
+
+    // The ack clears it by the exact eventId; the next observation is quiet again.
+    const ack = await h.engine.observeTask(task.taskId, {
+      connectionId: task.connectionId, waitMs: 1, ackFailureEventId: observation.failure.eventId,
+    });
+    assert.equal(ack.failureAck.acknowledged, true);
+    assert.equal(ack.failureAck.eventId, observation.failure.eventId);
+    const quiet = await h.engine.observeTask(task.taskId, { connectionId: task.connectionId, waitMs: 1 });
+    assert.equal(quiet.failure, null, 'reported, acknowledged, then quiet');
 
     // The task page reads the same bounded evidence from the public view.
     const view = h.engine.get(task.taskId);

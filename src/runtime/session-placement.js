@@ -71,6 +71,10 @@ const RECORD_FIELDS = Object.freeze([
   'isolation',
   'worktreeId',
   'worktreeState',
+  // The chain's Agent Teams decision (`true`/`false`), or absent for a row written before
+  // this field existed. It is an identity fact about the chain, like `isolation`: a
+  // follow-up inherits it unless the dispatcher states a new one.
+  'agentTeams',
   'updatedAt',
 ]);
 
@@ -1105,6 +1109,12 @@ function projectSessionRecord(value) {
     worktreeState: typeof value.worktreeState === 'string' && value.worktreeState.trim() !== ''
       ? value.worktreeState.trim()
       : null,
+    // The chain's Agent Teams decision, so a follow-up inherits what its parent ran with.
+    // A row written before this field existed (or one with a non-boolean value) reads back
+    // as `null` = "no recorded decision", which is exactly how the engine treats "the
+    // dispatcher made no choice": the Session keeps its own mode. That is the compatible
+    // reading, not a silent `false`.
+    agentTeams: typeof value.agentTeams === 'boolean' ? value.agentTeams : null,
     updatedAt: Number.isFinite(value.updatedAt) ? Math.trunc(value.updatedAt) : Date.now(),
   };
 }
@@ -1176,6 +1186,9 @@ async function rememberIdentity(store, placement, target, identity) {
     workspaceId: typeof placement.workspaceId === 'string' ? placement.workspaceId : '',
     sessionId,
     isolation: typeof target.isolation === 'string' ? target.isolation : null,
+    // The chain's Agent Teams decision travels with the identity, so a follow-up in a
+    // later process inherits the mode its parent ran with. `null` = no decision recorded.
+    agentTeams: typeof identity.agentTeams === 'boolean' ? identity.agentTeams : null,
     worktreeId: typeof target.worktreeId === 'string' ? target.worktreeId : null,
     worktreeState: typeof target.worktreeState === 'string' ? target.worktreeState : null,
   });

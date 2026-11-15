@@ -214,7 +214,7 @@ async function callWait(server, args) {
 test('delegate_wait is declared with a closed schema and an optional bounded waitSeconds', () => {
   const tool = TOOLS.find((entry) => entry.name === 'delegate_wait');
   assert.ok(tool !== undefined, 'delegate_wait must be advertised');
-  assert.deepEqual(Object.keys(tool.inputSchema.properties).sort(), ['taskId', 'waitSeconds']);
+  assert.deepEqual(Object.keys(tool.inputSchema.properties).sort(), ['ackFailureEventId', 'taskId', 'waitSeconds']);
   assert.deepEqual(tool.inputSchema.required, ['taskId']);
   assert.equal(tool.inputSchema.additionalProperties, false);
   const field = tool.inputSchema.properties.waitSeconds;
@@ -484,6 +484,7 @@ test('only a real task event is actionable; a spent deadline is not', async () =
 test('a repeated-failure reminder rides attention and is distinguishable from silence', async () => {
   const failure = {
     kind: 'repeated-tool-failure',
+    eventId: 'a'.repeat(16),
     toolName: 'bash',
     failureCode: 'ENOENT',
     operationDigest: 'a'.repeat(16),
@@ -518,6 +519,93 @@ test('an ordinary silence report carries no failure block, so a client can tell 
   assert.equal(body.reason, 'attention');
   assert.equal(body.failure, undefined, 'silence is not a failure reminder');
   assert.match(body.instruction, /No activity has been observed/iu);
+});
+
+test('a host ackFailureEventId is forwarded to the internal observation and never reaches another route', async () => {
+  const ackEventId = 'b'.repeat(16);
+  // The engine answers attention+failure on the first observation, then quiet
+  // (the ack landed on it); the wait returns the FIRST answer unchanged.
+  const { server, seen } = waitFixture([
+    (call) => {
+      assert.equal(call.payload.ackFailureEventId, ackEventId, 'the ack must ride the internal observation');
+      return observation('attention', { task: summary({ state: 'running' }), failure: {
+        kind: 'repeated-tool-failure', eventId: 'c'.repeat(16), toolName: 'bash', failureCode: 'ENOENT',
+        operationDigest: 'a'.repeat(16), consecutive: 3, threshold: 3, firstSeenAt: 1_760_000_000_000,
+      } });
+    },
+    observation('heartbeat'),
+  ], { clock: stillClock() });
+  const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60, ackFailureEventId: ackEventId });
+  assert.equal(body.reason, 'attention');
+  assert.ok(body.failure, 'the answer carries the reminder with its identity');
+  assert.equal(body.failure.eventId, 'c'.repeat(16));
+  const observeCalls = seen.filter((entry) => entry.route === 'observe');
+  assert.equal(observeCalls.length >= 1, true);
+  for (const call of observeCalls) {
+    assert.equal(call.payload.ackFailureEventId, ackEventId, 'every internal observation carries the ack (idempotent)');
+  }
+  // A wrong-typed ack is refused before any observation, as a tool-level error.
+  const bad = waitFixture([observation('heartbeat')], { clock: stillClock() });
+  await bad.server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  const refused = await bad.server.handle({
+    jsonrpc: '2.0', id: 2, method: 'tools/call',
+    params: { name: 'delegate_wait', arguments: { taskId: 'task-wait-1', ackFailureEventId: 7 } },
+  });
+  assert.equal(refused.result.isError, true, 'a non-string ack is a tool error, not an observation');
+  const refusal = JSON.parse(refused.result.content[0].text);
+  assert.equal(refusal.error.code, 'MCP_ARGUMENT_TYPE');
+  assert.equal(bad.seen.filter((entry) => entry.route === 'observe').length, 0, 'no observation was issued');
+});
+
+test('an overlong ackFailureEventId is refused by the schema before any observation', async () => {
+  const { server, seen } = waitFixture([observation('heartbeat')]);
+  await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  const refused = await server.handle({
+    jsonrpc: '2.0', id: 2, method: 'tools/call',
+    params: { name: 'delegate_wait', arguments: { taskId: 'task-wait-1', ackFailureEventId: 'x'.repeat(65) } },
+  });
+  assert.equal(refused.result.isError, true);
+  assert.equal(JSON.parse(refused.result.content[0].text).error.code, 'MCP_ARGUMENT_RANGE');
+  assert.equal(seen.filter((entry) => entry.route === 'observe').length, 0);
+});
+
+test('the wait tool is NOT announced read-only: acknowledging clears reminder state', () => {
+  // The `ackFailureEventId` argument clears the MONITOR'S reminder state — a real
+  // state change even though it never writes the task, decides a permission,
+  // answers a question, stops a run or changes any setting. The annotation must
+  // describe what the tool CAN do, not what a particular call does, so
+  // `readOnlyHint` is false while `destructiveHint` stays false (acknowledging
+  // destroys nothing).
+  const tool = TOOLS.find((entry) => entry.name === 'delegate_wait');
+  assert.equal(tool.annotations.readOnlyHint, false);
+  assert.equal(tool.annotations.destructiveHint, false);
+  const ack = tool.inputSchema.properties.ackFailureEventId;
+  assert.equal(ack.type, 'string');
+  assert.equal(ack.maxLength, 64);
+  assert.equal(ack.minLength, 1, 'an empty ack id is refused, not silently ignored');
+});
+
+test('an old client that never acks sees the SAME reminder redelivered, then a new episode with a new identity', async () => {
+  const failure = (eventId) => ({
+    kind: 'repeated-tool-failure', eventId, toolName: 'bash', failureCode: 'ENOENT',
+    operationDigest: 'a'.repeat(16), consecutive: 3, threshold: 3, firstSeenAt: 1_760_000_000_000,
+  });
+  // Observation 1 and 2 carry the same reminder (no ack arrives — an old client's
+  // behaviour); observation 3 is a new episode with its own identity.
+  const { server } = waitFixture([
+    observation('attention', { task: summary({ state: 'running' }), failure: failure('1'.repeat(16)) }),
+    observation('attention', { task: summary({ state: 'running' }), failure: failure('1'.repeat(16)) }),
+    observation('attention', { task: summary({ state: 'running' }), failure: failure('2'.repeat(16)) }),
+  ], { clock: stillClock() });
+  // First wait: redelivery of the unconfirmed reminder.
+  const first = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
+  assert.equal(first.body.failure.eventId, '1'.repeat(16));
+  // Second wait (old client, no ack): the SAME identity again.
+  const second = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
+  assert.equal(second.body.failure.eventId, '1'.repeat(16), 'an unconfirmed reminder is redelivered to an old client');
+  // The engine then reports a NEW episode: a new identity, delivered without any ack.
+  const third = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
+  assert.equal(third.body.failure.eventId, '2'.repeat(16), 'a new episode is its own notification');
 });
 
 test('attention, failure and cancellation are reported as they are, with the task state deciding terminality', async () => {

@@ -613,6 +613,12 @@ function projectView(view, maxEntryBytes, options = {}) {
     error: errorView(view.error, ctx),
     cancelledBy: label(view.cancelledBy),
     hostAcceptance: acceptance,
+    // The per-task Agent Teams decision (frozen at admission) and what DSH's own service
+    // confirmed for the run. Booleans and a bounded reason string only: `null` means the
+    // dispatcher made no choice, so a restored record can tell "not asked" from "asked",
+    // and "applied" from "asked but unapplied".
+    agentTeams: typeof view.agentTeams === 'boolean' ? view.agentTeams : null,
+    team: teamView(view.team, ctx),
     // A completed job is not an accepted one. This is fixed, never copied.
     selfApproved: false,
   };
@@ -1067,6 +1073,28 @@ function markPermissionInterrupted(entry) {
  * @param {unknown} value - task `activity` block.
  * @returns {object | null} bounded copy, or null when the task never ran.
  */
+/**
+ * Project one run's Agent Teams outcome for storage.
+ *
+ * Allow-list only: three booleans (or null) and one bounded reason. The selection itself
+ * belongs to the DSH Session, not to this record, so nothing here can turn a global
+ * switch on when a record is read back.
+ * @param {unknown} value - run `team` fact.
+ * @param {object} ctx - cut context.
+ * @returns {{ requested: boolean|null, supported: boolean, applied: boolean, enabled: boolean|null, reason: string|null } | null} bounded fact.
+ */
+function teamView(value, ctx) {
+  if (!isPlainObject(value)) return null;
+  return {
+    requested: typeof value.requested === 'boolean' ? value.requested : null,
+    supported: value.supported === true,
+    applied: value.applied === true,
+    enabled: typeof value.enabled === 'boolean' ? value.enabled : null,
+    reason: boundedReason(value.reason, ctx, 'team.reason'),
+  };
+}
+
+/** @param {object} value - activity summary view. @returns {object|null} bounded activity view. */
 function activityView(value) {
   if (!isPlainObject(value)) return null;
   const tool = isPlainObject(value.currentTool) ? value.currentTool : null;
@@ -1509,6 +1537,21 @@ function isPlainObject(value) {
 /** @returns {string | null} bounded label, or null when absent. */
 function label(value) {
   if (typeof value !== 'string' || value === '') return null;
+  return value.slice(0, MAX_LABEL_CHARS);
+}
+
+/**
+ * A short, bounded reason string (a code or a one-line diagnostic), cut once and
+ * the cut stated.
+ * @param {unknown} value - reason.
+ * @param {object} ctx - cut context.
+ * @param {string} field - field label used when the value had to be cut.
+ * @returns {string | null} bounded reason, or null when absent.
+ */
+function boundedReason(value, ctx, field) {
+  if (typeof value !== 'string' || value === '') return null;
+  if (value.length <= MAX_LABEL_CHARS) return value;
+  if (ctx !== null && ctx !== undefined) ctx.fields.add(field);
   return value.slice(0, MAX_LABEL_CHARS);
 }
 

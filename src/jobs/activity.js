@@ -41,7 +41,7 @@
 // The clock is injected (`now`) so tests can simulate twenty minutes of real
 // progress deterministically instead of sleeping.
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { REPEATED_FAILURE_KIND } from './diagnostics.js';
 
 /**
@@ -518,6 +518,16 @@ export class RepeatedFailureTracker {
     const threshold = Number(options.threshold);
     this.threshold = Number.isSafeInteger(threshold) && threshold > 0 ? threshold : 0;
     this.digest = typeof options.digest === 'function' ? options.digest : sha256Hex;
+    // A per-monitor random nonce, folded into every eventId this monitor mints.
+    // Two tasks whose monitors freeze the same clock, run the same tool, the same
+    // operation and the same failure would otherwise hash identical episode
+    // identities to the SAME eventId — and then one task's ack could acknowledge
+    // (and silence) the other task's reminder. The nonce namespaces the event
+    // identity per monitor; it carries no content of its own. SIXTEEN random bytes:
+    // the collision space of two monitors in the same process must be far larger
+    // than any plausible task count, and a smaller nonce would shrink it for no
+    // benefit — the id is 16 hex chars of digest, not of entropy.
+    this.nonce = randomHex16();
     /** callId -> { name, operationDigest } for calls whose result has not arrived yet. */
     this.openCalls = new Map();
     /**
@@ -604,8 +614,15 @@ export class RepeatedFailureTracker {
     this.episode.lastSeenAt = at;
     if (this.episode.reported || this.episode.count < this.threshold) return null;
     this.episode.reported = true;
+    // The stable event identity of THIS reminder. It is a digest of the episode's
+    // own hashed identity and its internal sequence — never the raw arguments,
+    // the error prose or the result body, which exist only as hash input. The
+    // receiver acknowledges THIS id, so a lost answer can be recovered by
+    // replaying exactly this event and an ack can be bound to it precisely.
+    const eventId = this.digest(`event\u0000${this.nonce}\u0000${identity}\u0000${this.episode.sequence}\u0000${this.episode.firstSeenAt}`).slice(0, 16);
     const entry = {
       kind: REPEATED_FAILURE_KIND,
+      eventId,
       toolName: call.name,
       failureCode: code,
       operationDigest: call.operationDigest,
@@ -736,6 +753,15 @@ function sha256Hex(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
+/**
+ * One 32-hex random nonce (16 random bytes), the per-monitor namespace of every
+ * eventId it mints.
+ * @returns {string} 32 lowercase hex characters.
+ */
+function randomHex16() {
+  return randomBytes(16).toString('hex');
+}
+
 /** Why one observation wait ended. */
 export const OBSERVE_REASONS = Object.freeze({
   heartbeat: 'heartbeat',
@@ -825,13 +851,24 @@ export class TaskMonitor {
      */
     this.failures = new RepeatedFailureTracker({ threshold: options.repeatFailureThreshold });
     /**
-     * The one failure reminder waiting to be delivered, or null.
+     * The one failure reminder waiting to be DELIVERED AND ACKNOWLEDGED, or null.
      *
      * A single slot, not a queue: the reminder is about the CURRENT episode, and an
-     * undelivered older one is superseded rather than replayed.
+     * undelivered older one is superseded rather than replayed. Unlike a take-once
+     * claim, this reminder STAYS parked until a receiver acknowledges it by its
+     * `eventId`: the server's having written one answer out is not proof that the
+     * receiver ever read it, and an answer lost on the wire must be recoverable by
+     * the client's own retry — the retry observes the SAME event, not a heartbeat.
      * @type {object | null}
      */
     this.pendingFailure = null;
+    /**
+     * The eventId of the most recently acknowledged reminder, kept so a repeated
+     * (idempotent) ack of a cleared event still answers success, and so an ack
+     * can be checked against what this monitor actually delivered.
+     * @type {string | null}
+     */
+    this.ackedEventId = null;
     /** Episode identity: bumped whenever genuine activity ends the idle episode. */
     this.episode = 0;
     /** The episode the self-check already ran for, or null. */
@@ -923,20 +960,64 @@ export class TaskMonitor {
   /**
    * Take the failure reminder that is waiting to be delivered, if any.
    *
-   * Claimed once, like the attention latch: the diagnostic reaches exactly one
-   * observation, so a run is not woken on every subsequent identical failure. A reminder
-   * whose episode has ended or changed since it was parked is DROPPED rather than
-   * delivered: the run already recovered or moved on, so it is history, not news.
-   * @returns {object | null} the diagnostic, or null.
+   * The reminder is NOT consumed here: it stays parked until it is acknowledged by
+   * its `eventId` through {@link ackFailureReport}. That is what makes a lost HTTP
+   * answer recoverable — the client's retry observes the same reminder again,
+   * because the server's having generated one answer proves nothing about what the
+   * receiver got. A reminder whose episode has ended or changed since it was parked
+   * is DROPPED rather than delivered: the run already recovered or moved on, so it
+   * is history, not news. Every observation returns the SAME event (same `eventId`),
+   * so one repeated failure is one notification identity, never several.
+   * @returns {object | null} the published diagnostic, or null.
    */
   claimFailureReport() {
     const report = this.pendingFailure;
-    this.pendingFailure = null;
     if (!this.failures.isCurrent(report)) return null;
     // Published form: the internal episode sequence does not leave this module.
     const { episodeSequence, ...published } = report;
     void episodeSequence;
     return published;
+  }
+
+  /**
+   * Acknowledge one delivered failure reminder by its exact event identity.
+   *
+   * The ack is bound to what THIS monitor parked: a matching `eventId` clears the
+   * reminder, a second ack of the same (now cleared) event is an idempotent
+   * success, and anything else — an unknown id, a stale one, garbage — leaves the
+   * pending reminder untouched. A NEW episode keeps parking its own reminder, so
+   * clearing one event can never silence the next notification.
+   * @param {unknown} eventId - the `eventId` the receiver observed.
+   * @returns {{ acknowledged: boolean, eventId: string | null, reason: string | null }} ack result.
+   */
+  ackFailureReport(eventId) {
+    const requested = typeof eventId === 'string' && eventId !== '' ? eventId : null;
+    let result;
+    if (requested === null) {
+      result = { acknowledged: false, eventId: null, reason: 'event-id-required' };
+    } else if (requested === this.ackedEventId) {
+      // Idempotent: the receiver repeats an ack that already landed.
+      result = { acknowledged: true, eventId: requested, reason: null };
+    } else {
+      const report = this.pendingFailure;
+      if (report === null || report.eventId !== requested) {
+        // Wrong, unknown or stale id. The pending reminder (if any) is NOT cleared:
+        // a bad ack must not silence a live notification.
+        result = { acknowledged: false, eventId: requested, reason: 'unknown-event' };
+      } else if (!this.failures.isCurrent(report)) {
+        // The episode ended before the ack arrived (recovery, or a different
+        // failure took over). The reminder is dropped here — it was superseded,
+        // and a late ack must not resurrect it — but it is honest that nothing
+        // pending was acknowledged.
+        this.pendingFailure = null;
+        result = { acknowledged: false, eventId: requested, reason: 'superseded' };
+      } else {
+        this.pendingFailure = null;
+        this.ackedEventId = requested;
+        result = { acknowledged: true, eventId: requested, reason: null };
+      }
+    }
+    return { ...result };
   }
 
   /**
@@ -1114,6 +1195,7 @@ export class TaskMonitor {
         // a stored record or a client.
         reported: this.failures.reported.map((entry) => ({
           kind: entry.kind,
+          eventId: entry.eventId,
           toolName: entry.toolName,
           failureCode: entry.failureCode,
           operationDigest: entry.operationDigest,
@@ -1290,6 +1372,7 @@ export class TaskMonitor {
     // trail stays as bounded evidence. The undelivered reminder is dropped with it.
     this.failures.dispose();
     this.pendingFailure = null;
+    this.ackedEventId = null;
     this.releaseWaiters();
   }
 }

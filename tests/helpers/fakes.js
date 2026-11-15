@@ -50,6 +50,10 @@ export async function nativePolicyServices(services = {}) {
     sessionProjections: registry,
     sandboxPolicy: services.sandboxPolicy === undefined ? sandboxPolicy : services.sandboxPolicy,
     approval: services.approval === undefined ? approval : services.approval,
+    // The DSH Agent Teams service is optional by design: a harness that does not compose
+    // it reports `undefined`, which is exactly the "requested but unavailable" case. A
+    // test may pass a recording double under `services.agentTeams`.
+    ...(services.agentTeams === undefined ? {} : { agentTeams: services.agentTeams }),
   };
 }
 

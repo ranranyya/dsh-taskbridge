@@ -47,7 +47,7 @@
 // beyond `@deepseek-ai/*` platform modules, which is why the native loader can
 // resolve every external against its frozen platform table.
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 import {
   CONNECTIVITY_LAYERS,
@@ -87,7 +87,6 @@ import {
   formatDuration,
   hostReviewLine,
   RECORD_REFRESH_INTERVAL_MS,
-  REVIEW_NOTE_PREVIEW_CHARS,
   recordRefreshPlan,
   reviewNotePreview,
   hasChangingRecords,
@@ -617,11 +616,11 @@ function ProviderEditor({ provider, store, snapshot, index }) {
   const fetched = snapshot.modelCatalog?.[providerId] ?? null;
   const models = provider.models ?? [];
 
-  const editProvider = useCallback((mutate) => {
+  const editProvider = useCallback((mutate, editOptions) => {
     store.editDraft((draft) => {
       const target = draft.providers.find((entry) => entry.id === providerId);
       if (target !== undefined) mutate(target);
-    });
+    }, editOptions);
   }, [store, providerId]);
 
   const selectedModel = models.find((entry) => entry.id === checkModel) ?? null;
@@ -678,7 +677,7 @@ function ProviderEditor({ provider, store, snapshot, index }) {
           <select
             id={`dshdg-p${index}-protocol`}
             value={provider.protocol}
-            onChange={(event) => editProvider((target) => { target.protocol = event.target.value; })}
+            onChange={(event) => editProvider((target) => { target.protocol = event.target.value; }, { immediate: true })}
           >
             {SUPPORTED_PROTOCOLS.map((protocol) => (
               <option key={protocol} value={protocol}>OpenAI 兼容 Chat Completions（{protocol}）</option>
@@ -1467,7 +1466,6 @@ function MonitoringCard({ store, snapshot }) {
   // immediately re-render as the documented default, hiding the edit.
   const raw = monitoringDraftOf(draft);
   const saved = monitoringOf(snapshot.settings);
-  const [saving, setSaving] = useState(false);
   const problems = precheckMonitoring(raw);
   const dirty = raw.selfCheckSeconds !== saved.selfCheckSeconds
     || raw.attentionSeconds !== saved.attentionSeconds
@@ -1575,29 +1573,15 @@ function MonitoringCard({ store, snapshot }) {
         <li>修改只影响<strong>之后新提交</strong>的任务；已经运行的任务保留它开始时的那份间隔快照。</li>
         <li>程序自检只读取本机已有的事实（任务是否还在、当前阶段、有没有待决定的调用、正在跑哪个工具），不读取代码差异，也不会读取你的文件内容。</li>
       </ul>
-      <div className="dshdg-row">
-        <button
-          type="button"
-          disabled={!dirty || saving || snapshot.loading?.monitoring === true || problems.length > 0}
-          onClick={async () => {
-            setSaving(true);
-            try {
-              // Send exactly what was validated. The button is disabled while
-              // `problems` is non-empty, so this is a well-formed block by construction.
-              await store.saveMonitoring(monitoringDraftOf(draft));
-            } finally {
-              setSaving(false);
-            }
-          }}
-        >
-          {snapshot.loading?.monitoring === true || saving ? '保存中…' : '只保存监控间隔'}
-        </button>
-        <span className="dshdg-hint">
-          {dirty ? '与已保存的值不同。' : `已保存：自检 ${saved.selfCheckSeconds} 秒，提醒 ${saved.attentionSeconds} 秒。`}
+      <div className="dshdg-row" data-dshdg-monitoring-status="">
+        <span className="dshdg-hint" role="status" aria-live="polite">
+          {dirty
+            ? '与已保存的值不同，正在自动保存（与整份设置走同一个串行保存队列）。'
+            : `已保存：自检 ${saved.selfCheckSeconds} 秒，提醒 ${saved.attentionSeconds} 秒。`}
         </span>
       </div>
       <p className="dshdg-hint">
-        也可以点页面底部的「保存设置」一起保存；保存的是同一个设置文档。
+        这几项也是整份设置文档的一部分，随其它设置一起自动保存；没有单独的保存按钮。
       </p>
     </div>
   );
@@ -1623,11 +1607,13 @@ function ExecutionPanel({ store, snapshot }) {
         idPrefix="dshdg-worker"
         value={{ providerId: worker.providerId ?? null, model: worker.model ?? null, reasoningEffort: worker.reasoningEffort ?? null }}
         onChange={(next) => {
+          // Provider / model / effort are SELECTS: each change is one discrete
+          // decision, so it is saved at once instead of waiting out the text debounce.
           store.editDraft((current) => {
             current.worker.providerId = next.providerId;
             current.worker.model = next.model;
             current.worker.reasoningEffort = next.reasoningEffort;
-          });
+          }, { immediate: true });
         }}
       />
       <div className="dshdg-grid">
@@ -1658,7 +1644,9 @@ function ExecutionPanel({ store, snapshot }) {
             id="dshdg-worker-isolation"
             value={worker.isolation ?? ISOLATION_MODES[0]}
             onChange={(event) => {
-              store.editDraft((current) => { current.worker.isolation = event.target.value; });
+              // A SELECT is one discrete decision: save it at once instead of waiting
+              // for the text debounce.
+              store.editDraft((current) => { current.worker.isolation = event.target.value; }, { immediate: true });
             }}
           >
             {ISOLATION_MODES.map((mode) => (
@@ -1733,7 +1721,8 @@ function ReviewPanel({ store, snapshot }) {
               type="checkbox"
               checked={enabled}
               onChange={(event) => {
-                store.editDraft((current) => { current.review.enabled = event.target.checked; });
+                // A SWITCH is one discrete decision: save it at once.
+                store.editDraft((current) => { current.review.enabled = event.target.checked; }, { immediate: true });
               }}
             />
             {' '}启用附加模型审查（默认关闭）
@@ -1761,11 +1750,12 @@ function ReviewPanel({ store, snapshot }) {
             reasoningEffort: review.reasoningEffort ?? null,
           }}
           onChange={(next) => {
+            // Review provider/model/effort are SELECTS: saved at once.
             store.editDraft((current) => {
               current.review.providerId = next.providerId;
               current.review.model = next.model;
               if ('reasoningEffort' in next) current.review.reasoningEffort = next.reasoningEffort;
-            });
+            }, { immediate: true });
           }}
         />
       ) : (
@@ -1784,19 +1774,54 @@ function ReviewPanel({ store, snapshot }) {
  *
  * The note itself is never shortened — the list shows a preview, this shows the whole text —
  * and a copy that fails says so instead of pretending the clipboard holds it.
- * @param {object} props - `task`.
+ *
+ * A COMPACT answer (`noteOmitted`) carries the length but not the body. That case used to
+ * dead-end in a sentence that told the operator to read the note "somewhere", with no way
+ * to do it — the "查看完整审查意见" click appeared to do nothing. It now reads the whole
+ * task through the store and shows the body, with the loading and refusal states visible.
+ * @param {object} props - `task`, `store`.
  * @returns {object} the detail control.
  */
-function ReviewNoteDetail({ task }) {
-  const [open, setOpen] = useState(false);
+function ReviewNoteDetail({ task, store }) {
   const [copyState, setCopyState] = useState(null);
+  const [readState, setReadState] = useState('idle');
   const preview = reviewNotePreview(task);
+  const noteBody = typeof task?.hostAcceptance?.note === 'string' ? task.hostAcceptance.note : '';
+  /**
+   * Read the whole task so a compact answer's omitted note becomes readable here.
+   * @returns {Promise<void>} resolves after the read (the store publishes the result).
+   */
+  const readFull = async () => {
+    if (store === undefined || store === null || preview === null) return;
+    setReadState('loading');
+    const outcome = await store.openTask(task.taskId);
+    setReadState(outcome?.ok === true ? 'loaded' : 'failed');
+  };
   if (preview === null) return '未记录（插件不会自行验收）';
   if (preview.omitted === true) {
-    return `审查意见已保存（${preview.chars} 字符），当前读取结果省略正文；可在结果详情中按需读取全文。`;
+    // The body is not in this task object. `store.openTask` fetches the full task, whose
+    // `hostAcceptance.note` is the whole text; the same object is re-read on the next
+    // render because the page subscribes to the store.
+    return (
+      <div className="dshdg-note" data-dshdg-note-omitted="">
+        <div className="dshdg-row">
+          <span className="dshdg-hint">{`审查意见已保存（${preview.chars} 字符），此处省略正文。`}</span>
+          <span className="dshdg-spacer" />
+          <button type="button" disabled={readState === 'loading'} onClick={() => { void readFull(); }}>
+            {readState === 'loading' ? '读取中…' : '读取完整正文'}
+          </button>
+        </div>
+        {readState === 'failed' ? (
+          <p className="dshdg-warn">
+            {`读取完整审查意见失败（${describeError(store?.getSnapshot?.().taskDetailError ?? null)}）。可再点一次重试。`}
+          </p>
+        ) : null}
+        {readState === 'loading' ? <p className="dshdg-hint">正在读取完整审查意见…</p> : null}
+      </div>
+    );
   }
   if (preview.chars === 0) return '（无审查意见正文）';
-  const full = typeof task?.hostAcceptance?.note === 'string' ? task.hostAcceptance.note : '';
+  const full = noteBody;
   const copy = () => {
     const clipboard = globalThis.navigator?.clipboard;
     if (typeof clipboard?.writeText !== 'function') {
@@ -1809,19 +1834,16 @@ function ReviewNoteDetail({ task }) {
     );
   };
   return (
-    <div className="dshdg-note">
+    // The FULL body is rendered in one step: no second "展开全文" click. The operator
+    // already asked for the whole note by opening the detail from that button.
+    <div className="dshdg-note" data-dshdg-note-full="">
       <div className="dshdg-row">
         <span className="dshdg-hint">{preview.chars} 字符</span>
         <span className="dshdg-spacer" />
-        {preview.chars > REVIEW_NOTE_PREVIEW_CHARS ? (
-          <button type="button" onClick={() => setOpen(!open)}>{open ? '收起' : '展开全文'}</button>
-        ) : null}
         <button type="button" onClick={copy}>复制全文</button>
       </div>
       {copyState === null ? null : <p className="dshdg-hint">{copyState}</p>}
-      {open || preview.chars <= REVIEW_NOTE_PREVIEW_CHARS
-        ? <pre className="dshdg-mono dshdg-note-full">{full}</pre>
-        : <pre className="dshdg-mono dshdg-note-preview">{`${preview.text}…`}</pre>}
+      <pre className="dshdg-mono dshdg-note-full">{full}</pre>
     </div>
   );
 }
@@ -1949,7 +1971,7 @@ function TaskDetail({ store, task }) {
         <dt>宿主验收</dt>
         <dd>{hostReviewLine(task, formatTime)}</dd>
         <dt>完整审查意见</dt>
-        <dd><ReviewNoteDetail key={task.taskId} task={task} /></dd>
+        <dd><ReviewNoteDetail key={task.taskId} task={task} store={store} /></dd>
       </dl>
 
       <h4>改动文件</h4>
@@ -2129,6 +2151,41 @@ function useTaskAutoRefresh({ store, snapshot, intervalMs = RECORD_REFRESH_INTER
 }
 
 /**
+ * The one line that tells the operator what the automatic save is doing.
+ *
+ * A failure is never hidden behind "已保存": the refusals are shown verbatim (the host
+ * is the authority, and the local precheck names the exact field), and an invalid
+ * draft says plainly that the LAST VALID document is still in force.
+ * @param {object} snapshot - store snapshot.
+ * @param {string[]} problems - current local precheck problems.
+ * @returns {string} operator-facing status line.
+ */
+function autosaveLine(snapshot, problems) {
+  const state = snapshot.saveState ?? 'idle';
+  const problemText = problems.length === 0
+    ? ''
+    : ` 待修正：${problems[0]}${problems.length > 1 ? ` 等 ${problems.length} 项` : ''}`;
+  switch (state) {
+    case 'saving':
+      return '保存中…';
+    case 'saved':
+      return '已保存。';
+    case 'invalid':
+      return `未保存：${(snapshot.saveProblems ?? problems).slice(0, 2).join('；')}。上次有效配置仍然生效。${problemText}`;
+    case 'failed': {
+      const described = snapshot.saveError === null || snapshot.saveError === undefined
+        ? '未知错误'
+        : describeError(snapshot.saveError);
+      return `保存失败：${described}。草稿已保留，可继续修正或重试。${problemText}`;
+    }
+    case 'pending':
+      return snapshot.dirty === true ? '有改动，准备保存…' : '所有修改已保存。';
+    default:
+      return snapshot.dirty === true ? '有未保存的修改。' : '所有修改已保存。';
+  }
+}
+
+/**
  * The review-note preview of one task row: at most 200 code points, plus a clear way to
  * read the whole note. The preview is a display cut; the saved body is untouched.
  * @param {object} props - `task`, `onOpen`.
@@ -2161,6 +2218,27 @@ function TasksPanel({ store, snapshot }) {
   const detail = snapshot.taskDetail;
   const plan = useTaskAutoRefresh({ store, snapshot });
   const liveCount = tasks.filter(isLiveTask).length;
+  const detailRef = useRef(null);
+  // The dependency is the count of SUCCESSFUL opens, not the task object: a background
+  // list refresh recomposes `taskDetail` (same task, merged row) and must NOT steal the
+  // operator's focus. A first open, a repeat open of the SAME task and a switch to a
+  // DIFFERENT task each bump the counter, so each one focuses and scrolls.
+  const detailView = snapshot.taskDetailView ?? 0;
+  useLayoutEffect(() => {
+    if (detailView === 0) return;
+    const node = detailRef.current;
+    if (node === null || node === undefined) return;
+    try {
+      node.focus({ preventScroll: true });
+    } catch {
+      // A non-focusable environment (or a test double) is not a reason to break render.
+    }
+    try {
+      node.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+    } catch {
+      // Scrolling is best-effort; focus already moved the operator's reading point.
+    }
+  }, [detailView]);
   const changing = hasChangingRecords([
     ...tasks,
     ...(detail === null || detail === undefined ? [] : [detail]),
@@ -2184,6 +2262,27 @@ function TasksPanel({ store, snapshot }) {
           自动刷新失败（{String(plan.refreshError)}），下面仍是上次读取的内容；可点“刷新”重试。
         </p>
       ) : null}
+      {snapshot.taskDetailError !== null && snapshot.taskDetailError !== undefined ? (
+        <p className="dshdg-warn" role="alert">
+          {`打开任务详情失败：${describeError(snapshot.taskDetailError)}。可再点一次“详情”重试。`}
+        </p>
+      ) : null}
+      {detail === null && snapshot.taskDetailLoading === true ? (
+        <p className="dshdg-hint" role="status">正在读取任务详情…</p>
+      ) : null}
+      {/* The open detail sits ABOVE the list: it is the answer to the click, and burying
+          it under a long list made the click look like it did nothing. It is focusable
+          and takes focus + scroll when it (re)appears. */}
+      {detail === null ? null : (
+        <div
+          ref={detailRef}
+          tabIndex={-1}
+          data-dshdg-task-detail=""
+          aria-label="任务详情"
+        >
+          <TaskDetail store={store} task={detail} />
+        </div>
+      )}
       {tasks.length === 0 ? <p className="dshdg-faint">还没有任务记录。</p> : (
         <div className="dshdg-list">
           {tasks.map((task) => {
@@ -2212,10 +2311,12 @@ function TasksPanel({ store, snapshot }) {
                   <span className="dshdg-faint">{formatTime(task.createdAt)}</span>
                   <button
                     type="button"
-                    disabled={snapshot.loading?.taskDetail === true}
+                    disabled={snapshot.taskDetailLoading === true}
                     onClick={() => { void store.openTask(task.taskId); }}
                   >
-                    详情
+                    {snapshot.taskDetailLoading === true && snapshot.taskDetail?.taskId !== task.taskId
+                      ? '读取中…'
+                      : '详情'}
                   </button>
                   <button
                     type="button"
@@ -2236,7 +2337,6 @@ function TasksPanel({ store, snapshot }) {
           })}
         </div>
       )}
-      {detail === null ? null : <TaskDetail store={store} task={detail} />}
       <p className="dshdg-faint">{`状态集合：${TASK_STATES.map(taskStateLabel).join(' / ')}`}</p>
     </div>
   );
@@ -2401,7 +2501,6 @@ export function DelegateConfigPage(props) {
     useCallback(() => store.getSnapshot(), [store]),
   );
   const [tab, setTab] = useState(TABS[0].key);
-  const [saving, setSaving] = useState(false);
   const loaded = useRef(false);
 
   useEffect(() => {
@@ -2467,37 +2566,22 @@ export function DelegateConfigPage(props) {
         {tab === 'codex' ? <CodexPanel store={store} snapshot={snapshot} /> : null}
       </div>
 
-      <div className="dshdg-row">
-        <span className="dshdg-hint">
-          {snapshot.dirty === true ? '有未保存的修改。' : '所有修改已保存。'}
-          {problems.length === 0 ? '' : ` 待修正：${problems[0]}${problems.length > 1 ? ` 等 ${problems.length} 项` : ''}`}
+      <div className="dshdg-row" data-dshdg-autosave="">
+        <span className="dshdg-hint" role="status" aria-live="polite">
+          {autosaveLine(snapshot, problems)}
         </span>
         <span className="dshdg-spacer" />
         <button
           type="button"
           disabled={snapshot.dirty !== true || snapshot.loading?.save === true}
+          title={snapshot.loading?.save === true ? '正在保存，稍后可放弃修改' : undefined}
           onClick={() => { store.resetDraft(); }}
         >
           放弃修改
         </button>
-        <button
-          type="button"
-          className="dshdg-primary"
-          disabled={snapshot.dirty !== true || snapshot.loading?.save === true || saving}
-          onClick={async () => {
-            setSaving(true);
-            try {
-              await store.saveSettings();
-            } finally {
-              setSaving(false);
-            }
-          }}
-        >
-          {snapshot.loading?.save === true || saving ? '保存中…' : '保存设置'}
-        </button>
       </div>
       <p className="dshdg-faint">
-        保存会整体替换设置文档；正在运行的任务保留它自己的快照。密钥从不随设置保存或导出。
+        修改会自动保存：开关与下拉立即保存，文本输入停顿后合并保存。保存会整体替换设置文档；正在运行的任务保留它自己的快照。密钥从不随设置保存或导出。
       </p>
     </div>
   );
