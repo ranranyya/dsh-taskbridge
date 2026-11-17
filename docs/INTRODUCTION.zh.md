@@ -56,7 +56,7 @@ dsh-taskbridge
 也可以指定本次版本：
 
 ```text
-dsh-taskbridge@1.5.2
+dsh-taskbridge@1.5.3
 ```
 
 安装后启用 **DSH TaskBridge**，进入该插件的设置页面。若使用的区域镜像尚未同步新版本，可切换到 npm 官方源；本项目 GitHub Release 也提供 `.tgz` 安装包。
@@ -260,7 +260,8 @@ TaskBridge 自身无需 dsh-crew。执行任务使用的项目依赖仍按任务
 | [会话放置与续接](conversation-placement.md) | DSH 工作区命名、会话创建和同任务续接。 |
 | [插件发现与更新](plugin-market.md) | 自定义索引、npm 与 GitHub 安装来源。 |
 | [旧名称迁移](taskbridge-upgrade.md) | 从 DSH Delegate / TaskDispatch 升级。 |
-| [1.5.2 更新说明](releases/1.5.2.zh.md) | 本次介绍更新的内容与验证范围。 |
+| [1.5.3 更新说明](releases/1.5.3.zh.md) | 验收展示、全文排版、混合换行修复与指挥规则更新。 |
+| [1.5.2 更新说明](releases/1.5.2.zh.md) | 产品介绍更新及验证范围。 |
 
 本插件不按 DSH 版本白名单筛选，所需接口按运行时实际能力检查；具体说明见 [运行时说明](runtime-compatibility.md)。CLI 独立执行通道及所有运行环境组合尚未完成，已知限制见 [1.5.1 说明](releases/1.5.1.zh.md)。
 

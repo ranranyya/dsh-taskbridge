@@ -281,9 +281,13 @@ test('plugin startup refreshes exact shipped Codex agents and leaves unknown fil
   const prior = readFileSync(new URL('./fixtures/codex-agent-0.1.7.toml', import.meta.url), 'utf8')
     .replace(/\r?\n/gu, '\r\n');
   const current = readFileSync(new URL('../codex/dsh-taskbridge.toml', import.meta.url), 'utf8');
+  // The managed agent is WRITTEN with LF terminators (`renderAgentFile` folds the template's
+  // CRLF spelling); the migration's product is those exact LF bytes, so the expectation is
+  // the rendered form, not the template file's own spelling.
+  const currentRendered = current.replace(/\r\n/gu, '\n');
 
   for (const entry of [
-    { name: 'known', contents: prior, expected: current },
+    { name: 'known', contents: prior, expected: currentRendered },
     { name: 'edited', contents: `${prior}# operator note\r\n`, expected: `${prior}# operator note\r\n` },
   ]) {
     const codexHome = mkdtempSync(join(tmpdir(), `dsh-delegate-codex-${entry.name}-`));

@@ -1,5 +1,7 @@
 # DSH TaskBridge
 
+> 当前版本：**1.5.3**。本次小更新修复验收摘要、完整审查意见排版与 Codex 模板混合换行识别，并加入指挥端规划和按需拆单规则。详见[更新说明](docs/releases/1.5.3.zh.md)。
+
 **让 Codex 指挥 DSH 工作，在 DSH 插件里选择执行所用的 API、模型和思考强度。**
 
 > **当前支持 Codex 端。Claude Code 与 Claude Desktop 接入预计在 2.0 版本上线。**
@@ -56,7 +58,7 @@ dsh-taskbridge
 也可以指定本次版本：
 
 ```text
-dsh-taskbridge@1.5.2
+dsh-taskbridge@1.5.3
 ```
 
 安装后启用 **DSH TaskBridge**，进入该插件的设置页面。若使用的区域镜像尚未同步新版本，可切换到 npm 官方源；本项目 GitHub Release 也提供 `.tgz` 安装包。
@@ -260,7 +262,8 @@ TaskBridge 自身无需 dsh-crew。执行任务使用的项目依赖仍按任务
 | [会话放置与续接](docs/conversation-placement.md) | DSH 工作区命名、会话创建和同任务续接。 |
 | [插件发现与更新](docs/plugin-market.md) | 自定义索引、npm 与 GitHub 安装来源。 |
 | [旧名称迁移](docs/taskbridge-upgrade.md) | 从 DSH Delegate / TaskDispatch 升级。 |
-| [1.5.2 更新说明](docs/releases/1.5.2.zh.md) | 本次介绍更新的内容与验证范围。 |
+| [1.5.3 更新说明](docs/releases/1.5.3.zh.md) | 验收展示、全文排版、混合换行修复与指挥规则更新。 |
+| [1.5.2 更新说明](docs/releases/1.5.2.zh.md) | 产品介绍更新及验证范围。 |
 
 本插件不按 DSH 版本白名单筛选，所需接口按运行时实际能力检查；具体说明见 [运行时说明](docs/runtime-compatibility.md)。CLI 独立执行通道及所有运行环境组合尚未完成，已知限制见 [1.5.1 说明](docs/releases/1.5.1.zh.md)。
 
@@ -300,13 +303,13 @@ profile 是**应用保留的**：npm / `dsh plugin` CLI 对该 profile 的操作
 Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式 profile 里执行 npm/pnpm
 命令，也不要直接编辑其中的文件。
 
-1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.5.2`**。
+1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.5.3`**。
    若中国大陆镜像尚未同步，先选择 npm 官方源再重试。安装后的显示名为 **DSH TaskBridge**。
    也可以从本项目 Release 下载 `.tgz`，或在仓库根目录打包：
 
    ```bash
    npm pack
-   #    → dsh-taskbridge-1.5.2.tgz
+   #    → dsh-taskbridge-1.5.3.tgz
    ```
 
 2. 使用本地包时，通过 **添加插件**入口选择下载或生成的 `.tgz`（或本仓库目录）完成安装。
@@ -320,7 +323,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-taskbridge-1.5.2.tgz && dsh plugin --profile web why dsh-taskbridge
+dsh plugin --profile web add ./dsh-taskbridge-1.5.3.tgz && dsh plugin --profile web why dsh-taskbridge
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -333,7 +336,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.5.2.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.5.3.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -768,7 +771,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-taskbridge-1.5.2.tgz
+dsh plugin --profile web add ./dsh-taskbridge-1.5.3.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings

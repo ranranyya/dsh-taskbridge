@@ -1560,23 +1560,37 @@ export function hostReviewBadge(task) {
 }
 
 /**
- * A task's recorded review conclusion as one bounded display line.
+ * A task's recorded review conclusion as one SHORT display line.
  *
- * Only a short note and the time are shown: the stored note is already redacted, and
- * nothing else about the review exists.
+ * This line carries the conclusion and its time — nothing else. The note BODY deliberately
+ * does not appear here: this row sits beside the detail's own "完整审查意见" block, which
+ * renders the saved text whole. Splicing a bounded cut of it in here produced a second,
+ * truncated copy that read as if the stored text itself had been cut (the misleading
+ * "已截断" line G10 fixes).
+ *
+ * The wording comes from `taskOutcome(...)` and only from there, so this row can never
+ * claim a conclusion the headline contradicts — notably `accepted: true` with a review
+ * record that is not durable yet (a save in flight, a timed-out unconfirmed write, a
+ * failed one). A record written before `reviewPersistence` existed keeps the old
+ * compatibility meaning (stored), which is again exactly what `taskOutcome` decides.
  * @param {object} task - task view.
  * @param {(at: number) => string} formatTime - time formatter from the page.
  * @returns {string} display text.
  */
 export function hostReviewLine(task, formatTime) {
+  const outcome = taskOutcome(task);
   const acceptance = task?.hostAcceptance;
-  if (acceptance === null || acceptance === undefined) return '未记录（插件不会自行验收）';
-  const label = acceptance.accepted === true ? '审查通过' : '需要修正';
+  if (acceptance === null || acceptance === undefined) {
+    // Nothing recorded. A write that is pending or already failed is its own state, and
+    // `taskOutcome` has already named it — repeating that here would say it twice.
+    const persistence = task?.reviewPersistence;
+    if (persistence?.pending === true || persistence?.state === 'failed') return outcome.label;
+    return '未记录（插件不会自行验收）';
+  }
   const at = typeof acceptance.acceptedAt === 'number' ? `（${formatTime(acceptance.acceptedAt)}）` : '';
-  const note = typeof acceptance.note === 'string' && acceptance.note !== ''
-    ? `：${boundedText(acceptance.note, 200)}`
-    : '';
-  return `${label}${at}${note}`;
+  // Only a CONFIRMED record is described as saved; an unconfirmed write keeps its own
+  // label and never borrows this suffix.
+  return outcome.decided ? `${outcome.label}${at}（结论已保存）` : `${outcome.label}${at}`;
 }
 
 /**

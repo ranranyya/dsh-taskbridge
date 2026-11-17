@@ -1,6 +1,6 @@
 # Runtime compatibility
 
-Build 1.5.2 retains the loading policy introduced in 1.4.2: **no DSH version whitelist**: it omits `engines.dsh`, declares
+Build 1.5.3 retains the loading policy introduced in 1.4.2: **no DSH version whitelist**: it omits `engines.dsh`, declares
 host-provided `@deepseek-ai/dsh-*` peers as `*`, and publishes no DSH engine range
 in the custom plugin index. The plugin uses runtime capability checks rather than
 rejecting a host solely by its version number. Node.js `>=24` is still required.

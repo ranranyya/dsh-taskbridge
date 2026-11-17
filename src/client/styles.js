@@ -209,9 +209,42 @@ export const CSS_TEXT = `
 .dshdg-fail { color: var(--dsw-alias-label-error, #d92d20); }
 .dshdg-unknown { color: var(--dsw-alias-label-tertiary, #8a9098); }
 .dshdg-table { display: grid; gap: 4px; }
-.dshdg-kv { display: grid; grid-template-columns: minmax(96px, 140px) minmax(0, 1fr); gap: 4px 10px; }
+.dshdg-kv {
+  display: grid;
+  grid-template-columns: minmax(96px, 140px) minmax(0, 1fr);
+  gap: 4px 10px;
+  min-width: 0;
+}
 .dshdg-kv dt { color: var(--dsw-alias-label-secondary, #61666d); }
-.dshdg-kv dd { margin: 0; overflow-wrap: anywhere; }
+.dshdg-kv dd {
+  margin: 0;
+  /* A grid item defaults to min-width: auto, i.e. "at least as wide as my longest
+     unbreakable run" — the single place that pushed a long review note past the panel. */
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* A recorded review note: shown whole, wrapped inside its own track, never clipped.
+   pre-wrap keeps every paragraph break and every space the host stored; anywhere breaks a
+   long unbroken run (a path, a URL, 270 code points of Chinese with no spaces). Nothing
+   here shortens, hides or line-clamps the body: the block keeps its natural height. */
+.dshdg-note {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.dshdg-note-full {
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.dshdg-note-preview {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 @media (max-width: 560px) {
   .dshdg-layer, .dshdg-kv { grid-template-columns: minmax(0, 1fr); }
 }

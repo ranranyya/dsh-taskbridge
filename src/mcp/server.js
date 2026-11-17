@@ -289,7 +289,11 @@ export const TOOLS = Object.freeze([
       + 'reuses that task\u2019s recorded execution checkout and DSH Session internally, taking no execution '
       + 'location from '
       + 'the caller. An unknown, unfinished, removed or differently-sourced parent is refused rather than '
-      + 'started as a new conversation.',
+      + 'started as a new conversation. '
+      + 'The commander must first plan and scope ONE cohesive, independently verifiable work packet. '
+      + 'Split a separable multi-stage goal before dispatch; include the chosen approach, scope and acceptance '
+      + 'checks. A simple complete task may use one packet. Rules, planning and final review remain with '
+      + 'the commander; a verification-only packet does not authorize implementation changes.',
     // It creates work, so it is not a read; it is not destructive of anything the
     // operator already has, and repeating it creates ANOTHER task (never idempotent).
     annotations: Object.freeze({
@@ -314,7 +318,7 @@ export const TOOLS = Object.freeze([
             + 'an execution.workspacePath or any other internal execution location in its place, because a '
             + 'different source path names a different repository and the continuation is refused.',
         },
-        prompt: { type: 'string', description: 'The task to perform.' },
+        prompt: { type: 'string', description: 'One commander-planned work packet: objective, chosen approach, owned files or modules, constraints and acceptance checks. Roadmap context does not authorize future packets. A verification-only assignment permits checks and evidence, not implementation edits.' },
         title: { type: 'string', maxLength: 120, description: 'Short work-content title in the operator\'s language, e.g. 修复登录错误. Used to name the new DSH Workspace; omit role instructions and task ids. A follow-up keeps its existing Workspace name.' },
         overrides: {
           type: 'object',

@@ -675,7 +675,11 @@ test('the UI distinguishes accepted, changes-requested and still-waiting', () =>
   assert.equal(hostReviewBadge(accepted).label, '审查通过');
   assert.equal(taskOutcome(accepted).accepted, true);
   assert.match(hostReviewLine(accepted, () => 'T'), /审查通过/u);
-  assert.match(hostReviewLine(accepted, () => 'T'), /fine/u);
+  // The row states the conclusion, its time and that the conclusion is stored. The note
+  // BODY belongs to the "完整审查意见" block, which shows it whole: a 200-code-point cut
+  // here used to read as if the stored note itself had been truncated (G10).
+  assert.equal(hostReviewLine(accepted, () => 'T'), '审查通过（T）（结论已保存）');
+  assert.equal(hostReviewLine(accepted, () => 'T').includes('fine'), false, 'the row carries no note body');
 
   // The bug that made every object look accepted: `changes-requested` is an object too.
   const rejected = {

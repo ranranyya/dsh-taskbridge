@@ -8,12 +8,18 @@
 //   1. `$CODEX_HOME/agents/dsh-taskbridge.toml` — a *managed copy* of the shipped
 //      template `codex/dsh-taskbridge.toml`. Ownership is proved by content, never by
 //      the file name or a version line alone:
-//        * a file that is byte-identical to the template this build would write is
-//          `installed` (and removable);
-//        * a file that matches one of the *known prior shipped templates* in
-//          {@link KNOWN_AGENT_TEMPLATES} byte for byte is `outdated` (refreshable and
-//          removable) — a conservative, enumerated list, not a heuristic;
+//        * a file that is the same text as the template this build would write is
+//          `installed` (and removable). "Same text" admits exactly one difference: CRLF
+//          versus LF line terminators (including a mixed spelling of the same lines).
+//          Nothing else is normalized — a version line, a comment, a blank line, a
+//          trailing space, a tab, a BOM or a lone CR all still make a file different;
+//        * a file that is the same text as one of the *known prior shipped templates* in
+//          {@link KNOWN_AGENT_TEMPLATES} — as published, or with the terminators spelled
+//          the other way per line — is `outdated` (refreshable and removable). The list is
+//          still a conservative, enumerated set of published builds, not a heuristic;
 //        * anything else is `modified`/`conflict`: never overwritten, never removed.
+//      The tolerant comparison is for CLASSIFICATION only. Every write and delete re-proves
+//      the exact bytes it read, so a file edited between the read and the write is kept.
 //      A first install is *exclusive* (`wx`), so a file that appears between the
 //      status read and the write is reported as a conflict instead of replaced.
 //   2. the `mcp_servers.dsh-delegate` table in `$CODEX_HOME/config.toml`, and only
@@ -111,15 +117,18 @@ export const CODEX_ACTIONS = Object.freeze(['status', 'install', 'repair', 'remo
  * *as written* (template with the version marker stamped).
  *
  * This list, not a heuristic, is what makes `outdated` mean "a build this plugin
- * really published". A file that is not byte-identical to one of these is somebody
+ * really published". A file that is not identical to one of these texts is somebody
  * else's file, even if it still carries the managed header and an old version line.
- * Regenerating a digest is a deliberate act: add the entry for a release only after
- * that release has been packed and its agent file verified.
+ * "Identical" admits the CRLF/LF spelling of the same text only (see
+ * {@link isKnownPriorTemplate}); the entries below stay the exact published identities and
+ * are never derived from the current template. Regenerating a digest is a deliberate act:
+ * add the entry for a release only after that release has been packed and its agent file
+ * verified.
  *
  * The 0.1.6, both 0.1.7 builds, the 0.1.8 and 0.1.9 builds, the published 0.1.10
  * template (in both its packed CRLF and its LF byte form), the published 0.1.11
  * template and the published 0.1.12 template are enumerated here because they are
- * published Codex agent builds. A file that is not byte-identical to one of these
+ * published Codex agent builds. A file that is not identical to one of these
  * releases or the current template is reported as `modified`, rather than guessed as
  * ours.
  * The array is intentionally mutable (not frozen) so a test can pin a temporary
@@ -423,10 +432,119 @@ export const KNOWN_AGENT_TEMPLATES = [
   // Exact published v1.5.1 template; only the version stamp changes in 1.5.2.
   { version: '1.5.1', sha256: '3d4fa9d8543306a10a5ac7d337d1538ebf57a20104674192de16ba13f580c0e6' },
   { version: '1.5.1', sha256: 'ad0c09209e60234d369a0589fdc61477efa20b95b02d66534901d6fbc0f4d673' },
+  // Published 1.5.2 before the P0 planning rules, preserved in tests/fixtures/agent-1.5.2.toml.
+  // These exact LF/CRLF identities allow a managed upgrade without claiming user edits.
+  { version: '1.5.2', sha256: 'e0971d206f962ed145d36986334fd27107d3270ead0688e4899b7be2fc1544d2' },
+  { version: '1.5.2', sha256: '86ec91643d285ff8fb7e21121b7e4c4cd1cc8687b1190af88865bfb0ff3eab8a' },
+  // The INSTALLED local test build `1.5.3-test.1`. Both identities are the bytes of that
+  // build's OWN product template, not a reconstruction from today's text: they were
+  // preserved byte for byte as `tests/fixtures/agent-1.5.3-test.1.toml` and compared
+  // byte-for-byte with the file actually installed on the operator's machine.
+  //
+  //   * `e5e96ae7…` — the installed CRLF form (43,287 bytes, `version = "1.5.3-test.1"`).
+  //   * `fc767654…` — the same text with every `\r\n` folded to `\n` (42,734 bytes).
+  //
+  // Without these two an untouched test.1 install hashes to "unknown content" and is
+  // reported `modified`, which would make the upgrade to 1.5.3-test.2 impossible. Only
+  // these exact bytes qualify: a single edited character still hashes to something
+  // unknown and stays the operator's file.
+  { version: '1.5.3-test.1', sha256: 'e5e96ae7d0ab3dbfe2d06b58182e2e36c761e0ee622b212f5d0ff584a6412fd0' },
+  { version: '1.5.3-test.1', sha256: 'fc7676549dd75fee7ae3ab343a617514dd0d32def9321255b772e29197ac9a76' },
+  // The INSTALLED local test build `1.5.3-test.2`, i.e. the last step before the formal
+  // 1.5.3 release. Its identity is evidence, not a rendering of today's text: both forms
+  // were read from the files of that build that are actually on the operator's machine
+  // (saved as `installed-test.2-template.toml` and `installed-test.2-agent.toml`) and were
+  // found to differ ONLY in their terminators, the version line being `1.5.3-test.2` in
+  // both. The template form is preserved byte for byte as
+  // `tests/fixtures/agent-1.5.3-test.2.toml` and compared against the installed one.
+  //
+  //   * `2a905842…` — the shipped template file, CRLF throughout (43,287 bytes).
+  //   * `77a4e834…` — the file that build actually installed, the same text with LF
+  //     terminators (42,734 bytes), which is what {@link renderAgentFile} writes.
+  //
+  // Without these two an untouched test.2 install hashes to "unknown content" and is
+  // reported `modified`, which would make the upgrade to the formal 1.5.3 template
+  // impossible. Only these exact bytes qualify: a single edited character still hashes to
+  // something unknown and stays the operator's file.
+  { version: '1.5.3-test.2', sha256: '2a9058424f33b0a022b05aedc3ebfcf35c0cb10eac498b754597dd7f90d3c775' },
+  { version: '1.5.3-test.2', sha256: '77a4e83459ef605826cfaa1057d19058c4ae36a5ed6080ebd70c88a0a3dd69fb' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */
 const VERSION_LINE = /^version[ \t]*=[ \t]*"([^"]*)"\r?$/mu;
+
+/**
+ * Read agent text with CRLF terminators folded to LF.
+ *
+ * The shipped template is stored with CRLF terminators while {@link renderAgentFile} writes
+ * the managed file with LF, so the terminator spelling alone is not a content difference.
+ * Only `\r\n` is folded: a BOM, a lone `\r`, a tab, a trailing space, a blank line, a comment
+ * and the version line all stay exactly as they are, so every one of them still makes a file
+ * a different text. A `\r\r\n` therefore keeps the extra `\r` and stays different too.
+ * Classification may use this fold; every write and delete still re-proves the exact bytes it
+ * read (`agent.expect`).
+ * @param {string} text - agent file or template text.
+ * @returns {string} the text with CRLF folded to LF.
+ */
+function normalizeLineEndings(text) {
+  return text.replace(/\r\n/gu, '\n');
+}
+
+/**
+ * The normalization above applied to BOTH texts, i.e. "is this the same text?".
+ * @param {string} contents - text read from an agent file.
+ * @param {string} template - text this build would write.
+ * @returns {boolean} true when the two texts differ at most in CRLF/LF spelling.
+ */
+function sameAgentText(contents, template) {
+  if (contents === template) return true;
+  return normalizeLineEndings(contents) === normalizeLineEndings(template);
+}
+
+/**
+ * Is this file one of the exact agent files an earlier release shipped?
+ *
+ * The only case where install may replace an existing file. The test is content identity: a
+ * single changed character changes the digest, and the version line is deliberately *not*
+ * used as proof.
+ *
+ * The one tolerated difference is the CRLF/LF spelling of the SAME text, which is why the
+ * file is also matched as its whole text normalized to LF and as that text with every
+ * terminator spelled CRLF. Both digests are compared against the SAME enumerated table above —
+ * that table is never rebuilt, widened, re-versioned or emptied.
+ *
+ * That equivalent branch is only reachable when the normalized text still contains NO `\r` at
+ * all. A `\r` left over after storing the CRLF/LF fold is a character of the file, not a
+ * spelling: a file whose every line was rewritten to `\r\r\n` normalizes to text that already
+ * looks CRLF, so without this guard it would match the published CRLF digest and be claimed as
+ * ours (then overwritten). Such a file is an operator edit and stays `modified`.
+ * Everything else still fails too: an added or removed line, a comment, a trailing space, a tab,
+ * a BOM, a changed version line or any other edit hashes to nothing in the table.
+ * @param {string} contents - installed file text.
+ * @param {object} [options] - `ignoreVersion`: compare with the version line masked, used only
+ *   to explain *why* a file is `modified` in the status note. It never grants refresh or removal.
+ * @returns {boolean} true when the file is a known published build of this template.
+ */
+export function isKnownPriorTemplate(contents, { ignoreVersion = false } = {}) {
+  if (typeof contents !== 'string') return false;
+  const known = (text) => KNOWN_AGENT_TEMPLATES.some((entry) => entry.sha256 === digest(text));
+  if (known(contents)) return true;
+  const lf = normalizeLineEndings(contents);
+  // A leftover `\r` means the file has a CR no spelling fold accounts for, so no equivalent
+  // digest may claim it. This guard wraps ONLY the equivalent branch; the diagnosis below is
+  // still reachable for such a file.
+  if (!lf.includes('\r')) {
+    if (known(lf)) return true;
+    const crlf = lf.replace(/\n/gu, '\r\n');
+    if (crlf !== contents && known(crlf)) return true;
+  }
+  if (!ignoreVersion) return false;
+  // Explanation-only path: the same body with the version line stripped still has to
+  // match a known build, which distinguishes "operator edited a managed file" from
+  // "this file was never ours".
+  const stripped = contents.replace(VERSION_LINE, 'version = "\u0000"');
+  return KNOWN_AGENT_TEMPLATES.some((entry) => entry.sha256 === digest(stripped));
+}
 
 /** Stable states reported for the agent file. */
 export const AGENT_STATES = Object.freeze({
@@ -1115,11 +1233,18 @@ async function readLinkTarget(path) {
 /**
  * Compare the installed agent file with the template this build would write.
  *
- * The order matters. Content equality is checked first, so a byte-identical file is
- * `installed` no matter what its version line says. Only then is the exact
- * known-template list consulted, and only a byte-exact match to a published build is
- * `outdated`. Everything else is `modified`: a body edit, a stray byte, a tampered
- * or invented version line, or a file that merely looks like ours.
+ * The order matters. Content equality is checked first, so a file that is the same text
+ * as the template is `installed` no matter what its version line says; "the same text"
+ * includes the CRLF/LF spelling, because the shipped template's terminators are not part
+ * of its content (see {@link normalizeLineEndings}). Only then is the exact known-template
+ * list consulted, and only a match to a published build is `outdated`. Everything else is
+ * `modified`: a body edit, a stray byte, a tampered or invented version line, or a file
+ * that merely looks like ours.
+ *
+ * `contents` is always the text EXACTLY as read, and `expect` (the status field derived
+ * from it) is what the write and delete paths re-prove against, so a file rewritten
+ * between the read and the write is still detected even though this classification is
+ * line-ending tolerant.
  * @param {string} path - agent file path.
  * @param {string} template - template text this build would write.
  * @returns {Promise<{ state: string, present: boolean, reason: string | null, contents: string | null }>} agent state and the exact bytes it was derived from.
@@ -1129,7 +1254,7 @@ async function readAgentState(path, template) {
   if (existing.kind === 'missing') return { state: AGENT_STATES.missing, present: false, reason: null, contents: null };
   if (existing.kind === 'other') return { state: AGENT_STATES.conflict, present: true, reason: 'not-a-regular-file', contents: null };
   const contents = existing.contents;
-  if (contents === template) return { state: AGENT_STATES.installed, present: true, reason: null, contents };
+  if (sameAgentText(contents, template)) return { state: AGENT_STATES.installed, present: true, reason: null, contents };
   if (isKnownPriorTemplate(contents)) return { state: AGENT_STATES.outdated, present: true, reason: null, contents };
   return {
     state: AGENT_STATES.modified,
@@ -1216,32 +1341,6 @@ function linkedBoundaryRefusal(status) {
     path: isHome ? status.codexHome : join(status.codexHome, 'agents'),
     reason: isHome ? 'codex-home-is-link' : 'agents-dir-is-link',
   };
-}
-
-/**
- * Is this file one of the exact agent files an earlier release shipped?
- *
- * The only case where install may replace an existing file. The test is content
- * identity against the enumerated digest list, which cannot be satisfied by an
- * operator edit: a single changed byte changes the digest. The version line is
- * deliberately *not* used as proof — an operator can edit a body while leaving (or
- * lowering) that line, and a heuristic on it is exactly how a customised agent
- * gets overwritten.
- * @param {string} contents - installed file text.
- * @param {object} [options] - `ignoreVersion`: compare with the version line masked,
- *   used only to explain *why* a file is `modified` in the status note.
- * @returns {boolean} true when the file is a known published build of this template.
- */
-export function isKnownPriorTemplate(contents, { ignoreVersion = false } = {}) {
-  if (typeof contents !== 'string') return false;
-  const digestValue = digest(contents);
-  if (KNOWN_AGENT_TEMPLATES.some((entry) => entry.sha256 === digestValue)) return true;
-  if (!ignoreVersion) return false;
-  // Explanation-only path: the same body with the version line stripped still has to
-  // match a known build, which distinguishes "operator edited a managed file" from
-  // "this file was never ours".
-  const stripped = contents.replace(VERSION_LINE, 'version = "\u0000"');
-  return KNOWN_AGENT_TEMPLATES.some((entry) => entry.sha256 === digest(stripped));
 }
 
 /**
@@ -2189,15 +2288,23 @@ export function removeMcpEntry(document) {
 
 /**
  * Render the agent file from the shipped template plus this package's version.
+ *
+ * The MANAGED file is written with LF terminators, whatever the template's own spelling
+ * is: this repository stores `codex/dsh-taskbridge.toml` CRLF, and a renderer that echoed
+ * that spelling would make the file it writes depend on the checkout it was built from.
+ * Only the terminators are touched — every other byte of the body is copied verbatim
+ * (spaces, tabs, blank lines, comments), and {@link readAgentTemplate} still returns the
+ * template exactly as shipped, so the source TOML is never rewritten.
  * @param {string} template - shipped template.
  * @param {string} version - package version.
- * @returns {string} file contents.
+ * @returns {string} file contents, LF-terminated.
  */
 export function renderAgentFile(template, version) {
   const marker = `version = ${renderString(version)}`;
-  if (/^version = ".*"$/mu.test(template)) return template.replace(/^version = ".*"$/mu, marker);
+  const text = normalizeLineEndings(template);
+  if (/^version = ".*"$/mu.test(text)) return text.replace(/^version = ".*"$/mu, marker);
   // Keep the provenance header first, then the version marker, then the rest.
-  const lines = template.split('\n');
+  const lines = text.split('\n');
   const insertAt = lines.findIndex((line) => line.trim() !== '' && !line.trimStart().startsWith('#'));
   const resolved = insertAt === -1 ? lines.length : insertAt;
   lines.splice(resolved, 0, marker);

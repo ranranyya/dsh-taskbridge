@@ -177,8 +177,10 @@ test('the shipped dispatcher rules are what install actually writes', async () =
     assert.match(written, /continueFromTaskId/u, 'the installed file must carry the continuation rule');
     // The only difference between the shipped template and the installed copy is
     // the version line the installer renders, so the rules a host reads are the
-    // rules this repository reviews.
-    assert.equal(written, shipped.replace(/^version = ".*"$/mu, `version = "${version}"`));
+    // rules this repository reviews. The managed copy is written with LF terminators
+    // while this repository stores the template CRLF, so the comparison folds
+    // terminators and nothing else: any real edit still fails it.
+    assert.equal(written, shipped.replace(/\r\n/gu, '\n').replace(/^version = ".*"$/mu, `version = "${version}"`));
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }

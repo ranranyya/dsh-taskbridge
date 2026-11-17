@@ -68,6 +68,26 @@ import { USER_PLANE_PREFIX, wrapUserPlaneRoutes } from '../src/http/user-plane.j
 import { PREFLIGHT_ISOLATIONS, PREFLIGHT_REASONS } from '../src/workspace/preflight.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+/**
+ * The shipped template as the installer writes it: LF terminators, then the version line.
+ *
+ * {@link renderAgentFile} writes the managed agent with LF terminators while this repository
+ * stores `codex/dsh-taskbridge.toml` with CRLF ones, so the expected bytes are derived ONCE
+ * here. The file the installer produced is compared against them EXACTLY, never normalized:
+ * folding the artifact would hide a renderer regression (extra CRs, changed terminators).
+ * @param {string} template - the template as read from the repository.
+ * @param {string} version - the version line the install writes.
+ * @returns {string} the bytes an install of `version` must produce.
+ */
+function expectedInstalledText(template, version) {
+  const lf = template.replace(/\r\n/gu, '\n');
+  if (/^version = ".*"$/mu.test(lf)) return lf.replace(/^version = ".*"$/mu, `version = "${version}"`);
+  const lines2 = lf.split('\n');
+  const insertAt = lines2.findIndex((line) => line.trim() !== '' && !line.trimStart().startsWith('#'));
+  lines2.splice(insertAt === -1 ? lines2.length : insertAt, 0, `version = "${version}"`);
+  return lines2.join('\n');
+}
+
 for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} managed rules are upgradeable, while user edits remain owned by the user`, () => {
   const original = readFileSync(join(ROOT, `tests/fixtures/codex-agent-${version}.toml`), 'utf8');
   const lf = original.replace(/\r\n/g, '\n');
@@ -77,7 +97,7 @@ for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} m
     assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
   }
 });
-const DELIVERABLE_VERSION = '1.5.2';
+const DELIVERABLE_VERSION = '1.5.3';
 
 // The 1.5.0 allow-list entries are the OLD published identity of the template. This
 // working tree's template text has grown (team, same-chain preflight, review evidence
@@ -118,7 +138,7 @@ test('the 1.5.0 template allow-list keeps the PUBLISHED bytes, not the edited wo
 });
 
 
-for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} companion upgrades to 1.5.2 without changing unrelated Codex settings`, async () => {
+for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} companion upgrades to 1.5.3 without changing unrelated Codex settings`, async () => {
   const fixture = codexHomeFixture();
   const lf = readFileSync(join(ROOT, 'tests/fixtures/codex-agent-1.4.3-test.2.toml'), 'utf8').replace(/\r\n/g, '\n');
   const prior = ending === 'CRLF' ? lf.replace(/\n/g, '\r\n') : lf;
@@ -132,7 +152,7 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
     assert.deepEqual(refreshed.changed, ['agent']);
     assert.deepEqual(refreshed.refused, []);
     assert.equal(refreshed.status.agent.state, 'installed');
-    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.5\.2"$/mu);
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.5\.3"$/mu);
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
   } finally {
     fixture.cleanup();
@@ -140,6 +160,39 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
 });
 // The baseline the current release upgrades *from*, pinned rather than derived: an
 // expectation that followed `DELIVERABLE_VERSION` would assert nothing.
+for (const ending of ['LF', 'CRLF']) test(`published 1.5.2 ${ending} upgrades to commander-authored P0 rules and stays installed`, async () => {
+  const fixture = codexHomeFixture();
+  const lf = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.2.toml'), 'utf8').replace(/\r\n/g, '\n');
+  const prior = ending === 'CRLF' ? lf.replace(/\n/g, '\r\n') : lf;
+  const config = '# Preserve existing operator configuration\nmodel = "operator-model"\n';
+  try {
+    mkdirSync(dirname(fixture.agentPath), { recursive: true });
+    writeFileSync(fixture.agentPath, prior);
+    writeFileSync(fixture.configPath, config);
+    const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
+    const before = await seam.status();
+    assert.equal(before.status.agent.state, 'outdated');
+    const refreshed = await seam.refreshKnownAgent();
+    assert.deepEqual(refreshed.changed, ['agent']);
+    assert.deepEqual(refreshed.refused, []);
+    assert.equal(refreshed.status.agent.state, 'installed');
+    const installed = readFileSync(fixture.agentPath, 'utf8');
+    assert.match(installed, /P0: COMMANDER-OWNED PLANNING AND WORK PACKETS/u);
+    assert.match(installed.replace(/\s+/gu, ' '), /verification-only packet, the implementation and rules are read-only/u);
+    assert.equal((await seam.status()).status.agent.state, 'installed');
+    assert.deepEqual((await seam.refreshKnownAgent()).changed, []);
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
+    const customized = installed + '\n# Operator-owned addition\n';
+    writeFileSync(fixture.agentPath, customized);
+    const refused = await seam.refreshKnownAgent();
+    assert.equal(refused.status.agent.state, 'modified');
+    assert.deepEqual(refused.changed, []);
+    assert.equal(readFileSync(fixture.agentPath, 'utf8'), customized);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 const PREVIOUS_VERSION = '0.1.14';
 const HISTORICAL_TEMPLATE_VERSION = '0.1.13';
 /**
@@ -1170,14 +1223,14 @@ test(`the published 0.1.11 agent is refreshed to ${DELIVERABLE_VERSION} by start
     assert.deepEqual(status.changed, ['agent']);
     assert.deepEqual(status.refused, []);
     const migrated = readFileSync(fixture.agentPath, 'utf8');
-    assert.equal(migrated, template, 'the migrated file must be exactly what this build writes');
+    assert.equal(migrated, expectedInstalledText(template, DELIVERABLE_VERSION), 'the migrated file must be exactly what this build writes');
     assert.match(migrated, new RegExp(`^version = "${DELIVERABLE_VERSION.replace(/\./gu, '\\.')}"$`, 'mu'));
     assert.equal(existsSync(fixture.configPath), false, 'startup migration must not create config.toml');
 
     // A second startup is a no-op: the migration happens exactly once.
     const again = await createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION }).refreshKnownAgent();
     assert.deepEqual(again.changed, [], 'an already-current agent file must not be rewritten');
-    assert.equal(readFileSync(fixture.agentPath, 'utf8'), template);
+    assert.equal(readFileSync(fixture.agentPath, 'utf8'), expectedInstalledText(template, DELIVERABLE_VERSION));
 
     // 2. A no-home first start creates nothing: without an agent file there is no
     //    migration to run and no MCP entry may be registered on startup.
@@ -1219,7 +1272,7 @@ test(`the published 0.1.11 agent is refreshed to ${DELIVERABLE_VERSION} by start
     assert.equal(statusRead.status.agent.managed, true);
     const installed = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
     assert.ok(installed.changed.includes('agent'));
-    assert.equal(readFileSync(fixture.agentPath, 'utf8'), template);
+    assert.equal(readFileSync(fixture.agentPath, 'utf8'), expectedInstalledText(template, DELIVERABLE_VERSION));
   } finally {
     fixture.cleanup();
   }
@@ -1259,13 +1312,13 @@ test(`the published ${AGENT_0_1_12_VERSION} agent is refreshed to ${DELIVERABLE_
     assert.deepEqual(status.changed, ['agent'], 'startup must refresh an unchanged published previous release');
     assert.deepEqual(status.refused, []);
     const migrated = readFileSync(fixture.agentPath, 'utf8');
-    assert.equal(migrated, template, 'the migrated file must be exactly what this build writes');
+    assert.equal(migrated, expectedInstalledText(template, DELIVERABLE_VERSION), 'the migrated file must be exactly what this build writes');
     assert.match(migrated, new RegExp(`^version = "${DELIVERABLE_VERSION.replace(/\./gu, '\\.')}"$`, 'mu'));
     assert.equal(existsSync(fixture.configPath), false, 'startup migration must not create config.toml');
 
     const again = await createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION }).refreshKnownAgent();
     assert.deepEqual(again.changed, [], 'an already-current agent file must not be rewritten');
-    assert.equal(readFileSync(fixture.agentPath, 'utf8'), template);
+    assert.equal(readFileSync(fixture.agentPath, 'utf8'), expectedInstalledText(template, DELIVERABLE_VERSION));
 
     // 2. The explicit paths report those bytes as `outdated`, never `modified`, and
     //    the install refreshes them.
@@ -1275,7 +1328,7 @@ test(`the published ${AGENT_0_1_12_VERSION} agent is refreshed to ${DELIVERABLE_
     assert.equal(statusRead.status.agent.managed, true);
     const installed = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
     assert.ok(installed.changed.includes('agent'));
-    assert.equal(readFileSync(fixture.agentPath, 'utf8'), template);
+    assert.equal(readFileSync(fixture.agentPath, 'utf8'), expectedInstalledText(template, DELIVERABLE_VERSION));
 
     // 3. A user body edit on top of the previous release's bytes is theirs: the
     //    version line is not the proof, so no action may write, refresh or remove it.
@@ -1344,7 +1397,7 @@ test('both published 0.1.10 byte forms are recognized and refreshed, as a histor
       writeFileSync(fixture.agentPath, prior);
       const migrated = await createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION }).refreshKnownAgent();
       assert.deepEqual(migrated.changed, ['agent'], `startup must refresh the ${form.name} 0.1.10 file`);
-      assert.equal(readFileSync(fixture.agentPath, 'utf8'), template);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), expectedInstalledText(template, DELIVERABLE_VERSION));
       const again = await createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION }).refreshKnownAgent();
       assert.deepEqual(again.changed, [], `a refreshed ${form.name} file must not be rewritten again`);
 
@@ -1412,7 +1465,7 @@ test('the published 0.1.13 agent is refreshed when unchanged and preserved when 
     assert.deepEqual(status.changed, ['agent'], 'startup must refresh an unchanged published 0.1.13 file');
     assert.deepEqual(status.refused, []);
     const migrated = readFileSync(fixture.agentPath, 'utf8');
-    assert.equal(migrated, template, 'the migrated file must be exactly what this build writes');
+    assert.equal(migrated, expectedInstalledText(template, DELIVERABLE_VERSION), 'the migrated file must be exactly what this build writes');
     assert.match(migrated, new RegExp(`^version = "${DELIVERABLE_VERSION.replace(/\./gu, '\\.')}"$`, 'mu'));
     assert.equal(existsSync(fixture.configPath), false, 'startup migration must not create config.toml');
 
@@ -1427,7 +1480,7 @@ test('the published 0.1.13 agent is refreshed when unchanged and preserved when 
     assert.equal(statusRead.status.agent.managed, true);
     const installed = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
     assert.ok(installed.changed.includes('agent'));
-    assert.equal(readFileSync(fixture.agentPath, 'utf8'), template);
+    assert.equal(readFileSync(fixture.agentPath, 'utf8'), expectedInstalledText(template, DELIVERABLE_VERSION));
 
     // 3. MODIFIED 0.1.13: a body edit is the operator's, so nothing writes, refreshes or
     //    removes it — a version line that still says 0.1.13 grants nothing.
@@ -1535,7 +1588,7 @@ for (const release of HISTORICAL_AGENT_FIXTURES) {
       const migrated = await seam.refreshManagedIntegration({ startupTarget });
       assert.deepEqual(migrated.changed, ['agent']);
       assert.deepEqual(migrated.refused, []);
-      assert.equal(readFileSync(fixture.agentPath, 'utf8'), template, 'the file becomes exactly this build\'s agent');
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), expectedInstalledText(template, DELIVERABLE_VERSION), 'the file becomes exactly this build\'s agent');
       assert.equal(existsSync(fixture.configPath), false, 'startup must not create config.toml');
 
       // 2. Repeating it is a no-op, and the explicit install refreshes the same bytes.
@@ -1545,7 +1598,7 @@ for (const release of HISTORICAL_AGENT_FIXTURES) {
       writeFileSync(fixture.agentPath, lfForm);
       const installed = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
       assert.ok(installed.changed.includes('agent'), 'the LF form of the same release is refreshed too');
-      assert.equal(readFileSync(fixture.agentPath, 'utf8'), template);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), expectedInstalledText(template, DELIVERABLE_VERSION));
 
       // 3. An operator edit on top of the published bytes is THEIRS: the version line is
       //    not the proof, so no action may write, refresh or remove it.
@@ -1594,7 +1647,7 @@ test('the published 1.3.2 fixture is the release this build must refresh, not me
       .refreshManagedIntegration();
     assert.deepEqual(migrated.changed, ['agent'], 'startup refreshes it');
     const refreshed = readFileSync(fixture.agentPath, 'utf8');
-    assert.equal(refreshed, template);
+    assert.equal(refreshed, expectedInstalledText(template, DELIVERABLE_VERSION));
     // The refreshed rules are the new contract, which is the point of the upgrade.
     assert.match(refreshed, /delegate_wait\(\{ taskId \}\)/u);
     assert.doesNotMatch(refreshed, /raise `waitSeconds` only when you\s+deliberately want to stay silent longer/u);
@@ -1663,7 +1716,7 @@ test('only an enumerated published build is refreshable, and it is refreshed exa
   try {
     // Simulate a published prior build by pinning a digest into the known list for
     // the duration of this test; the list is the only thing that grants "outdated".
-    const prior = readFileSync(join(ROOT, 'codex', AGENT_FILENAME), 'utf8')
+    const prior = readFileSync(join(ROOT, 'codex', AGENT_FILENAME), 'utf8').replace(/\r\n/gu, '\n')
       .replace(/^version = ".*"$/mu, 'version = "0.1.5"');
     // Remember the shipped list so the temporary entry can be removed without wiping
     // the product identities (including the legacy 1.0.0 ones) for later tests.
@@ -4176,8 +4229,8 @@ test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () =
   // The published 1.5.0 identities are NOT removed by adding the test build.
   assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0'
     && entry.sha256 === '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b'), true);
-  // The public version matches the formal release; test identity registration is separate.
-  assert.equal(DELIVERABLE_VERSION, '1.5.2');
+  // The public version matches this formal release; historical identity registration is separate.
+  assert.equal(DELIVERABLE_VERSION, '1.5.3');
 });
 
 test('an untouched 1.5.1-test.1 install (LF and CRLF) upgrades to this candidate, idempotently', async () => {
@@ -4341,5 +4394,451 @@ test('the exact published 1.5.1 companion remains a recognised prior build in LF
     assert.ok(KNOWN_AGENT_TEMPLATES.some(entry => entry.version === '1.5.1' && entry.sha256 === expected));
     assert.equal(isKnownPriorTemplate(text), true);
     assert.equal(isKnownPriorTemplate(text + '\n# operator edit\n'), false);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The installed local test build `1.5.3-test.1` -> the installed `1.5.3-test.2`
+// candidate (the last step before the formal 1.5.3 release).
+// ---------------------------------------------------------------------------
+// The reference is not a guess and is never rebuilt from today's template: it is the file
+// that build actually installed on the operator's machine, preserved BYTE FOR BYTE as
+// `tests/fixtures/agent-1.5.3-test.1.toml` (CRLF, 43287 bytes). The current template has
+// since changed (its version line now says `1.5.3`), so re-deriving the old bytes
+// from it would fabricate a sample that no installation ever held.
+const AGENT_1_5_3_TEST_1_FIXTURE = join(ROOT, 'tests/fixtures/agent-1.5.3-test.1.toml');
+/** The byte-exact installed sample: CRLF, as Windows wrote it. */
+const AGENT_1_5_3_TEST_1_INSTALLED_DIGEST = 'e5e96ae7d0ab3dbfe2d06b58182e2e36c761e0ee622b212f5d0ff584a6412fd0';
+/** The same sample with only `\r\n` folded to `\n` (a POSIX checkout's spelling). */
+const AGENT_1_5_3_TEST_1_LF_DIGEST = 'fc7676549dd75fee7ae3ab343a617514dd0d32def9321255b772e29197ac9a76';
+
+/**
+ * The bytes this candidate's install must produce, derived from the SHIPPED template.
+ *
+ * The template is stored CRLF and {@link renderAgentFile} writes LF, so the expected
+ * artifact is the template's LF text with the version line this install stamps. It is
+ * computed here once and compared EXACTLY: normalizing the artifact read back from disk
+ * would hide a renderer regression (an extra `\r`, a changed terminator).
+ * @returns {string} the exact managed file contents.
+ */
+function expectedManagedAgentText() {
+  return expectedInstalledText(readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8'), DELIVERABLE_VERSION);
+}
+
+/**
+ * The byte forms an operator's test.1 file can really hold, and whether each one is a
+ * known build.
+ *
+ * The first two are the exact enumerated identities. The third is the documented MIXED
+ * spelling: the installed sample with only its version line spelled LF. It folds to the
+ * published LF text with no leftover `\r`, so {@link isKnownPriorTemplate}'s unchanged
+ * equivalence branch rightly accepts it (it IS the same text). A file carrying a CR that
+ * no fold accounts for — `\r\r\n` — is still refused, and is asserted as such below.
+ * @returns {Array<[string, string, string | null, boolean]>} label, text, expected digest
+ *   (or null for a form that is not itself enumerated), and whether it is a known build.
+ */
+function test1ByteForms() {
+  const installed = readFileSync(AGENT_1_5_3_TEST_1_FIXTURE).toString('utf8');
+  const lf = installed.replace(/\r\n/g, '\n');
+  const mixedVersionLine = installed.replace('version = "1.5.3-test.1"\r\n', 'version = "1.5.3-test.1"\n');
+  return [
+    ['installed CRLF', installed, AGENT_1_5_3_TEST_1_INSTALLED_DIGEST, true],
+    ['LF', lf, AGENT_1_5_3_TEST_1_LF_DIGEST, true],
+    ['CRLF body with an LF version line', mixedVersionLine, null, true],
+  ];
+}
+
+test('the installed 1.5.3-test.1 sample is a real, enumerated prior build in every byte form', () => {
+  const installed = readFileSync(AGENT_1_5_3_TEST_1_FIXTURE).toString('utf8');
+  assert.equal(Buffer.byteLength(installed, 'utf8'), 43_287, 'the sample is the CRLF bytes actually installed');
+  assert.equal(digest(installed), AGENT_1_5_3_TEST_1_INSTALLED_DIGEST);
+  assert.equal(digest(installed.replace(/\r\n/g, '\n')), AGENT_1_5_3_TEST_1_LF_DIGEST);
+  assert.match(installed, /^version = "1\.5\.3-test\.1"\r$/mu, 'the sample really is the test.1 build');
+  for (const [label, text, expected, known] of test1ByteForms()) {
+    if (expected !== null) assert.equal(digest(text), expected, `${label}: the pinned identity`);
+    assert.equal(isKnownPriorTemplate(text), known, `${label}: byte-exact known build, or correctly refused`);
+    assert.equal(isKnownPriorTemplate(`${text}\n# operator edit\n`), false, `${label}: one added line is not`);
+    assert.equal(isKnownPriorTemplate(`${text.replace('P0:', 'P0 :')}`), false, `${label}: a body edit is not`);
+  }
+  // The G12 guard is untouched: a CR no spelling fold accounts for (`\r\r\n` everywhere)
+  // is a character of the file, not a terminator spelling, so it never becomes ours.
+  const corrupted = readFileSync(AGENT_1_5_3_TEST_1_FIXTURE).toString('utf8')
+    .replace(/\r\n/g, '\n').replace(/\n/g, '\r\r\n');
+  assert.equal(isKnownPriorTemplate(corrupted), false, 'a lone-CR-corrupted test.1 file stays the operator\'s');
+  // Adding the test.1 identities removed nothing: the published builds stay enumerated.
+  for (const sha256 of [
+    '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b',
+    '253a695842e9634e28e86030c7ffb10d21b338f09451a8c13849cfce1d9d9364',
+    'e0971d206f962ed145d36986334fd27107d3270ead0688e4899b7be2fc1544d2',
+    '86ec91643d285ff8fb7e21121b7e4c4cd1cc8687b1190af88865bfb0ff3eab8a',
+  ]) {
+    assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.sha256 === sha256), true, `${sha256.slice(0, 8)}… stays enumerated`);
+  }
+});
+
+/** Every line of `after` but not of `before`, as a byte-exact prefix check. */
+function addedTail(before, after) {
+  assert.equal(after.startsWith(before), true, 'the operator settings survive byte-identically as a prefix');
+  return after.slice(before.length);
+}
+
+/**
+ * Assert that one install appended exactly the plugin's marked MCP entry and nothing else.
+ *
+ * The managed entry is the ONLY thing an install may add to `config.toml`; every operator
+ * byte before it is preserved verbatim, including CRLF terminators and comments.
+ * @param {string} before - the config as the operator wrote it.
+ * @param {string} after - the config after the action.
+ * @param {string} label - assertion prefix.
+ */
+function assertOnlyManagedMcpAdded(before, after, label) {
+  const tail = addedTail(before, after);
+  assert.equal(tail.startsWith(`\r\n${MCP_MARKER}\r\n`), true, `${label}: only the managed entry was appended`);
+  assert.match(tail, /^\[mcp_servers\.dsh-delegate\]\r?$/mu, `${label}: the adopted entry is the plugin's`);
+  assert.equal(/(^|[^\r])\n/u.test(after), false, `${label}: the config stays CRLF throughout`);
+}
+
+for (const [label, prior] of test1ByteForms().map(([name, text]) => [name, text])) {
+  test(`an untouched 1.5.3-test.1 install (${label}) upgrades to ${DELIVERABLE_VERSION} byte-exactly, idempotently, and a user note survives`, async () => {
+    const fixture = codexHomeFixture();
+    const expected = expectedManagedAgentText();
+    // A REAL operator config: unrelated settings, a comment and CRLF terminators.
+    const config = [
+      '# operator comment in a Windows-edited file',
+      'model = "operator-model"',
+      '',
+      '[mcp_servers]',
+      'other = { command = "node", args = ["C:/other/server.mjs"] }',
+      '',
+    ].join('\r\n');
+    try {
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      writeFileSync(fixture.agentPath, prior);
+      writeFileSync(fixture.configPath, config);
+      const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+
+      // The false conflict this identity exists to prevent: untouched installed bytes
+      // read as `modified` ("somebody else's file") and therefore never refreshed.
+      const before = await runCodexAction('status', options);
+      assert.equal(before.status.agent.state, 'outdated', `${label}: upgradable, not ${before.status.agent.state}`);
+
+      const install = await runCodexAction('install', options);
+      assert.equal(install.status.agent.state, 'installed', `${label}: refreshed`);
+      assert.deepEqual(install.refused, []);
+      const upgraded = readFileSync(fixture.agentPath, 'utf8');
+      // The artifact is compared EXACTLY against the CRLF-template -> LF + current version
+      // rendering; nothing is folded on the file that was actually written.
+      assert.equal(upgraded, expected, `${label}: exactly the template LF text stamped ${DELIVERABLE_VERSION}`);
+      assert.equal(upgraded.includes(`version = "${DELIVERABLE_VERSION}"`), true);
+      assert.equal(upgraded.includes('\r'), false, `${label}: the managed file is LF, like every install`);
+      // config.toml: every operator byte is preserved verbatim, and the ONLY addition is the
+      // plugin's own marked MCP entry, still CRLF like the file it was appended to.
+      const afterInstall = readFileSync(fixture.configPath, 'utf8');
+      assertOnlyManagedMcpAdded(config, afterInstall, label);
+
+      // Reading the installed artifact back is `installed` and a repeat install is a no-op.
+      assert.equal((await runCodexAction('status', options)).status.agent.state, 'installed');
+      const repeated = await runCodexAction('install', options);
+      assert.deepEqual(repeated.changed, [], `${label}: idempotent`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), upgraded);
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), afterInstall, `${label}: the config is untouched too`);
+      const refreshedAgain = await seamRefresh(fixture, options);
+      assert.deepEqual(refreshedAgain.changed, [], `${label}: startup refresh is a no-op too`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), upgraded);
+
+      // A user note added to the UPGRADED file makes it the operator's: install, startup
+      // refresh and remove must all leave it byte-identical.
+      const withNote = `${upgraded}# operator note: keep this line\n`;
+      writeFileSync(fixture.agentPath, withNote);
+      assert.equal((await runCodexAction('status', options)).status.agent.state, 'modified');
+      const refused = await runCodexAction('install', options);
+      assert.ok(refused.refused.some((entry) => entry.code === 'AGENT_USER_MODIFIED'), `${label}: install refuses`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), withNote, `${label}: install did not overwrite`);
+      const startup = await seamRefresh(fixture, options);
+      assert.deepEqual(startup.changed, [], `${label}: startup refresh does not rewrite it`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), withNote);
+      const removed = await runCodexAction('remove', options);
+      assert.ok(removed.refused.some((entry) => entry.code === 'AGENT_USER_MODIFIED'), `${label}: remove refuses`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), withNote, `${label}: remove did not delete`);
+      // A removal deletes only what it can still prove is its own: the operator's file stays,
+      // and the managed MCP entry is gone. What config.toml keeps is the operator's own text —
+      // every line and terminator — followed by the single terminating newline the document
+      // editor leaves, exactly like the pre-existing CRLF removal case above.
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), `${config.trimEnd()}\r\n`,
+        `${label}: the config is the operator's own again`);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+test('a user note added to the ORIGINAL 1.5.3-test.1 install is never overwritten by install, refresh or remove', async () => {
+  const installed = readFileSync(AGENT_1_5_3_TEST_1_FIXTURE).toString('utf8');
+  for (const [label, base] of [['installed CRLF', installed], ['LF', installed.replace(/\r\n/g, '\n')]]) {
+    const fixture = codexHomeFixture();
+    const config = '# operator config\r\nmodel = "operator-model"\r\n\r\n[mcp_servers]\r\nother = { command = "node" }\r\n';
+    try {
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      // One added comment line inside the operator's own old build: no longer a known
+      // identity, so it is their file even though the body is otherwise test.1's.
+      const customised = `${base.trimEnd()}\n# operator note inside the old build\n`;
+      writeFileSync(fixture.agentPath, customised);
+      writeFileSync(fixture.configPath, config);
+      const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+
+      assert.equal((await runCodexAction('status', options)).status.agent.state, 'modified', `${label}: theirs, not ours`);
+      const install = await runCodexAction('install', options);
+      assert.ok(install.refused.some((entry) => entry.code === 'AGENT_USER_MODIFIED'), `${label}: install refuses`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), customised, `${label}: install left it byte-identical`);
+      assert.deepEqual((await seamRefresh(fixture, options)).changed, [], `${label}: startup refresh leaves it`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), customised);
+      const removed = await runCodexAction('remove', options);
+      assert.ok(removed.refused.some((entry) => entry.code === 'AGENT_USER_MODIFIED'), `${label}: remove refuses`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), customised, `${label}: remove left it byte-identical`);
+      // The refused removal still removes only its own marked entry, so what remains is the
+      // operator's config minus that appended block, byte for byte, plus the single
+      // terminating newline the document editor leaves (the same rule as above).
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), `${config.trimEnd()}\r\n`,
+        `${label}: only the managed entry went`);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+/**
+ * Drive the startup refresh for a fixture through the seam, exactly as activation does.
+ * @param {{ home: string }} fixture - the temporary Codex home.
+ * @param {object} options - codex action options (home, env, version).
+ * @returns {Promise<object>} the refresh outcome.
+ */
+async function seamRefresh(fixture, options) {
+  const seam = createCodexSeam({ codexHome: fixture.home, env: options.env, version: options.version });
+  return await seam.refreshKnownAgent();
+}
+
+// ---------------------------------------------------------------------------
+// The installed local test build `1.5.3-test.2` -> the formal `1.5.3` release.
+// ---------------------------------------------------------------------------
+// Both reference samples are EVIDENCE, not renderings of today's template: the shipped
+// `1.5.3-test.2` template file (CRLF, 43,287 bytes) and the file that build actually
+// installed on the operator's machine (the same text with LF terminators, 42,734 bytes)
+// were read from that machine and are byte-identical apart from the terminators. The
+// template form is preserved byte for byte as `tests/fixtures/agent-1.5.3-test.2.toml`,
+// and the two are proved to differ in nothing but CRLF/LF below: re-deriving either from
+// the current template would fabricate a sample no installation ever held.
+const AGENT_1_5_3_TEST_2_FIXTURE = join(ROOT, 'tests/fixtures/agent-1.5.3-test.2.toml');
+/** The exact shipped `1.5.3-test.2` template bytes: CRLF throughout. */
+const AGENT_1_5_3_TEST_2_TEMPLATE_DIGEST = '2a9058424f33b0a022b05aedc3ebfcf35c0cb10eac498b754597dd7f90d3c775';
+/** The same sample with only `\r\n` folded to `\n`: the exact bytes that build installed. */
+const AGENT_1_5_3_TEST_2_INSTALLED_DIGEST = '77a4e83459ef605826cfaa1057d19058c4ae36a5ed6080ebd70c88a0a3dd69fb';
+
+/**
+ * The byte forms an operator's `1.5.3-test.2` file can really hold, and whether each one
+ * is a known build.
+ *
+ * The first two are the exact identities registered from the sample above. The other two
+ * are the documented MIXED spellings — only the version line, or every line alternately,
+ * spelled the other way. Neither leaves a `\r` behind once the CRLF fold is applied, so
+ * {@link isKnownPriorTemplate}'s unchanged equivalence branch rightly accepts them: they
+ * ARE the same text. A file carrying a CR that no fold accounts for (`\r\r\n`) is still
+ * refused, and is asserted as such below.
+ * @returns {Array<[string, string, string | null, boolean]>} label, text, expected digest
+ *   (or null for a form that is not itself an enumerated identity), and whether it is a
+ *   known build.
+ */
+function test2ByteForms() {
+  const template = readFileSync(AGENT_1_5_3_TEST_2_FIXTURE).toString('utf8');
+  const installed = template.replace(/\r\n/g, '\n');
+  const mixedVersionLine = template.replace('version = "1.5.3-test.2"\r\n', 'version = "1.5.3-test.2"\n');
+  const lines = installed.split('\n');
+  const alternating = lines
+    .map((line, index) => (index === lines.length - 1 ? line : `${line}${index % 2 === 0 ? '\r\n' : '\n'}`))
+    .join('');
+  return [
+    ['installed template CRLF', template, AGENT_1_5_3_TEST_2_TEMPLATE_DIGEST, true],
+    ['installed LF', installed, AGENT_1_5_3_TEST_2_INSTALLED_DIGEST, true],
+    ['CRLF body with an LF version line', mixedVersionLine, null, true],
+    ['alternating CRLF/LF lines', alternating, null, true],
+  ];
+}
+
+test('the installed 1.5.3-test.2 samples are real, enumerated prior builds in every byte form', () => {
+  const template = readFileSync(AGENT_1_5_3_TEST_2_FIXTURE).toString('utf8');
+  const installed = template.replace(/\r\n/g, '\n');
+  assert.equal(Buffer.byteLength(template, 'utf8'), 43_287, 'the sample is the shipped template, CRLF bytes');
+  assert.equal(digest(template), AGENT_1_5_3_TEST_2_TEMPLATE_DIGEST);
+  assert.equal(Buffer.byteLength(installed, 'utf8'), 42_734, 'the installed form really is the LF one');
+  assert.equal(digest(installed), AGENT_1_5_3_TEST_2_INSTALLED_DIGEST);
+  assert.equal(installed.includes('\r'), false, 'the installed form has no CR left');
+  // The two samples differ ONLY in their terminators: same number of lines, same version.
+  assert.equal(template.split('\r\n').join('\n'), installed, 'the samples differ only in CRLF versus LF');
+  assert.equal((template.match(/\r\n/g) || []).length, (installed.match(/\n/g) || []).length,
+    'one terminator per line in both samples');
+  assert.match(template, /^version = "1\.5\.3-test\.2"\r$/mu, 'the sample really is the test.2 build');
+  assert.match(installed, /^version = "1\.5\.3-test\.2"$/mu, 'and so is the installed form');
+  for (const [label, text, expected, known] of test2ByteForms()) {
+    if (expected !== null) assert.equal(digest(text), expected, `${label}: the pinned identity`);
+    assert.equal(isKnownPriorTemplate(text), known, `${label}: byte-exact known build, or correctly refused`);
+    assert.equal(isKnownPriorTemplate(`${text}\n# operator edit\n`), false, `${label}: one added line is not`);
+    assert.equal(isKnownPriorTemplate(`${text.replace('P0:', 'P0 :')}`), false, `${label}: a body edit is not`);
+  }
+  // The G12 guard is untouched: a CR no spelling fold accounts for (`\r\r\n` everywhere)
+  // is a character of the file, not a terminator spelling, so it never becomes ours.
+  const corrupted = installed.replace(/\n/g, '\r\r\n');
+  assert.equal(isKnownPriorTemplate(corrupted), false, 'a lone-CR-corrupted test.2 file stays the operator\'s');
+  // Adding the test.2 identities removed nothing: earlier local builds stay enumerated.
+  for (const sha256 of [
+    'e5e96ae7d0ab3dbfe2d06b58182e2e36c761e0ee622b212f5d0ff584a6412fd0',
+    'fc7676549dd75fee7ae3ab343a617514dd0d32def9321255b772e29197ac9a76',
+    'e0971d206f962ed145d36986334fd27107d3270ead0688e4899b7be2fc1544d2',
+    '86ec91643d285ff8fb7e21121b7e4c4cd1cc8687b1190af88865bfb0ff3eab8a',
+  ]) {
+    assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.sha256 === sha256), true, `${sha256.slice(0, 8)}… stays enumerated`);
+  }
+});
+
+/**
+ * The operator's own `config.toml` used by the test.2 upgrade fixtures: unrelated settings,
+ * a comment, a second MCP server and CRLF terminators throughout.
+ * @returns {string} the config as the operator wrote it.
+ */
+function operatorCrlfConfig() {
+  return [
+    '# operator comment in a Windows-edited file',
+    'model = "operator-model"',
+    '',
+    '[mcp_servers]',
+    'other = { command = "node", args = ["C:/other/server.mjs"] }',
+    '',
+  ].join('\r\n');
+}
+
+for (const [label, prior] of test2ByteForms().map(([name, text]) => [name, text])) {
+  test(`an untouched 1.5.3-test.2 install (${label}) upgrades to ${DELIVERABLE_VERSION} byte-exactly, idempotently, and a user note survives`, async () => {
+    const fixture = codexHomeFixture();
+    const expected = expectedManagedAgentText();
+    const config = operatorCrlfConfig();
+    try {
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      writeFileSync(fixture.agentPath, prior);
+      writeFileSync(fixture.configPath, config);
+      const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+
+      // The false conflict these identities exist to prevent: untouched installed bytes
+      // read as `modified` ("somebody else's file") and therefore never refreshed.
+      const before = await runCodexAction('status', options);
+      assert.equal(before.status.agent.state, 'outdated', `${label}: upgradable, not ${before.status.agent.state}`);
+
+      const install = await runCodexAction('install', options);
+      assert.equal(install.status.agent.state, 'installed', `${label}: refreshed`);
+      assert.deepEqual(install.refused, []);
+      const upgraded = readFileSync(fixture.agentPath, 'utf8');
+      // The artifact is compared EXACTLY against the CRLF-template -> LF + formal version
+      // rendering; nothing is folded on the file that was actually written.
+      assert.equal(upgraded, expected, `${label}: exactly the template LF text stamped ${DELIVERABLE_VERSION}`);
+      assert.equal(upgraded.includes('version = "1.5.3"'), true, `${label}: the formal version line`);
+      assert.equal(upgraded.includes('\r'), false, `${label}: the managed file is LF, like every install`);
+      // config.toml: every operator byte is preserved verbatim, and the ONLY addition is the
+      // plugin's own marked MCP entry, still CRLF like the file it was appended to.
+      const afterInstall = readFileSync(fixture.configPath, 'utf8');
+      assertOnlyManagedMcpAdded(config, afterInstall, label);
+
+      // Reading the installed artifact back is `installed` and a repeat install is a no-op.
+      assert.equal((await runCodexAction('status', options)).status.agent.state, 'installed');
+      const repeated = await runCodexAction('install', options);
+      assert.deepEqual(repeated.changed, [], `${label}: idempotent`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), upgraded);
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), afterInstall, `${label}: the config is untouched too`);
+      const refreshedAgain = await seamRefresh(fixture, options);
+      assert.deepEqual(refreshedAgain.changed, [], `${label}: startup refresh is a no-op too`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), upgraded);
+
+      // A user note added to the UPGRADED file makes it the operator's: install, startup
+      // refresh and remove must all leave it byte-identical.
+      const withNote = `${upgraded}# operator note: keep this line\n`;
+      writeFileSync(fixture.agentPath, withNote);
+      assert.equal((await runCodexAction('status', options)).status.agent.state, 'modified');
+      const refused = await runCodexAction('install', options);
+      assert.ok(refused.refused.some((entry) => entry.code === 'AGENT_USER_MODIFIED'), `${label}: install refuses`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), withNote, `${label}: install did not overwrite`);
+      const startup = await seamRefresh(fixture, options);
+      assert.deepEqual(startup.changed, [], `${label}: startup refresh does not rewrite it`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), withNote);
+      const removed = await runCodexAction('remove', options);
+      assert.ok(removed.refused.some((entry) => entry.code === 'AGENT_USER_MODIFIED'), `${label}: remove refuses`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), withNote, `${label}: remove did not delete`);
+      // What config.toml keeps after that refused removal is the operator's own text —
+      // every line and terminator — plus the single terminating newline the document editor
+      // leaves, exactly like the test.1 case above.
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), `${config.trimEnd()}\r\n`,
+        `${label}: the config is the operator's own again`);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+test('the startup refresh alone upgrades every untouched 1.5.3-test.2 byte form to the formal template', async () => {
+  for (const [label, prior] of test2ByteForms().map(([name, text]) => [name, text])) {
+    const fixture = codexHomeFixture();
+    const expected = expectedManagedAgentText();
+    const config = operatorCrlfConfig();
+    try {
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      writeFileSync(fixture.agentPath, prior);
+      writeFileSync(fixture.configPath, config);
+      const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+      // No explicit action at all: this is the plugin starting up, which may only rewrite a
+      // file whose complete bytes still match a published template.
+      const refreshed = await seamRefresh(fixture, options);
+      assert.deepEqual(refreshed.changed, ['agent'], `${label}: startup upgraded the agent only`);
+      assert.deepEqual(refreshed.refused, [], `${label}: nothing refused`);
+      assert.equal(refreshed.status.agent.state, 'installed', `${label}: installed afterwards`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), expected, `${label}: exactly the formal LF bytes`);
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), config, `${label}: config.toml not touched`);
+      const again = await seamRefresh(fixture, options);
+      assert.deepEqual(again.changed, [], `${label}: and it is a no-op afterwards`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), expected);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+test('a user note added to the ORIGINAL 1.5.3-test.2 install is never overwritten by install, refresh or remove', async () => {
+  const template = readFileSync(AGENT_1_5_3_TEST_2_FIXTURE).toString('utf8');
+  for (const [label, base] of [
+    ['installed template CRLF', template],
+    ['installed LF', template.replace(/\r\n/g, '\n')],
+  ]) {
+    const fixture = codexHomeFixture();
+    const config = '# operator config\r\nmodel = "operator-model"\r\n\r\n[mcp_servers]\r\nother = { command = "node" }\r\n';
+    try {
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      // One added comment line inside the operator's own old build: no longer a known
+      // identity, so it is their file even though the body is otherwise test.2's.
+      const customised = `${base.trimEnd()}\n# operator note inside the old build\n`;
+      writeFileSync(fixture.agentPath, customised);
+      writeFileSync(fixture.configPath, config);
+      const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+
+      assert.equal((await runCodexAction('status', options)).status.agent.state, 'modified', `${label}: theirs, not ours`);
+      const install = await runCodexAction('install', options);
+      assert.ok(install.refused.some((entry) => entry.code === 'AGENT_USER_MODIFIED'), `${label}: install refuses`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), customised, `${label}: install left it byte-identical`);
+      assert.deepEqual((await seamRefresh(fixture, options)).changed, [], `${label}: startup refresh leaves it`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), customised);
+      const removed = await runCodexAction('remove', options);
+      assert.ok(removed.refused.some((entry) => entry.code === 'AGENT_USER_MODIFIED'), `${label}: remove refuses`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), customised, `${label}: remove left it byte-identical`);
+      // The refused removal still removes only its own marked entry, so what remains is the
+      // operator's config minus that appended block, byte for byte, plus the single
+      // terminating newline the document editor leaves.
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), `${config.trimEnd()}\r\n`,
+        `${label}: only the managed entry went`);
+    } finally {
+      fixture.cleanup();
+    }
   }
 });

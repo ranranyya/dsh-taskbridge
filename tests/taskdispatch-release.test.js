@@ -14,7 +14,7 @@ const manifest = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'));
 
 test('public identity changes while the actual managed data and MCP identifiers remain compatible', async () => {
   assert.equal(manifest.name, 'dsh-taskbridge');
-  assert.equal(manifest.version, '1.5.2');
+  assert.equal(manifest.version, '1.5.3');
   const home = join(tmpdir(), 'taskdispatch-home-fixture');
   assert.equal(installationRecordPath({ DSH_HOME: home }), join(home, 'data', 'dsh-delegate', 'codex-installation.json'));
   assert.equal(manifest.bin['dsh-delegate-mcp'], 'bin/dsh-delegate-mcp.js');
@@ -34,6 +34,21 @@ for (const version of ['1.2.0', '1.3.0', '1.3.1', '1.3.2', '1.4.1']) test(`the r
   for (const text of [lf, lf.replaceAll('\n', '\r\n')]) {
     const sha256 = createHash('sha256').update(text).digest('hex');
     assert.ok(KNOWN_AGENT_TEMPLATES.some(entry => entry.version === version && entry.sha256 === sha256));
+  }
+});
+
+// The local build this release upgrades from. Its fixture is the file that build actually
+// installed (preserved byte for byte), not a rendering of today's template, so both of its
+// exact identities must stay enumerable for an untouched test.1 installation to upgrade.
+test('the byte-exact installed 1.5.3-test.1 sample remains recognized in its installed CRLF and LF forms', async () => {
+  const installed = await readFile(join(ROOT, 'tests/fixtures/agent-1.5.3-test.1.toml'), 'utf8');
+  const forms = [
+    ['installed CRLF', installed, 'e5e96ae7d0ab3dbfe2d06b58182e2e36c761e0ee622b212f5d0ff584a6412fd0'],
+    ['LF', installed.replaceAll('\r\n', '\n'), 'fc7676549dd75fee7ae3ab343a617514dd0d32def9321255b772e29197ac9a76'],
+  ];
+  for (const [label, text, expected] of forms) {
+    assert.equal(createHash('sha256').update(text).digest('hex'), expected, `${label}: the pinned sample identity`);
+    assert.ok(KNOWN_AGENT_TEMPLATES.some(entry => entry.version === '1.5.3-test.1' && entry.sha256 === expected), `${label}: enumerated`);
   }
 });
 
