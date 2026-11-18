@@ -56,7 +56,7 @@ dsh-taskbridge
 也可以指定本次版本：
 
 ```text
-dsh-taskbridge@1.5.4
+dsh-taskbridge@1.6.0
 ```
 
 安装后启用 **DSH TaskBridge**，进入该插件的设置页面。若使用的区域镜像尚未同步新版本，可切换到 npm 官方源；本项目 GitHub Release 也提供 `.tgz` 安装包。

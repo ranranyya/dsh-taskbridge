@@ -41,6 +41,7 @@ import { AuthorizationRegistry } from './auth/grants.js';
 import { bindAllowsExternalConnections } from './auth/fence.js';
 import { JobEngine } from './jobs/engine.js';
 import { HistoryStore } from './jobs/history.js';
+import { PlanStore } from './jobs/plan-store.js';
 import { WorkspaceLocks } from './workspace/locks.js';
 import { createGitRunner } from './workspace/audit.js';
 import { WorktreeManager } from './workspace/worktrees.js';
@@ -155,6 +156,7 @@ export async function apply(ctx, config = {}) {
   const providerRegistry = createProviderRegistry({ llm: ctx.llm, adapter });
 
   const history = new HistoryStore(dataDir);
+  const plans = new PlanStore(dataDir);
   const worktrees = new WorktreeManager({ runGit }, { rootDir: join(dataDir, 'worktrees') });
   // The task-thread identity map: task id -> the DSH Workspace/Session that task
   // drove, plus the paths and (for an isolated run) the tree ownership facts a
@@ -235,6 +237,7 @@ export async function apply(ctx, config = {}) {
     runGit,
     worktrees,
     history,
+    plans,
     providerRegistry,
     credentials,
     logger,
@@ -505,6 +508,7 @@ export async function apply(ctx, config = {}) {
     // History is flushed before the store is closed so a task that finished during
     // teardown is still durable. The session map is flushed on the same terms.
     await history.dispose();
+    await plans.dispose();
     await sessionStore.dispose();
     providerRegistry.dispose();
     auth.revokeAll();
@@ -522,6 +526,7 @@ export async function apply(ctx, config = {}) {
     engine,
     locks,
     history,
+    plans,
     sessionStore,
     worktrees,
     providerRegistry,

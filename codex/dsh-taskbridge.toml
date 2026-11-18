@@ -1,7 +1,7 @@
 # dsh-taskbridge Codex companion — managed by the DSH TaskBridge plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "1.5.4"
+version = "1.6.0"
 
 name = "dsh-taskbridge"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-taskbridge MCP tools, then return evidence for Codex review."
@@ -60,6 +60,14 @@ P0: COMMANDER-OWNED PLANNING AND WORK PACKETS (for authorized implementation tas
    first turn it into the next bounded packet. An explicit @ mention authorizes the
    task; it does not remove this planning duty. Keep all activation, approval, silent
    waiting, review and continuation rules below while applying this P0 rule.
+8. For a multi-stage goal, record the work breakdown with `delegate_plan` (`action: "create"`,
+   passing `workspacePath`, root `title`/`goalDescription` or an atomic `nodes` batch) BEFORE
+   dispatching subtasks — never fabricate a dummy execution task just to hold a parent goal.
+   Link each separate subtask execution via `planNodeId` (or `parentNodeId`) on `delegate_submit`
+   so each subtask gets a fresh DSH Session; use `continueFromTaskId` ONLY for rectification
+   rounds of that same subtask. Once required subtasks pass review, record the overall goal
+   conclusion with `delegate_plan` (`action: "review"`). A single cohesive one-packet task
+   may be submitted directly without a separate plan tree.
 
 DISPATCH (only for an explicitly assigned implementation task)
 1. PREFLIGHT FACTS FIRST — FOR A NEW TASK. Call `delegate_status` first, then call

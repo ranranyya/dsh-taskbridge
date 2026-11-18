@@ -112,6 +112,8 @@ export interface DelegateSubmitRequest {
   title?: string;
   goalDescription?: string;
   continueFromTaskId?: string;
+  planNodeId?: string;
+  parentNodeId?: string;
   overrides?: {
     model?: string;
     reasoningEffort?: string;
@@ -119,6 +121,59 @@ export interface DelegateSubmitRequest {
     [field: string]: unknown;
   };
   agentTeams?: boolean;
+}
+
+export interface DelegatePlanNode {
+  nodeId: string;
+  parentNodeId: string | null;
+  title: string;
+  goalDescription?: string;
+  sourcePath: string | null;
+  sourcePathDigest: string | null;
+  connectionId: string;
+  sequence: number;
+  createdAt: number;
+  updatedAt: number;
+  hostAcceptance: {
+    accepted: boolean;
+    state: 'accepted' | 'changes-requested';
+    decision: 'accepted' | 'changes-requested';
+    acceptedAt: number;
+    by: 'commander';
+    note: string;
+    noteChars: number;
+    completionSummary?: string;
+  } | null;
+  reviewHistory?: Array<{
+    accepted: boolean;
+    state: 'accepted' | 'changes-requested';
+    decision: 'accepted' | 'changes-requested';
+    acceptedAt: number;
+    by: 'commander';
+    note: string;
+    noteChars: number;
+    completionSummary?: string;
+  }>;
+}
+
+export interface DelegatePlanRequest {
+  action: 'create' | 'update' | 'review' | 'get' | 'list';
+  nodeId?: string;
+  parentNodeId?: string;
+  workspacePath?: string;
+  title?: string;
+  goalDescription?: string;
+  decision?: 'accepted' | 'changes-requested';
+  note?: string;
+  completionSummary?: string;
+  nodes?: Array<{
+    key?: string;
+    parentKey?: string;
+    parentNodeId?: string;
+    title: string;
+    goalDescription?: string;
+    workspacePath?: string;
+  }>;
 }
 
 /**

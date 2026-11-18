@@ -37,6 +37,7 @@ import { checkProviderConnectivity } from '../model/connectivity.js';
 import { MAX_CREDENTIAL_VALUE_CHARS } from '../credentials/seam.js';
 import { CODEX_ACTIONS, publicCodexStatus, runCodexAction } from '../codex/installer.js';
 import { classifyError, HttpError, jsonResponse, readJsonRequest } from '../http/respond.js';
+import { buildTaskTree } from '../jobs/task-tree.js';
 
 /**
  * Route prefix, already below `/api` because the native exact-route registry
@@ -330,13 +331,15 @@ export function userPlaneRoutes(deps) {
       fetch: async (request) => {
         const url = new URL(request.url, 'http://localhost');
         const connectionId = url.searchParams.get('connectionId') ?? undefined;
-        const { tasks, history } = await readTaskRecords(deps, { connectionId });
+        const { tasks, history, plans, tree } = await readTaskRecords(deps, { connectionId });
         return jsonResponse(200, {
           ok: true,
           tasks,
           // Stated, not implied: a client must be able to tell a complete list
           // from one whose archive section could not be read.
           history,
+          plans,
+          tree,
         });
       },
     },
@@ -790,10 +793,30 @@ function archivedRecord(deps, job) {
  * @param {object} [options] - `connectionId` to filter on.
  * @returns {Promise<{ tasks: object[], history: object }>} merged list and archive status.
  */
+async function loadPlans(deps, options = {}) {
+  const store = deps.plans ?? deps.engine?.plans ?? null;
+  if (store === null || store === undefined || typeof store.load !== 'function') {
+    return { available: false, nodes: [], code: 'PLAN_UNAVAILABLE' };
+  }
+  try {
+    const nodes = await store.load(options.connectionId ? { connectionId: options.connectionId } : {});
+    return { available: true, nodes: Array.isArray(nodes) ? nodes : [], code: null };
+  } catch (error) {
+    deps.logger?.warn?.('dsh-delegate: durable plan store could not be read', error?.code ?? 'PLAN_UNREADABLE');
+    throw new HttpError(
+      503,
+      'PLAN_HISTORY_UNREADABLE',
+      'the durable plan document could not be read, so task plans are not shown',
+      { cause: typeof error?.code === 'string' ? error.code : 'PLAN_UNREADABLE' },
+    );
+  }
+}
+
 async function readTaskRecords(deps, options = {}) {
   const filtered = options.connectionId !== undefined && options.connectionId !== null;
   const live = deps.engine.list(filtered ? { connectionId: options.connectionId } : {});
   const archive = await loadArchive(deps);
+  const planState = await loadPlans(deps, filtered ? { connectionId: options.connectionId } : {});
   const liveIds = new Set(live.map((task) => task.taskId));
 
   const merged = [];
@@ -816,6 +839,13 @@ async function readTaskRecords(deps, options = {}) {
       unreadable: false,
       ...(archive.available ? {} : { reason: archive.code }),
     },
+    plans: {
+      available: planState.available,
+      count: planState.available ? planState.nodes.length : 0,
+      unreadable: false,
+      ...(planState.available ? {} : { reason: planState.code }),
+    },
+    tree: buildTaskTree({ planNodes: planState.nodes, tasks: merged }),
   };
 }
 

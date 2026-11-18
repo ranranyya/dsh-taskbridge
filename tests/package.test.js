@@ -41,16 +41,16 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
  * so asserting itself would pass for any value. `1.5.0` adds question handling and combined waits.
  */
-const DELIVERABLE_VERSION = '1.5.4';
+const DELIVERABLE_VERSION = '1.6.0';
 
 /**
  * The published build this release upgrades *from*.
  *
  * Kept as its own constant because the release assertions below are relative: the
- * current version must be exactly one PATCH above this baseline (a correction release),
+ * current version must be strictly newer than this baseline,
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.5.3';
+const PREVIOUS_VERSION = '1.5.4';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -814,12 +814,12 @@ test('the packed size stays bounded and contains no single-file outlier', () => 
   // 1.5.2 adds full bilingual product guides and two small workflow PNGs (about
   // 100 KB combined growth). Keep a bounded allowance for those shipped docs;
   // the single-file outlier and archive-exclusion checks still apply below.
-  assert.ok(total < 2_950_000, `unpacked size grew unexpectedly: ${total} bytes`);
-  // 1.5.4 keeps the hard bound above and asserts the stricter 2,940,000-byte release budget
-  // with real headroom so comment or prose drift cannot silently creep back to the hard limit.
-  const RELEASE_BUDGET_BYTES = 2_940_000;
+  assert.ok(total < 3_120_000, `unpacked size grew unexpectedly: ${total} bytes`);
+  // 1.6.0 adds the durable planning store (`src/jobs/plan-store.js`), deterministic
+  // tree projection (`src/jobs/task-tree.js`) and the `delegate_plan` MCP surface.
+  const RELEASE_BUDGET_BYTES = 3_080_000;
   assert.ok(total <= RELEASE_BUDGET_BYTES,
-    `the archive must fit the 1.5.4 release budget of ${RELEASE_BUDGET_BYTES} bytes, saw ${total}`);
+    `the archive must fit the 1.6.0 release budget of ${RELEASE_BUDGET_BYTES} bytes, saw ${total}`);
   const largest = PACKED.map((path) => ({ path, size: statSync(join(ROOT, path)).size }))
     .sort((left, right) => right.size - left.size)[0];
   assert.ok(largest.size < 500_000, `unexpectedly large packed file: ${largest.path}`);

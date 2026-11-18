@@ -15,8 +15,9 @@ import {
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const previous = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.3.toml'), 'utf8');
+const previous154 = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.4.toml'), 'utf8');
 const current = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
-const version = '1.5.4';
+const version = '1.6.0';
 
 useDirectoryClassifier(async (paths) => new Map(paths.map((path) => {
   let kind = 'missing';
@@ -29,19 +30,23 @@ useDirectoryClassifier(async (paths) => new Map(paths.map((path) => {
   return [path, kind];
 })));
 
-test('the placement rules keep the exact published 1.5.3 identities upgradeable', () => {
+test('the placement rules keep the exact published 1.5.3 and 1.5.4 identities upgradeable', () => {
   const lf = previous.replace(/\r\n/gu, '\n');
+  const lf154 = previous154.replace(/\r\n/gu, '\n');
   assert.equal(digest(previous), 'd26428333420f6e37d6a2ed5b953268bb99642eec4c08d46c402002ca6793df8');
   assert.equal(digest(lf), '12c1caac42d461b143e23b0b1e1218e32a735ee665ce13ac56ebef7c0f46cfd3');
+  assert.equal(digest(previous154), '94ee47a0bfc16a36c76010d1e1a2476ff6117966f5c1559b01193353199f82e8');
+  assert.equal(digest(lf154), '8efbe5d627f72b34fb66decd7784552b5eafb0289c409bb6443ae28094351aae');
   assert.notEqual(current.replace(/\r\n/gu, '\n'), lf);
-  for (const text of [previous, lf]) {
+  assert.notEqual(current.replace(/\r\n/gu, '\n'), lf154);
+  for (const text of [previous, lf, previous154, lf154]) {
     assert.equal(isKnownPriorTemplate(text), true);
     assert.equal(isKnownPriorTemplate(`${text}\n# operator change\n`), false);
   }
 });
 
 test('a real temporary Codex home upgrades only known rules and preserves custom edits and config', async () => {
-  for (const oldText of [previous, previous.replace(/\r\n/gu, '\n')]) {
+  for (const oldText of [previous, previous.replace(/\r\n/gu, '\n'), previous154, previous154.replace(/\r\n/gu, '\n')]) {
     const home = mkdtempSync(join(tmpdir(), 'taskbridge-placement-rules-'));
     try {
       const agent = join(home, 'agents/dsh-taskbridge.toml');

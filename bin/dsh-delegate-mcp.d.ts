@@ -66,6 +66,7 @@ export type ExecutionRoute =
   | 'permission'
   | 'question'
   | 'review'
+  | 'plan'
   | 'preflight';
 
 /**

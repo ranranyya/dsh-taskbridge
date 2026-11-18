@@ -95,6 +95,10 @@ import {
   canonicalTaskDescription,
   readTaskDescription,
 } from '../jobs/task-descriptions.js';
+import {
+  MAX_PLAN_BATCH,
+  PLAN_TITLE_MAX_CHARS,
+} from '../jobs/plan-store.js';
 import { waitForTask } from './wait.js';
 import { QUESTION_ANSWER_KIND, createCallMetrics, correlationId } from './metrics.js';
 // The engine's own per-call permission bounds. Imported rather than re-stated so this
@@ -373,6 +377,24 @@ export const TOOLS = Object.freeze([
             + 'task record and appears in the `goalDescription` field of the task view that `delegate_submit` '
             + 'returns and of `delegate_result`; it is never derived from the prompt, a parent task or the result, '
             + 'and it does not change what the worker is told.',
+        },
+        planNodeId: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 256,
+          description: 'OPTIONAL. The `nodeId` (`plan-...`) of an existing planning node created with `delegate_plan` '
+            + 'that THIS execution task carries out. Starts a new DSH Session for that planned item; later '
+            + 'rectification rounds of this same item use `continueFromTaskId` and automatically inherit `planNodeId`. '
+            + 'Do NOT pass a sibling subtask\u2019s `planNodeId` together with `continueFromTaskId`.',
+        },
+        parentNodeId: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 256,
+          description: 'OPTIONAL. The `nodeId` (`plan-...`) or `taskId` (`task-...`) of the parent goal or parent task '
+            + 'when submitting a child subtask directly without pre-creating a leaf `planNodeId`. Starts a NEW DSH '
+            + 'Session under that parent; never reuses the parent\u2019s Session (`continueFromTaskId` is for rectification '
+            + 'rounds of the SAME item only).',
         },
       },
       required: ['workspacePath', 'prompt'],
@@ -788,6 +810,104 @@ export const TOOLS = Object.freeze([
     }),
   }),
   Object.freeze({
+    name: 'delegate_plan',
+    title: 'Manage multi-level task plan tree',
+    description: 'Create, update, review or read durable planning nodes (`plan-...`) for a multi-stage goal without '
+      + 'fabricating dummy worker executions. Use `action: "create"` to record a root goal and optional multi-level '
+      + 'subtask breakdown (single node via `title`, or atomic batch via `nodes[]` using `key`/`parentKey` or '
+      + '`parentNodeId`). Then dispatch each executable leaf packet with `delegate_submit` passing `planNodeId` (or '
+      + '`parentNodeId` for a direct child subtask); use `continueFromTaskId` ONLY for rectification rounds of that '
+      + 'same node. Use `action: "review"` to record the commander\u2019s conclusion (`accepted` or `changes-requested`, '
+      + '`note`, optional `completionSummary`) on a goal/plan node once its required children are verified. Use '
+      + '`action: "get"` or `action: "list"` to inspect planning nodes, hierarchy, orphans and source-project grouping. '
+      + 'Creates no grant, changes no setting/provider/switch, and starts no worker.',
+    annotations: Object.freeze({
+      title: 'Manage multi-level task plan tree',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    }),
+    inputSchema: Object.freeze({
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['create', 'update', 'review', 'get', 'list'],
+          description: 'Operation to perform on the plan store.',
+        },
+        nodeId: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 256,
+          description: 'Target `plan-...` node id (required for `update`, `review` and `get`).',
+        },
+        parentNodeId: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 256,
+          description: 'Optional existing parent `plan-...` or `task-...` id when creating child plan node(s).',
+        },
+        workspacePath: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 4096,
+          description: 'Absolute path of the operator-authorized SOURCE repository this goal belongs to (used for '
+            + 'verified project grouping and source consistency checks; filter on `list`).',
+        },
+        title: {
+          type: 'string',
+          minLength: 1,
+          maxLength: PLAN_TITLE_MAX_CHARS,
+          codePointLength: true,
+          description: 'Readable node title (1..120 Unicode code points; required for single-node `create`).',
+        },
+        goalDescription: {
+          type: 'string',
+          maxLength: MAX_TASK_DESCRIPTION_CHARS,
+          codePointLength: true,
+          description: 'Optional planned objective of this node (at most 2000 Unicode code points).',
+        },
+        decision: {
+          type: 'string',
+          enum: ['accepted', 'changes-requested'],
+          description: 'Commander review decision for `action: "review"`.',
+        },
+        note: {
+          type: 'string',
+          maxLength: MAX_REVIEW_NOTE_CHARS,
+          codePointLength: true,
+          description: 'Required review conclusion note (at most 8000 Unicode code points) for `action: "review"`.',
+        },
+        completionSummary: {
+          type: 'string',
+          maxLength: MAX_TASK_DESCRIPTION_CHARS,
+          codePointLength: true,
+          description: 'Optional summary of what was actually accomplished (at most 2000 Unicode code points) for `action: "review"`.',
+        },
+        nodes: {
+          type: 'array',
+          description: `Optional atomic batch of 1..${MAX_PLAN_BATCH} plan nodes for \`action: "create"\`.`,
+          items: {
+            type: 'object',
+            properties: {
+              key: { type: 'string', minLength: 1, maxLength: 64, description: 'Local batch key so children in the same batch can reference `parentKey`.' },
+              parentKey: { type: 'string', minLength: 1, maxLength: 64, description: 'References `key` of a parent item in this same `nodes` batch.' },
+              parentNodeId: { type: 'string', minLength: 1, maxLength: 256, description: 'References an already-stored `plan-...` or `task-...` parent (mutually exclusive with `parentKey`).' },
+              title: { type: 'string', minLength: 1, maxLength: PLAN_TITLE_MAX_CHARS, codePointLength: true, description: 'Node title (1..120 Unicode code points).' },
+              goalDescription: { type: 'string', maxLength: MAX_TASK_DESCRIPTION_CHARS, codePointLength: true, description: 'Optional planned objective (at most 2000 Unicode code points).' },
+              workspacePath: { type: 'string', minLength: 1, maxLength: 4096, description: 'Optional absolute source repository path (must match parent when parent has one).' },
+            },
+            required: ['title'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    }),
+  }),
+  Object.freeze({
     name: 'delegate_preflight',
     title: 'Inspect workspace before dispatch',
     description: 'Read-only preflight of one absolute workspace path: whether it is a git repository with a commit, '
@@ -877,6 +997,7 @@ const TOOL_ROUTES = Object.freeze({
   delegate_permission_decide: 'permission',
   delegate_question_answer: 'question',
   delegate_review: 'review',
+  delegate_plan: 'plan',
   delegate_preflight: 'preflight',
   // No plane route: the census is this process's own and travels to no backend.
   delegate_metrics: null,
@@ -949,11 +1070,22 @@ function validateArrayItem(tool, key, items, entry, index) {
     const value = entry[field];
     if (declared.type === 'string') {
       if (typeof value !== 'string') throw new McpError('MCP_ARGUMENT_TYPE', `${where}.${field} must be a string`);
-      if (typeof declared.maxLength === 'number' && value.length > declared.maxLength) {
+      if (typeof declared.maxLength === 'number' && declared.codePointLength === true) {
+        const points = reviewNoteLength(normalizeReviewNote(value));
+        if (points > declared.maxLength) {
+          throw new McpError('MCP_ARGUMENT_RANGE',
+            `${where}.${field} must be at most ${declared.maxLength} Unicode code points, but it is ${points}`);
+        }
+      } else if (typeof declared.maxLength === 'number' && value.length > declared.maxLength) {
         throw new McpError('MCP_ARGUMENT_RANGE',
           `${where}.${field} must be at most ${declared.maxLength} characters`);
       }
-      out[field] = value;
+      if (typeof declared.minLength === 'number' && value.trim().length < declared.minLength) {
+        throw new McpError('MCP_ARGUMENT_REQUIRED', `${where}.${field} must not be empty`);
+      }
+      out[field] = (field === TASK_DESCRIPTION_FIELDS.goal || field === TASK_DESCRIPTION_FIELDS.summary)
+        ? canonicalizeToolDescription({ name: where }, field, value)
+        : value;
       continue;
     }
     if (declared.type === 'array') {
@@ -1101,7 +1233,63 @@ function validateArgs(tool, args) {
       throw new McpError('MCP_ARGUMENTS_INVALID', 'delegate_result cannot combine reviewNoteOffset and completionSummaryOffset');
     }
   }
+  if (tool.name === 'delegate_plan') {
+    validatePlanArgs(out);
+  }
   return out;
+}
+
+const PLAN_ACTION_ALLOWED = Object.freeze({
+  create: Object.freeze(['action', 'title', 'goalDescription', 'parentNodeId', 'workspacePath', 'nodes']),
+  update: Object.freeze(['action', 'nodeId', 'title', 'goalDescription', 'workspacePath']),
+  review: Object.freeze(['action', 'nodeId', 'decision', 'note', 'completionSummary']),
+  get: Object.freeze(['action', 'nodeId']),
+  list: Object.freeze(['action', 'workspacePath']),
+});
+
+function validatePlanArgs(out) {
+  const action = out.action;
+  const allowed = PLAN_ACTION_ALLOWED[action];
+  for (const key of Object.keys(out)) {
+    if (!allowed.includes(key)) {
+      throw new McpError('MCP_ARGUMENTS_INVALID', `delegate_plan action "${action}" does not accept ${JSON.stringify(key)}`);
+    }
+  }
+  if (action === 'create') {
+    if (out.nodes !== undefined) {
+      if (out.nodes.length === 0 || out.nodes.length > MAX_PLAN_BATCH) {
+        throw new McpError('MCP_ARGUMENT_RANGE', `delegate_plan.nodes must contain 1..${MAX_PLAN_BATCH} items`);
+      }
+      if (out.title !== undefined || out.goalDescription !== undefined) {
+        throw new McpError('MCP_ARGUMENTS_INVALID', 'delegate_plan cannot combine batch `nodes` with top-level `title` or `goalDescription`');
+      }
+    } else if (typeof out.title !== 'string' || out.title.trim() === '') {
+      throw new McpError('MCP_ARGUMENT_REQUIRED', 'delegate_plan create requires `title` (or a non-empty `nodes` batch)');
+    }
+    return;
+  }
+  if (action === 'update') {
+    if (typeof out.nodeId !== 'string' || out.nodeId.trim() === '') {
+      throw new McpError('MCP_ARGUMENT_REQUIRED', 'delegate_plan update requires `nodeId`');
+    }
+    if (out.title === undefined && out.goalDescription === undefined && out.workspacePath === undefined) {
+      throw new McpError('MCP_ARGUMENT_REQUIRED', 'delegate_plan update requires at least one of `title`, `goalDescription` or `workspacePath`');
+    }
+    return;
+  }
+  if (action === 'review') {
+    for (const req of ['nodeId', 'decision', 'note']) {
+      if (typeof out[req] !== 'string' || out[req].trim() === '') {
+        throw new McpError('MCP_ARGUMENT_REQUIRED', `delegate_plan review requires a non-empty \`${req}\``);
+      }
+    }
+    return;
+  }
+  if (action === 'get') {
+    if (typeof out.nodeId !== 'string' || out.nodeId.trim() === '') {
+      throw new McpError('MCP_ARGUMENT_REQUIRED', 'delegate_plan get requires `nodeId`');
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

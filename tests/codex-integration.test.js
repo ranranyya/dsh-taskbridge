@@ -97,7 +97,7 @@ for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} m
     assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
   }
 });
-const DELIVERABLE_VERSION = '1.5.4';
+const DELIVERABLE_VERSION = '1.6.0';
 
 // The 1.5.0 allow-list entries are the OLD published identity of the template. This
 // working tree's template text has grown (team, same-chain preflight, review evidence
@@ -152,7 +152,7 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
     assert.deepEqual(refreshed.changed, ['agent']);
     assert.deepEqual(refreshed.refused, []);
     assert.equal(refreshed.status.agent.state, 'installed');
-    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.5\.4"$/mu);
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.6\.0"$/mu);
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
   } finally {
     fixture.cleanup();
@@ -4230,7 +4230,7 @@ test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () =
   assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0'
     && entry.sha256 === '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b'), true);
   // The public version matches this formal release; historical identity registration is separate.
-  assert.equal(DELIVERABLE_VERSION, '1.5.4');
+  assert.equal(DELIVERABLE_VERSION, '1.6.0');
 });
 
 test('an untouched 1.5.1-test.1 install (LF and CRLF) upgrades to this candidate, idempotently', async () => {
@@ -4737,7 +4737,7 @@ for (const [label, prior] of test2ByteForms().map(([name, text]) => [name, text]
       // The artifact is compared EXACTLY against the CRLF-template -> LF + formal version
       // rendering; nothing is folded on the file that was actually written.
       assert.equal(upgraded, expected, `${label}: exactly the template LF text stamped ${DELIVERABLE_VERSION}`);
-      assert.equal(upgraded.includes('version = "1.5.4"'), true, `${label}: the formal version line`);
+      assert.equal(upgraded.includes(`version = "${DELIVERABLE_VERSION}"`), true, `${label}: the formal version line`);
       assert.equal(upgraded.includes('\r'), false, `${label}: the managed file is LF, like every install`);
       // config.toml: every operator byte is preserved verbatim, and the ONLY addition is the
       // plugin's own marked MCP entry, still CRLF like the file it was appended to.

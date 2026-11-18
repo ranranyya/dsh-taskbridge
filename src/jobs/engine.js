@@ -87,6 +87,7 @@ import {
   sameRecordedDirectory,
 } from './continuation-identity.js';
 import { taskTitle } from './title.js';
+import { MAX_PLAN_DEPTH } from './plan-store.js';
 import { REVIEW_STATES, reviewWork } from '../review/reviewer.js';
 import { buildReviewPrompt, buildWorkerPrompt } from '../review/prompts.js';
 import { captureBaseline, captureDiff } from '../workspace/audit.js';
@@ -167,6 +168,15 @@ export const JOB_CODES = Object.freeze({
   reviewInvalid: 'JOB_REVIEW_INVALID',
   reviewNotPersisted: 'JOB_REVIEW_NOT_PERSISTED',
   descriptionInvalid: 'JOB_DESCRIPTION_INVALID',
+  planRefInvalid: 'JOB_PLAN_REF_INVALID',
+  planRefConflict: 'JOB_PLAN_REF_CONFLICT',
+  planNodeNotFound: 'JOB_PLAN_NODE_NOT_FOUND',
+  parentNodeNotFound: 'JOB_PARENT_NODE_NOT_FOUND',
+  planSourceMismatch: 'JOB_PLAN_SOURCE_MISMATCH',
+  planContinuationConflict: 'JOB_PLAN_CONTINUATION_CONFLICT',
+  planDepthExceeded: 'JOB_PLAN_DEPTH_EXCEEDED',
+  planCycleDetected: 'JOB_PLAN_CYCLE_DETECTED',
+  planStoreUnavailable: 'JOB_PLAN_STORE_UNAVAILABLE',
 });
 
 /** Default interval of the internal authorization sweep. */
@@ -387,6 +397,7 @@ export class JobEngine {
     // store, so a restart reports its own `interrupted` records instead of this
     // engine resurrecting tasks it never admitted.
     this.history = deps?.history ?? null;
+    this.plans = deps?.plans ?? null;
     this.tasks = new Map();
     this.aborted = false;
     this.sweepTimer = null;
@@ -550,6 +561,22 @@ export class JobEngine {
       });
     }
     const continueFromTaskId = typeof rawContinuation === 'string' ? rawContinuation.trim() : '';
+    const rawPlanNodeId = request?.planNodeId;
+    if (rawPlanNodeId !== undefined && typeof rawPlanNodeId !== 'string') {
+      throw new JobError(JOB_CODES.planRefInvalid, 'planNodeId must be a string', {
+        field: 'planNodeId',
+        requestedType: rawPlanNodeId === null ? 'null' : typeof rawPlanNodeId,
+      });
+    }
+    const planNodeId = typeof rawPlanNodeId === 'string' ? rawPlanNodeId.trim() : '';
+    const rawParentNodeId = request?.parentNodeId;
+    if (rawParentNodeId !== undefined && typeof rawParentNodeId !== 'string') {
+      throw new JobError(JOB_CODES.planRefInvalid, 'parentNodeId must be a string', {
+        field: 'parentNodeId',
+        requestedType: rawParentNodeId === null ? 'null' : typeof rawParentNodeId,
+      });
+    }
+    const parentNodeId = typeof rawParentNodeId === 'string' ? rawParentNodeId.trim() : '';
     const goal = canonicalTaskDescription(request?.goalDescription, TASK_DESCRIPTION_FIELDS.goal, redactText);
     if (goal.ok === false) {
       throw new JobError(JOB_CODES.descriptionInvalid, goal.refusal.message, {
@@ -568,6 +595,8 @@ export class JobEngine {
     // Frozen before the first await so the task record states, from the moment it
     // exists, whether it starts a conversation or continues one.
     task.continueFromTaskId = continueFromTaskId === '' ? null : continueFromTaskId;
+    task.planNodeId = planNodeId === '' ? null : planNodeId;
+    task.parentNodeId = parentNodeId === '' ? null : parentNodeId;
     task.goalDescription = goal.value;
     this.tasks.set(task.taskId, task);
     this.prune();
@@ -614,6 +643,8 @@ export class JobEngine {
       // conversation. Frozen at creation: it is what the run does with its session,
       // and it must not be re-read after the first await.
       continueFromTaskId: null,
+      planNodeId: null,
+      parentNodeId: null,
       goalDescription: null,
       connectionId: null,
       grantId: null,
@@ -783,6 +814,10 @@ export class JobEngine {
       task.phase = 'continuation';
       await this.assertContinuation(task, sourcePath);
       this.assertLive(task, 'continuation');
+    } else if (task.planNodeId !== null || task.parentNodeId !== null) {
+      task.phase = 'plan-hierarchy';
+      await this.assertPlanHierarchy(task, sourcePath);
+      this.assertLive(task, 'plan-hierarchy');
     }
 
     // ---- 3. one immutable settings snapshot ----------------------------------
@@ -1653,6 +1688,8 @@ export class JobEngine {
         executionPathDigest: pathDigest(parent.executionPath),
         isolation: parent.effective?.worker?.isolation ?? null,
         conversation: parent.execution?.conversation ?? null,
+        planNodeId: parent.planNodeId ?? null,
+        parentNodeId: parent.parentNodeId ?? null,
       };
     } else {
       const durable = await this.durableParent(task, parentId, caller);
@@ -1665,6 +1702,8 @@ export class JobEngine {
         executionPathDigest: durable.executionPathDigest ?? null,
         isolation: durable.isolation ?? null,
         conversation: durable.execution?.conversation ?? null,
+        planNodeId: durable.planNodeId ?? null,
+        parentNodeId: durable.parentNodeId ?? null,
       };
     }
 
@@ -1673,10 +1712,189 @@ export class JobEngine {
     task.continuationIdentity = await this.readContinuationIdentity(task);
     this.admitContinuation(task, row, sourcePath);
 
+    // `continueFromTaskId` connects rectification rounds of the SAME node: a follow-up
+    // inherits its parent's hierarchy and refuses conflicting hierarchy overrides.
+    const parentPlanId = row.planNodeId ?? null;
+    const parentTreeId = row.parentNodeId ?? null;
+    if (task.planNodeId !== null && task.planNodeId !== parentPlanId) {
+      throw new JobError(
+        JOB_CODES.planContinuationConflict,
+        'continueFromTaskId continues the same work item and cannot switch planNodeId; omit continueFromTaskId to start a separate subtask',
+        {
+          continueFromTaskId: parentId,
+          requestedPlanNodeId: task.planNodeId,
+          parentPlanNodeId: parentPlanId,
+        },
+      );
+    }
+    if (task.parentNodeId !== null && task.parentNodeId !== parentTreeId) {
+      throw new JobError(
+        JOB_CODES.planContinuationConflict,
+        'continueFromTaskId continues the same work item and cannot switch parentNodeId; omit continueFromTaskId to start a separate child subtask',
+        {
+          continueFromTaskId: parentId,
+          requestedParentNodeId: task.parentNodeId,
+          parentParentNodeId: parentTreeId,
+        },
+      );
+    }
+    task.planNodeId = parentPlanId;
+    task.parentNodeId = parentTreeId;
+
     // Recorded only after every check passed: these two facts are what admission's
     // isolation and worktree steps read to resume the parent instead of starting over.
     task.continuationParent = parent;
     task.continuationRecord = task.continuationIdentity;
+  }
+
+  async assertPlanHierarchy(task, sourcePath) {
+    const caller = typeof task.connectionId === 'string' && task.connectionId !== '' ? task.connectionId : null;
+    if (caller === null) {
+      throw new JobError(JOB_CODES.planNodeNotFound, 'no such plan node for this connection', {});
+    }
+    if (task.planNodeId !== null) {
+      if (this.plans === null || typeof this.plans.get !== 'function') {
+        throw new JobError(JOB_CODES.planStoreUnavailable, 'the plan store is unavailable in this deployment', {
+          planNodeId: task.planNodeId,
+        });
+      }
+      const planNode = await this.guardPreflight(task, 'plan-lookup', () => this.plans.get(task.planNodeId, caller));
+      if (planNode === null) {
+        throw new JobError(JOB_CODES.planNodeNotFound, 'no such plan node for this connection', {
+          planNodeId: task.planNodeId,
+        });
+      }
+      const expectedParent = planNode.parentNodeId ?? null;
+      if (task.parentNodeId !== null && task.parentNodeId !== expectedParent) {
+        throw new JobError(
+          JOB_CODES.planRefConflict,
+          'parentNodeId conflicts with the named planNodeId\'s recorded parentNodeId',
+          {
+            planNodeId: task.planNodeId,
+            parentNodeId: task.parentNodeId,
+            expectedParentNodeId: expectedParent,
+          },
+        );
+      }
+      if (planNode.sourcePath !== null || planNode.sourcePathDigest !== null) {
+        if (!recordedDirectoryIs({ path: planNode.sourcePath, digest: planNode.sourcePathDigest }, sourcePath)) {
+          throw new JobError(JOB_CODES.planSourceMismatch, 'the named plan node belongs to another source repository', {
+            planNodeId: task.planNodeId,
+          });
+        }
+      }
+      // Canonicalize: `planNodeId` already owns the parent link via `plan.json`.
+      task.parentNodeId = null;
+      return;
+    }
+
+    // `task.parentNodeId !== null` (child subtask directly under a plan node or an earlier task).
+    if (task.parentNodeId === task.taskId) {
+      throw new JobError(JOB_CODES.planCycleDetected, 'a task cannot be its own parentNodeId', {
+        parentNodeId: task.parentNodeId,
+      });
+    }
+    const parentFacts = await this.guardPreflight(task, 'parent-lookup', () => (
+      this.resolveHierarchyParentFacts(task.parentNodeId, caller)
+    ));
+    if (parentFacts === null) {
+      throw new JobError(JOB_CODES.parentNodeNotFound, 'no such parent node for this connection', {
+        parentNodeId: task.parentNodeId,
+      });
+    }
+    if (parentFacts.sourcePath !== null || parentFacts.sourcePathDigest !== null) {
+      if (!recordedDirectoryIs({ path: parentFacts.sourcePath, digest: parentFacts.sourcePathDigest }, sourcePath)) {
+        throw new JobError(JOB_CODES.planSourceMismatch, 'the named parent node belongs to another source repository', {
+          parentNodeId: task.parentNodeId,
+        });
+      }
+    }
+    const nextDepth = parentFacts.depth + 1;
+    if (nextDepth > MAX_PLAN_DEPTH) {
+      throw new JobError(
+        JOB_CODES.planDepthExceeded,
+        `task hierarchy depth ${nextDepth} exceeds the maximum of ${MAX_PLAN_DEPTH}`,
+        { parentNodeId: task.parentNodeId, depth: nextDepth, maxDepth: MAX_PLAN_DEPTH },
+      );
+    }
+  }
+
+  async resolveHierarchyParentFacts(targetId, connectionId, planCache = null) {
+    const planMap = planCache instanceof Map
+      ? planCache
+      : (this.plans && typeof this.plans.load === 'function'
+        ? new Map((await this.plans.load({ connectionId })).map((n) => [n.nodeId, n]))
+        : new Map());
+    const historyRows = this.history && typeof this.history.load === 'function'
+      ? await this.history.load()
+      : [];
+    const historyById = new Map();
+    for (const row of Array.isArray(historyRows) ? historyRows : []) {
+      if (row && typeof row.taskId === 'string' && row.connectionId === connectionId) {
+        historyById.set(row.taskId, row);
+      }
+    }
+
+    const readNode = (id) => {
+      const plan = planMap.get(id) ?? null;
+      if (plan !== null && plan.connectionId === connectionId) {
+        return {
+          kind: 'plan',
+          id: plan.nodeId,
+          nextId: plan.parentNodeId ?? null,
+          sourcePath: plan.sourcePath ?? null,
+          sourcePathDigest: plan.sourcePathDigest ?? null,
+        };
+      }
+      const live = this.tasks.get(id) ?? null;
+      if (live !== null && live.connectionId === connectionId) {
+        return {
+          kind: 'task',
+          id: live.taskId,
+          nextId: live.planNodeId ?? live.parentNodeId ?? live.continueFromTaskId ?? null,
+          countsDepth: live.planNodeId === null && live.continueFromTaskId === null,
+          sourcePath: live.sourcePath ?? null,
+          sourcePathDigest: pathDigest(live.sourcePath),
+        };
+      }
+      const stored = historyById.get(id) ?? null;
+      if (stored !== null) {
+        return {
+          kind: 'task',
+          id: stored.taskId,
+          nextId: stored.planNodeId ?? stored.parentNodeId ?? stored.continueFromTaskId ?? null,
+          countsDepth: (stored.planNodeId ?? null) === null && (stored.continueFromTaskId ?? null) === null,
+          sourcePath: stored.sourcePath ?? null,
+          sourcePathDigest: stored.sourcePathDigest ?? null,
+        };
+      }
+      return null;
+    };
+
+    const first = readNode(targetId);
+    if (first === null) return null;
+
+    const visited = new Set();
+    let cur = first;
+    let depth = 0;
+    while (cur !== null) {
+      if (visited.has(cur.id)) {
+        throw new JobError(JOB_CODES.planCycleDetected, 'parent ancestry contains a cycle', {
+          parentNodeId: targetId,
+        });
+      }
+      visited.add(cur.id);
+      if (cur.kind === 'plan' || cur.countsDepth !== false) depth += 1;
+      cur = cur.nextId !== null ? readNode(cur.nextId) : null;
+    }
+
+    return {
+      found: true,
+      kind: first.kind,
+      depth: Math.max(1, depth),
+      sourcePath: first.sourcePath,
+      sourcePathDigest: first.sourcePathDigest,
+    };
   }
 
   /**
@@ -4780,6 +4998,12 @@ export class JobEngine {
       // Frozen on the task at creation, so the record states the intent even when
       // the run never got as far as driving a conversation.
       continueFromTaskId: task.continueFromTaskId ?? null,
+      ...(typeof task.planNodeId === 'string' && task.planNodeId !== ''
+        ? { planNodeId: task.planNodeId }
+        : {}),
+      ...(typeof task.parentNodeId === 'string' && task.parentNodeId !== ''
+        ? { parentNodeId: task.parentNodeId }
+        : {}),
       ...(typeof task.goalDescription === 'string' && task.goalDescription !== ''
         ? { goalDescription: task.goalDescription }
         : {}),

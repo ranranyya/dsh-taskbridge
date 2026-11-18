@@ -95,6 +95,7 @@ const EXPECTED_TOOLS = [
   'delegate_cancel',
   'delegate_metrics',
   'delegate_permission_decide',
+  'delegate_plan',
   'delegate_preflight',
   // Answers an ordinary question a worker asked. It is not an approval and grants
   // nothing (see the dedicated assertions below).
@@ -110,9 +111,9 @@ const EXPECTED_TOOLS = [
 // 1. The exposed surface cannot authorize, configure or touch credentials
 // ---------------------------------------------------------------------------
 
-test('the MCP surface exposes exactly ten bounded tools and no control-plane tool', () => {
+test('the MCP surface exposes exactly eleven bounded tools and no control-plane tool', () => {
   assert.deepEqual(TOOLS.map((tool) => tool.name).sort(), EXPECTED_TOOLS);
-  assert.equal(TOOLS.length, 10);
+  assert.equal(TOOLS.length, 11);
   // Named explicitly so the reason is in the failure message, not only in a diff.
   for (const forbidden of ['connection', 'grant', 'settings', 'credential', 'secret', 'authorize']) {
     for (const tool of TOOLS) {
@@ -224,6 +225,7 @@ test('every tool carries accurate MCP annotations, and the long wait is not anno
       ['delegate_permission_decide', false],
       ['delegate_question_answer', false],
       ['delegate_review', false],
+      ['delegate_plan', false],
       ['delegate_preflight', true],
       ['delegate_metrics', true],
     ],
@@ -257,6 +259,7 @@ test('each tool reaches exactly its own execution-plane route', async () => {
     { taskId: 't1', requestId: 'permission-t1-1', decision: 'reject', reason: 'no', fingerprint: 'sha256:abc' }],
     ['delegate_review', { taskId: 't1', decision: 'accepted', note: 'reviewed' }, 'review',
       { taskId: 't1', decision: 'accepted', note: 'reviewed' }],
+    ['delegate_plan', { action: 'list' }, 'plan', { action: 'list' }],
     // The question answer reaches its own route and forwards only the answer body; the
     // MCP-only flag is stripped at this boundary.
     ['delegate_question_answer', {

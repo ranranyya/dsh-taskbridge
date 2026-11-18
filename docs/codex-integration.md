@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.5.4 (persisted task descriptions, commander planning, placement checks, and managed template upgrades). This automatic installer covers Codex, the currently supported client. Claude Code and Claude Desktop integration is planned for 2.0; see the separate roadmap.
+Status: implemented in 1.6.0 (planning nodes, multi-level parent-child hierarchy, persisted task descriptions, commander planning, placement checks, and managed template upgrades). This automatic installer covers Codex, the currently supported client. Claude Code and Claude Desktop integration is planned for 2.0; see the separate roadmap.
 
 1.5.1 refreshes the manifest on each activation, resolves a normal linked home root, and upgrades exact shipped/candidate templates while preserving custom content. See [1.5.1 notes](releases/1.5.1.zh.md).
 
@@ -532,7 +532,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.5.4",
+  "packageVersion": "1.6.0",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,

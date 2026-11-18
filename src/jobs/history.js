@@ -284,6 +284,21 @@ export class HistoryStore {
             merged = { ...(merged ?? entry), goalDescription: savedGoal };
           }
         }
+        for (const hierarchyField of ['planNodeId', 'parentNodeId']) {
+          const savedRef = draft[index][hierarchyField];
+          if (typeof savedRef === 'string' && savedRef !== '') {
+            const incomingRef = entry[hierarchyField];
+            if (incomingRef !== undefined && incomingRef !== savedRef) {
+              throw new HistoryError(HISTORY_CODES.viewInvalid, `a saved ${hierarchyField} cannot be replaced by a different one`, {
+                taskId: entry.taskId,
+                field: hierarchyField,
+              });
+            }
+            if (incomingRef !== savedRef) {
+              merged = { ...(merged ?? entry), [hierarchyField]: savedRef };
+            }
+          }
+        }
         if (merged !== null) {
           entry = projectView(merged, this.maxEntryBytes, { rejectOversizeNote: true });
         }
@@ -347,6 +362,23 @@ export class HistoryStore {
             taskId,
             field: TASK_DESCRIPTION_FIELDS.goal,
           });
+        }
+      }
+      for (const hierarchyField of ['planNodeId', 'parentNodeId']) {
+        const storedRef = base[index][hierarchyField];
+        if (typeof storedRef === 'string' && storedRef !== '') {
+          if (entry[hierarchyField] === undefined) {
+            throw new HistoryError(HISTORY_CODES.viewInvalid, `a history update may not erase ${hierarchyField}`, {
+              taskId,
+              field: hierarchyField,
+            });
+          }
+          if (entry[hierarchyField] !== storedRef) {
+            throw new HistoryError(HISTORY_CODES.viewInvalid, `a history update may not replace ${hierarchyField}`, {
+              taskId,
+              field: hierarchyField,
+            });
+          }
         }
       }
       const storedReview = base[index].hostAcceptance;
@@ -634,6 +666,8 @@ function projectView(view, maxEntryBytes, options = {}) {
   // Both are omitted when absent, so a load does not rewrite a document to add the new keys.
   const title = titleText(view.title, ctx);
   const continueFrom = continuationRef(view.continueFromTaskId, taskId);
+  const planNodeId = continuationRef(view.planNodeId, taskId);
+  const parentNodeId = continuationRef(view.parentNodeId, taskId);
   const goalDescription = descriptionText(
     view.goalDescription, ctx, TASK_DESCRIPTION_FIELDS.goal, { rejectOversize: options.rejectOversizeNote === true },
   );
@@ -642,6 +676,8 @@ function projectView(view, maxEntryBytes, options = {}) {
     state: view.state,
     ...(title === '' ? {} : { title }),
     ...(continueFrom === null ? {} : { continueFromTaskId: continueFrom }),
+    ...(planNodeId === null ? {} : { planNodeId }),
+    ...(parentNodeId === null ? {} : { parentNodeId }),
     // Only present when the commander stated a goal: nothing is derived from the prompt.
     ...(goalDescription === null ? {} : { goalDescription }),
     phase: label(view.phase),

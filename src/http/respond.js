@@ -156,8 +156,20 @@ function statusForCode(code) {
   if (code === 'JOB_ARCHIVED_TASK') return 409;
   // A malformed review request is the caller's mistake; an unpersisted one is an
   // upstream failure; "this task cannot be reviewed (now)" conflicts with its state.
-  if (code === 'JOB_REVIEW_INVALID') return 400;
-  if (code === 'JOB_REVIEW_NOT_PERSISTED') return 502;
+  if (code === 'JOB_REVIEW_INVALID' || code === 'JOB_DESCRIPTION_INVALID'
+    || code === 'JOB_PLAN_REF_INVALID' || code === 'JOB_PLAN_REF_CONFLICT') {
+    return 400;
+  }
+  if (code === 'JOB_REVIEW_NOT_PERSISTED' || code === 'PLAN_WRITE_FAILED') return 502;
+  if (code === 'JOB_PLAN_STORE_UNAVAILABLE' || code === 'PLAN_UNREADABLE' || code === 'PLAN_FILE_TOO_LARGE'
+    || code === 'PLAN_MALFORMED' || code === 'PLAN_SCHEMA_UNSUPPORTED' || code === 'PLAN_DISPOSED') {
+    return 503;
+  }
+  if (code === 'PLAN_INVALID' || code === 'PLAN_TITLE_INVALID'
+    || code === 'PLAN_DESCRIPTION_INVALID' || code === 'PLAN_REVIEW_INVALID') {
+    return 400;
+  }
+  if (code.startsWith('PLAN_')) return 409;
   if (code.startsWith('JOB_')) return 409;
   // The credential seam is a separate service. "It is not installed here" is a
   // capability gap (503), "the backend refused the write" is an upstream failure

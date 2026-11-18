@@ -78,6 +78,7 @@ const ROUTES = Object.freeze({
   // registers exactly `/tasks/review`, so a missing entry here refused the one call that
   // records `hostAcceptance` with `MCP_ROUTE_UNMAPPED` before any request was sent.
   review: Object.freeze({ method: 'POST', path: '/tasks/review' }),
+  plan: Object.freeze({ method: 'POST', path: '/plans' }),
   // Read-only workspace facts. Registered on the execution plane beside `/status`
   // so it answers with the switch off; it creates nothing to clean up.
   preflight: Object.freeze({ method: 'POST', path: '/workspace/preflight' }),

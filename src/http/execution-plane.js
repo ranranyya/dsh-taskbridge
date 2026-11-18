@@ -26,6 +26,9 @@ import {
   TASK_DESCRIPTION_FIELDS,
   canonicalTaskDescription,
 } from '../jobs/task-descriptions.js';
+import { PLAN_CODES } from '../jobs/plan-store.js';
+import { buildTaskTree } from '../jobs/task-tree.js';
+import { recordedDirectoryIs } from '../jobs/continuation-identity.js';
 
 /** Route prefix owned by this plane. Deliberately not under `/api`. */
 export const EXECUTION_PREFIX = '/dsh-delegate/x';
@@ -88,6 +91,7 @@ export function createExecutionHandler(deps) {
     // is NOT gated by the delegation switch — like `/tasks/get` and `/tasks/cancel`, it
     // stays answerable with the switch off.
     ['POST /tasks/review', recordHostReview],
+    ['POST /plans', managePlans],
     // Read-only workspace inspection for a dispatcher: the facts and the isolation
     // recommendation that used to be discovered only when a job admitted. It is a
     // separate route — not a field on `/tasks` — because it neither authorizes nor
@@ -255,6 +259,16 @@ async function submitTask({ req, res, connection, deps }) {
   }
   // The canonical value travels on; the engine re-derives the same form (a no-op).
   const goalField = goal.value === null ? {} : { goalDescription: goal.value };
+  if (body.planNodeId !== undefined && typeof body.planNodeId !== 'string') {
+    throw new HttpError(400, 'JOB_PLAN_REF_INVALID', 'planNodeId must be a string', { field: 'planNodeId' });
+  }
+  if (body.parentNodeId !== undefined && typeof body.parentNodeId !== 'string') {
+    throw new HttpError(400, 'JOB_PLAN_REF_INVALID', 'parentNodeId must be a string', { field: 'parentNodeId' });
+  }
+  const hierarchyFields = {
+    ...(body.planNodeId === undefined ? {} : { planNodeId: body.planNodeId }),
+    ...(body.parentNodeId === undefined ? {} : { parentNodeId: body.parentNodeId }),
+  };
   if (deps.engine.authorizationMode === 'switch') {
     const task = await deps.engine.start({
       connectionId: connection.connectionId,
@@ -263,6 +277,7 @@ async function submitTask({ req, res, connection, deps }) {
       ...(body.title === undefined ? {} : { title: body.title }),
       overrides,
       ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
+      ...hierarchyFields,
       ...goalField,
     });
     sendJson(res, 202, { ok: true, task });
@@ -282,6 +297,7 @@ async function submitTask({ req, res, connection, deps }) {
     ...(body.title === undefined ? {} : { title: body.title }),
     overrides,
     ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
+    ...hierarchyFields,
     ...goalField,
   });
   sendJson(res, 202, { ok: true, task });
@@ -769,4 +785,187 @@ async function preflight({ req, res, deps }) {
     allowShared: body.allowShared === true,
   });
   sendJson(res, 200, result);
+}
+
+const PLAN_ALLOWED_FIELDS = Object.freeze({
+  create: Object.freeze(['action', 'title', 'goalDescription', 'parentNodeId', 'workspacePath', 'nodes']),
+  update: Object.freeze(['action', 'nodeId', 'title', 'goalDescription', 'workspacePath', 'parentNodeId']),
+  review: Object.freeze(['action', 'nodeId', 'decision', 'note', 'completionSummary']),
+  get: Object.freeze(['action', 'nodeId']),
+  list: Object.freeze(['action', 'workspacePath']),
+});
+
+async function managePlans({ req, res, connection, deps }) {
+  const body = await readJsonBody(req);
+  const action = typeof body.action === 'string' ? body.action.trim() : '';
+  const allowedFields = PLAN_ALLOWED_FIELDS[action];
+  if (allowedFields === undefined) {
+    throw new HttpError(400, PLAN_CODES.invalid, 'action must be one of create, update, review, get, list');
+  }
+  for (const key of Object.keys(body)) {
+    if (!allowedFields.includes(key)) {
+      throw new HttpError(400, PLAN_CODES.invalid, `plan ${action} does not accept field ${JSON.stringify(key)}`, {
+        action,
+        field: key,
+      });
+    }
+  }
+
+  if (action === 'create' || action === 'update') {
+    if (deps.engine.posture().authorized !== true) {
+      const code = deps.engine.authorizationMode === 'switch' ? 'DELEGATION_DISABLED' : 'JOB_NOT_AUTHORIZED';
+      const msg = deps.engine.authorizationMode === 'switch'
+        ? 'delegation is disabled in DSH settings'
+        : 'no live delegation authorization exists';
+      throw new HttpError(403, code, msg);
+    }
+  }
+
+  const plans = deps.plans ?? deps.engine?.plans ?? null;
+  if (plans === null || typeof plans.load !== 'function') {
+    throw new HttpError(503, 'JOB_PLAN_STORE_UNAVAILABLE', 'the plan store is unavailable in this deployment');
+  }
+
+  const connectionId = connection.connectionId;
+
+  if (action === 'create') {
+    const resolveExternalParent = typeof deps.engine?.resolveHierarchyParentFacts === 'function'
+      ? (parentId, connId, existingPlanMap) => deps.engine.resolveHierarchyParentFacts(parentId, connId, existingPlanMap)
+      : undefined;
+    const outcome = await plans.create({ ...body, connectionId }, { resolveExternalParent });
+    sendJson(res, 201, {
+      ok: true,
+      ...(outcome.node !== undefined ? { node: outcome.node } : {}),
+      nodes: outcome.nodes,
+    });
+    return;
+  }
+
+  if (action === 'update') {
+    const node = await plans.update({ ...body, connectionId });
+    sendJson(res, 200, { ok: true, node });
+    return;
+  }
+
+  if (action === 'review') {
+    const outcome = await plans.review({ ...body, connectionId });
+    sendJson(res, 200, { ok: true, node: outcome.node, replayed: outcome.replayed });
+    return;
+  }
+
+  if (action === 'get') {
+    const nodeId = typeof body.nodeId === 'string' ? body.nodeId.trim() : '';
+    if (nodeId === '') {
+      throw new HttpError(400, PLAN_CODES.invalid, 'nodeId is required for plan get', { field: 'nodeId' });
+    }
+    const node = await plans.get(nodeId, connectionId);
+    if (node === null) {
+      throw new HttpError(404, PLAN_CODES.nodeNotFound, 'no such plan node for this connection', { nodeId });
+    }
+    const { planNodes, tasks } = await connectionTreeInputs(deps, connectionId);
+    const tree = buildTaskTree({ planNodes, tasks });
+    const treeNode = findTreeNode(tree.roots, node.nodeId);
+    sendJson(res, 200, {
+      ok: true,
+      node,
+      treeNode: treeNode === null ? null : compactTreeNodeSummary(treeNode),
+    });
+    return;
+  }
+
+  let { planNodes, tasks } = await connectionTreeInputs(deps, connectionId);
+  if (body.workspacePath !== undefined) {
+    if (typeof body.workspacePath !== 'string' || body.workspacePath.trim() === '') {
+      throw new HttpError(400, PLAN_CODES.invalid, 'workspacePath must be a non-empty string when provided', {
+        field: 'workspacePath',
+      });
+    }
+    const targetWs = body.workspacePath.trim();
+    planNodes = planNodes.filter((n) => (
+      (n.sourcePath !== null || n.sourcePathDigest !== null)
+      && recordedDirectoryIs({ path: n.sourcePath, digest: n.sourcePathDigest }, targetWs)
+    ));
+    tasks = tasks.filter((t) => (
+      (t.sourcePath !== null || t.sourcePathDigest !== null)
+      && recordedDirectoryIs({ path: t.sourcePath, digest: t.sourcePathDigest }, targetWs)
+    ));
+  }
+  const tree = buildTaskTree({ planNodes, tasks });
+  sendJson(res, 200, {
+    ok: true,
+    nodes: planNodes,
+    tree: {
+      flatNodes: tree.flatNodes,
+      orphans: tree.orphans,
+      projects: tree.projects,
+      counts: tree.counts,
+    },
+  });
+}
+
+async function connectionTreeInputs(deps, connectionId) {
+  const plans = deps.plans ?? deps.engine?.plans ?? null;
+  const planNodes = plans && typeof plans.load === 'function'
+    ? await plans.load({ connectionId })
+    : [];
+  const live = typeof deps.engine?.list === 'function'
+    ? deps.engine.list({ connectionId })
+    : [];
+  const liveIds = new Set(live.map((t) => t.taskId));
+  const historyStore = deps.history ?? deps.engine?.history ?? null;
+  const tasks = [...live];
+  if (historyStore && typeof historyStore.load === 'function') {
+    const stored = await historyStore.load();
+    for (const row of Array.isArray(stored) ? stored : []) {
+      if (!row || row.connectionId !== connectionId || liveIds.has(row.taskId)) continue;
+      tasks.push(typeof deps.engine?.historyViewOf === 'function' ? deps.engine.historyViewOf(row) : row);
+    }
+  }
+  return { planNodes, tasks };
+}
+
+function findTreeNode(nodes, nodeId) {
+  for (const node of nodes) {
+    if (node.nodeId === nodeId) return node;
+    const found = findTreeNode(node.children ?? [], nodeId);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+function compactTreeNodeSummary(treeNode) {
+  return {
+    nodeId: treeNode.nodeId,
+    kind: treeNode.kind,
+    parentNodeId: treeNode.parentNodeId,
+    depth: treeNode.depth,
+    title: treeNode.title,
+    displayTitle: treeNode.displayTitle,
+    goalDescription: treeNode.goalDescription,
+    completionSummary: treeNode.completionSummary,
+    executed: treeNode.executed,
+    nodeStatus: treeNode.nodeStatus,
+    orphan: treeNode.orphan,
+    projectKey: treeNode.projectKey,
+    executions: (treeNode.executions ?? []).map((ch) => ({
+      chainId: ch.chainId,
+      rootTaskId: ch.rootTaskId,
+      latestTaskId: ch.latestTaskId,
+      roundCount: ch.roundCount,
+      taskIds: ch.taskIds,
+      nodeStatus: ch.nodeStatus,
+      brokenContinuation: ch.brokenContinuation,
+    })),
+    children: (treeNode.children ?? []).map((child) => ({
+      nodeId: child.nodeId,
+      kind: child.kind,
+      title: child.displayTitle,
+      executed: child.executed,
+      nodeStatus: child.nodeStatus,
+      roundCount: child.kind === 'plan'
+        ? child.executions.reduce((s, e) => s + e.roundCount, 0)
+        : child.chain.roundCount,
+      childCount: child.children.length,
+    })),
+  };
 }
