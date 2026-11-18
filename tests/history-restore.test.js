@@ -8,11 +8,12 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, realpath } from 'node:fs/promises';
+import { mkdir, readFile, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { JobEngine, JOB_CODES, REVIEW_PERSISTENCE_STATES, TASK_STATES } from '../src/jobs/engine.js';
 import { HistoryStore } from '../src/jobs/history.js';
+import { SessionStore } from '../src/runtime/session-placement.js';
 import { SettingsService } from '../src/config/settings.js';
 import { WorkspaceLocks } from '../src/workspace/locks.js';
 import { AuthorizationRegistry } from '../src/auth/grants.js';
@@ -69,10 +70,11 @@ async function fixture() {
   /**
    * Boot one engine over the SAME data directory, as a restart would.
    * @param {object} [options] - `history`: a store to share; `delegationEnabled`.
-   * @returns {Promise<object>} `{ engine, store }`.
+   * @returns {Promise<object>} `{ engine, store, sessionStore }`.
    */
   const boot = async (options = {}) => {
     const store = options.history ?? new HistoryStore(join(dir, 'data'));
+    const sessionStore = options.sessionStore ?? new SessionStore(join(dir, 'data'));
     const agents = fakeAgents({ respond: { text: 'implemented the change' } });
     const workspaces = fakeWorkspaceController();
     const sessionController = fakeSessionController({ workspaces, respond: { text: 'implemented the change' } });
@@ -100,12 +102,15 @@ async function fixture() {
         },
       },
       history: store,
+      // No session identity store by default, exactly as before: a test that needs a real
+      // `continueFromTaskId` opt-in supplies one. Nothing here changes the default.
+      ...(options.sessionStore === undefined ? {} : { sessionStore }),
       delegationEnabled: options.delegationEnabled ?? true,
       authorizationMode: options.authorizationMode ?? 'switch',
       logger: { info() {}, warn() {} },
     });
-    engines.push({ engine, store });
-    return { engine, store };
+    engines.push({ engine, store, sessionStore });
+    return { engine, store, sessionStore };
   };
 
   return {
@@ -116,9 +121,10 @@ async function fixture() {
     /** @returns {Promise<object>} plane deps for one engine. */
     deps: (engine) => ({ engine, auth: engine.auth, settings, logger: { warn() {} } }),
     async close() {
-      for (const { engine, store } of engines.reverse()) {
+      for (const { engine, store, sessionStore } of engines.reverse()) {
         await engine.dispose().catch(() => undefined);
         await store.flush().catch(() => undefined);
+        await sessionStore.dispose().catch(() => undefined);
       }
       await cleanup(dir);
     },
@@ -889,3 +895,72 @@ for (const fail of [false, true]) {
     } finally { release(); await f.close(); }
   });
 }
+
+// ---------------------------------------------------------------------------
+// 12. Title and continuation reference survive the round trip to the page and tools
+// ---------------------------------------------------------------------------
+
+test('an explicit title and continuation reference survive a restart through the user plane', async () => {
+  const f = await fixture();
+  try {
+    // A real task-thread identity map, so the explicit reference is genuinely ADMITTED and
+    // recorded rather than refused for want of a store. The restart below gets a fresh one
+    // over the same data directory, as a plugin reload would.
+    const first = await f.boot({ sessionStore: new SessionStore(join(f.dir, 'data')) });
+    const title = '续接标题 😀 保留 48 字内的原文';
+    const parentId = await finishedTask(f, first.engine);
+    // The engine's own namer gives the parent a title too (from its prompt); that live
+    // value — not a guess about it — is what the restarted record must agree with.
+    const parentLive = first.engine.get(parentId);
+    const parentTitle = parentLive.title;
+    assert.equal(typeof parentTitle, 'string');
+    assert.equal(parentTitle.length > 0, true, 'the engine names even an explicit-less task');
+    assert.equal(parentLive.continueFromTaskId, null, 'the first round continues nothing');
+
+    const childId = await finishedTask(f, first.engine, { title, continueFromTaskId: parentId });
+    const childView = first.engine.get(childId);
+    assert.equal(childView.title, title, 'the engine kept the explicit title as given');
+    assert.equal(childView.continueFromTaskId, parentId);
+    await first.store.flush();
+    await first.engine.dispose();
+
+    // ---- restart: nothing is live any more, and the identity map is reloaded ----
+    const second = await f.boot({ sessionStore: new SessionStore(join(f.dir, 'data')) });
+    assert.equal(second.engine.list().length, 0);
+    // The user plane reads the durable archive from `deps.history`, so the booted store is
+    // passed explicitly — the same wiring §11 uses.
+    const deps = { ...f.deps(second.engine), history: second.store };
+
+    // The list the page reads and the detail the tools read both keep the stored facts.
+    const [listed, detailed] = await pageRecords(deps, childId);
+    assert.equal(listed.title, title, 'the user-plane list keeps the stored title');
+    assert.equal(listed.continueFromTaskId, parentId, 'the user-plane list keeps the stored reference');
+    assert.equal(detailed.title, title);
+    assert.equal(detailed.continueFromTaskId, parentId);
+    assert.equal(detailed.source, 'history');
+
+    const got = await callPlane(deps, '/tasks/get', { taskId: childId });
+    assert.equal(got.status, 200);
+    assert.equal(got.body.task.title, title);
+    assert.equal(got.body.task.continueFromTaskId, parentId);
+    // Reading the archive is read-only: a stored record is never continued from here.
+    assert.equal(second.engine.list().length, 0, 'reading a restored record revived nothing');
+
+    // The parent's generated title is restored as the live value, and it stays an
+    // independent first round: it names no parent of its own.
+    const parent = await callPlane(deps, '/tasks/get', { taskId: parentId });
+    assert.equal(parent.status, 200);
+    assert.equal(parent.body.task.title, parentTitle, 'the engine-generated title is preserved, not dropped');
+    assert.equal(parent.body.task.continueFromTaskId ?? null, null);
+    const [parentListed] = await pageRecords(deps, parentId);
+    assert.equal(parentListed.title, parentTitle, 'the list agrees with the live value');
+    assert.equal(parentListed.continueFromTaskId ?? null, null);
+
+    // The stored record carries no prompt, so nothing can re-derive a title from one.
+    const raw = await readFile(join(f.dir, 'data', 'history.json'), 'utf8');
+    assert.equal(raw.includes('"prompt"'), false);
+    assert.equal(raw.includes(title), true);
+  } finally {
+    await f.close();
+  }
+});

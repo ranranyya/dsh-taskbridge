@@ -1,4 +1,4 @@
-# Worker session permissions (1.5.3; historical 1.0.0–1.2.0 audits retained)
+# Worker session permissions (1.5.4; historical 1.0.0–1.2.0 audits retained)
 
 This document describes the worker sandbox, per-call approval and ordinary-question boundaries. The standing worker sandbox remains `workspace-write`; a question answer never grants access. A single approved operation does not authorize another call.
 

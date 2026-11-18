@@ -1,6 +1,6 @@
 {
   "name": "dsh-taskbridge",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "让 Codex 指挥 DSH：在插件里选择已有 API、执行模型与思考强度，完成派工、静默等待、权限审批、集中审查和原会话续接。支持一键配置 Codex 智能体、可选模型复审与设置自动保存。Claude Code / Claude Desktop 接入预计在 2.0 上线。",
   "license": "MIT",
   "repository": {
@@ -84,6 +84,7 @@
     "docs/releases/1.5.3-test.1.zh.md",
     "docs/releases/1.5.3-test.2.zh.md",
     "docs/releases/1.5.3.zh.md",
+    "docs/releases/1.5.4.zh.md",
     "docs/assets/*.png"
   ],
   "dsh": {

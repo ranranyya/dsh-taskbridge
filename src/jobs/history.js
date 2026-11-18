@@ -16,6 +16,10 @@
 //  * A limit that cannot be met by evicting a terminal record is refused. A live
 //    (pending/running) job is never silently dropped.
 //
+// `continueFromTaskId` and `title` are omitted when absent; `goalDescription` and
+// `hostAcceptance.completionSummary` enforce <= 2000 code points on writes (never cut by fitting)
+// and truncate with markers on loads of older/external documents.
+//
 // On load, `pending`/`running` records become `interrupted` with
 // `error.code = JOB_INTERRUPTED_RESTART`. They are never resubmitted, and the
 // authorization that once covered them is not restored.
@@ -24,8 +28,14 @@ import { randomBytes } from 'node:crypto';
 import * as nodeFs from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
-import { redactDeep } from '../config/redact.js';
+import { redactDeep, redactText } from '../config/redact.js';
 import { REVIEW_NOTE_MAX_CHARS, truncateCodePoints } from './review-note.js';
+import {
+  TASK_DESCRIPTION_FIELDS,
+  TASK_DESCRIPTION_MAX_CHARS,
+  canonicalTaskDescription,
+  truncateTaskDescription,
+} from './task-descriptions.js';
 
 /** Persisted document format version. Unknown versions are refused, never migrated. */
 const SCHEMA_VERSION = 1;
@@ -50,6 +60,9 @@ const FIT_RESERVE = 512;
 const TRUNCATION_MARK = '… [truncated]';
 
 const MAX_PATH_CHARS = 4096;
+/** The truncation path of the completion summary, exactly as a reader sees it. */
+const SUMMARY_PATH = `hostAcceptance.${TASK_DESCRIPTION_FIELDS.summary}`;
+
 const MAX_LABEL_CHARS = 256;
 const MAX_MESSAGE_CHARS = 4096;
 const MAX_DETAIL_STRING_CHARS = 512;
@@ -246,15 +259,33 @@ export class HistoryStore {
         if (isTerminal(draft[index].state) && !isTerminal(entry.state)) return structuredClone(draft[index]);
         // Inspect the current row INSIDE the write queue. A terminal snapshot can
         // have been captured before a review, then queued behind its slow write.
+        let merged = null;
         const recorded = draft[index].hostAcceptance;
         if (recorded !== null && recorded !== undefined) {
-          if (entry.hostAcceptance !== null && entry.hostAcceptance !== undefined
-            && (entry.hostAcceptance.state !== recorded.state || entry.hostAcceptance.note !== recorded.note)) {
+          if (!sameRecordedReview(entry.hostAcceptance, recorded)) {
             throw new HistoryError(HISTORY_CODES.viewInvalid, 'a saved review cannot be replaced by a task snapshot', {
               taskId: entry.taskId,
             });
           }
-          entry = projectView({ ...entry, hostAcceptance: recorded }, this.maxEntryBytes, { rejectOversizeNote: true });
+          merged = { ...entry, hostAcceptance: recorded };
+        }
+        // A saved goal description is never replaced by a snapshot that lacks one, and a
+        // DIFFERENT one is a conflict refused rather than trusted.
+        const savedGoal = draft[index].goalDescription;
+        if (typeof savedGoal === 'string' && savedGoal !== '') {
+          const incoming = entry.goalDescription;
+          if (incoming !== undefined && incoming !== savedGoal) {
+            throw new HistoryError(HISTORY_CODES.viewInvalid, 'a saved goal description cannot be replaced by a different one', {
+              taskId: entry.taskId,
+              field: TASK_DESCRIPTION_FIELDS.goal,
+            });
+          }
+          if (incoming !== savedGoal) {
+            merged = { ...(merged ?? entry), goalDescription: savedGoal };
+          }
+        }
+        if (merged !== null) {
+          entry = projectView(merged, this.maxEntryBytes, { rejectOversizeNote: true });
         }
         draft[index] = entry;
       } else {
@@ -278,10 +309,13 @@ export class HistoryStore {
    * two writes can never interleave. The mutation receives a detached copy of the CURRENT
    * row (re-read under the write) and returns the row to store; throwing refuses with the
    * caller's error and nothing is written.
+   *
+   * A stored description may not be erased, replaced, or gain a summary.
    * @param {string} taskId - stored task id.
    * @param {(row: object) => object} mutate - mutation of the current stored row.
    * @returns {Promise<object>} detached copy of the stored entry.
-   * @throws {HistoryError} `HISTORY_VIEW_INVALID` when this task has no stored row.
+   * @throws {HistoryError} `HISTORY_VIEW_INVALID` when this task has no stored row, when the
+   *   patch would replace a saved description, or when a description is over the bound.
    */
   async update(taskId, mutate) {
     if (this.disposed) throw this.disposedError();
@@ -299,6 +333,39 @@ export class HistoryStore {
       const entry = projectView(await mutate(structuredClone(base[index])), this.maxEntryBytes, { rejectOversizeNote: true });
       if (entry.taskId !== taskId) {
         throw new HistoryError(HISTORY_CODES.viewInvalid, 'a history update may not change the task it patches', { taskId });
+      }
+      const storedGoal = base[index].goalDescription;
+      if (typeof storedGoal === 'string' && storedGoal !== '') {
+        if (entry.goalDescription === undefined) {
+          throw new HistoryError(HISTORY_CODES.viewInvalid, 'a history update may not erase the goal description', {
+            taskId,
+            field: TASK_DESCRIPTION_FIELDS.goal,
+          });
+        }
+        if (entry.goalDescription !== storedGoal) {
+          throw new HistoryError(HISTORY_CODES.viewInvalid, 'a history update may not replace the goal description', {
+            taskId,
+            field: TASK_DESCRIPTION_FIELDS.goal,
+          });
+        }
+      }
+      const storedReview = base[index].hostAcceptance;
+      const storedSummary = storedReview?.completionSummary;
+      if (storedReview !== null && storedReview !== undefined) {
+        const proposed = entry.hostAcceptance?.completionSummary;
+        const hadSummary = typeof storedSummary === 'string' && storedSummary !== '';
+        if (!hadSummary && proposed !== undefined) {
+          throw new HistoryError(HISTORY_CODES.viewInvalid, 'a saved review with no completion summary cannot gain one', {
+            taskId,
+            field: TASK_DESCRIPTION_FIELDS.summary,
+          });
+        }
+        if (hadSummary && proposed !== storedSummary) {
+          throw new HistoryError(HISTORY_CODES.viewInvalid, 'a saved completion summary cannot be replaced by a different one', {
+            taskId,
+            field: TASK_DESCRIPTION_FIELDS.summary,
+          });
+        }
       }
       const draft = base.map((job) => structuredClone(job));
       draft[index] = entry;
@@ -545,9 +612,10 @@ export class HistoryStore {
  * @param {object} view - public job view.
  * @param {number} maxEntryBytes - per-entry byte budget.
  * @param {{ rejectOversizeNote?: boolean }} [options] - `rejectOversizeNote` refuses an
- *   oversized review note instead of cutting it (writes); a load keeps the cut.
+ *   oversized review note or completion summary instead of cutting it (writes); a load
+ *   keeps the cut.
  * @returns {object} bounded, redacted entry.
- * @throws {HistoryError} when the view, or the note under `rejectOversizeNote`, is invalid.
+ * @throws {HistoryError} when the view, or a description under `rejectOversizeNote`, is invalid.
  */
 function projectView(view, maxEntryBytes, options = {}) {
   if (!isPlainObject(view)) {
@@ -563,9 +631,19 @@ function projectView(view, maxEntryBytes, options = {}) {
 
   const ctx = newCutContext(view.truncation, maxEntryBytes);
   const acceptance = acceptanceView(view.hostAcceptance, ctx, { rejectOversize: options.rejectOversizeNote === true });
+  // Both are omitted when absent, so a load does not rewrite a document to add the new keys.
+  const title = titleText(view.title, ctx);
+  const continueFrom = continuationRef(view.continueFromTaskId, taskId);
+  const goalDescription = descriptionText(
+    view.goalDescription, ctx, TASK_DESCRIPTION_FIELDS.goal, { rejectOversize: options.rejectOversizeNote === true },
+  );
   const entry = {
     taskId,
     state: view.state,
+    ...(title === '' ? {} : { title }),
+    ...(continueFrom === null ? {} : { continueFromTaskId: continueFrom }),
+    // Only present when the commander stated a goal: nothing is derived from the prompt.
+    ...(goalDescription === null ? {} : { goalDescription }),
     phase: label(view.phase),
     createdAt: time(view.createdAt),
     startedAt: time(view.startedAt),
@@ -639,6 +717,14 @@ function projectView(view, maxEntryBytes, options = {}) {
   // already-fitted entry is a no-op and a reload never rewrites the file.
   const truncation = cutView(ctx);
   if (truncation !== null) redacted.truncation = truncation;
+  const finalBytes = byteLength(JSON.stringify(redacted));
+  if (finalBytes > maxEntryBytes) {
+    throw new HistoryError(
+      HISTORY_CODES.entryTooLarge,
+      'the job history view cannot be bounded to the configured entry budget',
+      { bytes: finalBytes, limit: maxEntryBytes },
+    );
+  }
   return redacted;
 }
 
@@ -1237,16 +1323,20 @@ function errorView(value, ctx) {
  * code-point bound is kept exactly as written and REFUSED here when it is longer, so a
  * caller can never be told a shortened conclusion was saved; a document already carrying
  * more than the bound keeps read-compatible behaviour.
+ *
+ * `completionSummary` is the same kind of prose under the same rule, stored only here.
  * @param {unknown} value - host-acceptance value.
  * @param {object} ctx - cut context.
  * @param {{ rejectOversize?: boolean }} [options] - `rejectOversize` refuses instead of cutting.
  * @returns {object | null} bounded host-acceptance record.
- * @throws {HistoryError} `HISTORY_VIEW_INVALID` when the note exceeds the bound and
- *   `rejectOversize` is set.
+ * @throws {HistoryError} `HISTORY_VIEW_INVALID` when the note or the summary exceeds the
+ *   bound and `rejectOversize` is set.
  */
 function acceptanceView(value, ctx, options = {}) {
   if (!isPlainObject(value)) return null;
-  const note = options.rejectOversize === true ? requireNote(value.note) : noteText(value.note, ctx);
+  const reject = options.rejectOversize === true;
+  const note = reject ? requireNote(value.note) : noteText(value.note, ctx);
+  const summary = descriptionText(value.completionSummary, ctx, SUMMARY_PATH, { rejectOversize: reject });
   return {
     accepted: value.accepted === true,
     state: label(value.state),
@@ -1254,7 +1344,42 @@ function acceptanceView(value, ctx, options = {}) {
     by: label(value.by),
     note,
     noteChars: typeof value.note === 'string' ? Array.from(value.note).length : null,
+    ...(summary === null ? {} : { completionSummary: summary }),
   };
+}
+
+function descriptionRefusal(refusal) {
+  return new HistoryError(HISTORY_CODES.viewInvalid, refusal.message, {
+    field: refusal.field,
+    limit: refusal.limit,
+    length: refusal.length,
+    unit: refusal.unit,
+  });
+}
+
+/** Project `goalDescription` or `completionSummary` (refuse on write; redact + bound on load). */
+function descriptionText(value, ctx, field, options = {}) {
+  if (options.rejectOversize === true) {
+    const read = canonicalTaskDescription(value, field, redactText);
+    if (read.ok === false) throw descriptionRefusal(read.refusal);
+    return read.value;
+  }
+  if (typeof value !== 'string') return null;
+  const trimmed = redactText(value.trim());
+  if (trimmed === '') return null;
+  if (Array.from(trimmed).length <= TASK_DESCRIPTION_MAX_CHARS) return trimmed;
+  const bounded = truncateTaskDescription(trimmed, Array.from(TRUNCATION_MARK).length);
+  ctx.fields.add(field);
+  return `${bounded}${TRUNCATION_MARK}`;
+}
+
+/** Compare incoming review block against the recorded one (absent incoming summary keeps stored). */
+function sameRecordedReview(incoming, stored) {
+  if (incoming === null || incoming === undefined) return true;
+  if (incoming.state !== stored.state || incoming.note !== stored.note) return false;
+  const mine = incoming.completionSummary;
+  if (mine === undefined) return true;
+  return mine === stored.completionSummary;
 }
 
 /**
@@ -1334,6 +1459,10 @@ function boundedDetails(value, ctx, field, depth) {
  * Free text is halved first, then long arrays, then optional blocks; each cut is
  * recorded, so a consumer can see that evidence was reduced instead of receiving
  * a silently short record. Only when nothing more can be cut is the entry refused.
+ *
+ * Neither commander description is ever cut to fit: a legal description CAN be the reason an
+ * entry does not fit, and then the save is REFUSED. `completionSummary` lives inside
+ * `hostAcceptance`, which {@link dropBlock} cannot drop.
  * @param {object} entry - mutable entry.
  * @param {object} ctx - cut context.
  * @returns {void}
@@ -1370,20 +1499,28 @@ function fitEntry(entry, ctx) {
  */
 function cutLargestText(entry, ctx) {
   let chosen = null;
+  let chosenNext = '';
   let length = 0;
   for (const parts of TEXT_PATHS) {
     const value = getPath(entry, parts);
     if (typeof value !== 'string' || value === '') continue;
+    const base = value.endsWith(TRUNCATION_MARK) ? value.slice(0, -TRUNCATION_MARK.length) : value;
+    let limit = Math.floor(base.length / 2);
+    if (limit > 0) {
+      const lead = base.charCodeAt(limit - 1);
+      const trail = base.charCodeAt(limit);
+      if (lead >= 0xd800 && lead <= 0xdbff && trail >= 0xdc00 && trail <= 0xdfff) limit -= 1;
+    }
+    const next = `${base.slice(0, limit)}${TRUNCATION_MARK}`;
+    if (byteLength(JSON.stringify(next)) >= byteLength(JSON.stringify(value))) continue;
     if (value.length > length) {
       chosen = parts;
+      chosenNext = next;
       length = value.length;
     }
   }
   if (chosen === null) return false;
-  const current = getPath(entry, chosen);
-  const base = current.endsWith(TRUNCATION_MARK) ? current.slice(0, -TRUNCATION_MARK.length) : current;
-  const limit = Math.floor(base.length / 2);
-  setPath(entry, chosen, `${base.slice(0, limit)}${TRUNCATION_MARK}`);
+  setPath(entry, chosen, chosenNext);
   const field = chosen.join('.');
   ctx.fields.add(field);
   // Keep the existing evidence flags honest when the patch itself was cut.
@@ -1538,6 +1675,21 @@ function isPlainObject(value) {
 function label(value) {
   if (typeof value !== 'string' || value === '') return null;
   return value.slice(0, MAX_LABEL_CHARS);
+}
+
+/** Bounded display title, or '' when absent (never synthesized). */
+function titleText(value, ctx) {
+  if (typeof value !== 'string' || value.trim() === '') return '';
+  return text(value, ctx, 'title', MAX_LABEL_CHARS);
+}
+
+/** Explicit continuation reference, or null when absent/invalid/self-referential. */
+function continuationRef(value, taskId) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed === '' || trimmed.length > MAX_LABEL_CHARS) return null;
+  if (trimmed === taskId) return null;
+  return trimmed;
 }
 
 /**

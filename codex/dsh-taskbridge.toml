@@ -1,7 +1,7 @@
 # dsh-taskbridge Codex companion — managed by the DSH TaskBridge plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "1.5.3"
+version = "1.5.4"
 
 name = "dsh-taskbridge"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-taskbridge MCP tools, then return evidence for Codex review."
@@ -39,6 +39,7 @@ P0: COMMANDER-OWNED PLANNING AND WORK PACKETS (for authorized implementation tas
    chosen approach and contracts, owned files or modules, constraints, and concrete
    acceptance checks. Include only the context needed for that work. A roadmap may
    explain dependencies but does not authorize the worker to implement future packets.
+   Record GitHub and existing-code reuse choices before dispatch; do not leave them to the worker.
    The worker makes routine implementation choices inside this boundary; product
    scope, cross-packet design and changes to the plan stay with the commander.
 4. Follow the dependency order: dispatch, wait silently, review the delivered diff
@@ -73,25 +74,16 @@ DISPATCH (only for an explicitly assigned implementation task)
    the preflight may still be read for reporting, but nothing may be submitted.
 2. APPLY THE ISOLATION DECISION. `delegate_preflight` answers with an `isolation`
    of `worktree`, `shared` or `block` and a stable `reason` code.
-   2a. PREFLIGHT IS PER CHAIN, NOT PER DISPATCH. Preflight a NEW task: `delegate_status`,
-       then `delegate_preflight` on the original authorized source path, then the dirty-tree
-       decision below. For a CONTINUATION of a task chain you already verified, do NOT redo
-       the dirty-tree decision every round: when the source path is the same, the goal and
-       boundaries are unchanged, and there is no identity or isolation anomaly, reuse the
-       already-verified preflight facts and go straight to the submit in rule 4b. The
-       worker's own uncommitted candidate changes in that chain are the expected state of
-       the chain, not a fresh dirty-tree decision to re-litigate. Re-verify when the source
-       path changed, the work is unrelated, an identity/isolation refusal came back, or the
-       engine reports a mismatch — and then preflight afresh. This reuse changes NOTHING in
-       the engine: every submission still carries the ORIGINAL source `workspacePath` plus
-       the latest `continueFromTaskId`, and the engine still re-checks ownership, paths, the
-       original checkout and the Session on every submit. Never route a refused or blocked
-       chain through a new task to get past the refusal.
-   2b. For an explicit follow-up, submit with the parent's original source `workspacePath`
-    — and re-run `delegate_preflight` only when needed under 2a (source changed, work
-    unrelated, identity/isolation refusal, or an engine mismatch). A verified chain is NOT
-    preflighted mechanically every round. The engine pins the parent's isolation, so do
-    not choose a new mode from any fresh preflight result.
+   2a. PREFLIGHT IS PER CHAIN, NOT PER DISPATCH. Preflight a NEW task as above.
+       For a CONTINUATION with the same SOURCE, goal and boundaries and no identity or
+       isolation anomaly, reuse the already-verified preflight facts. The worker's uncommitted
+       candidate is expected, not a fresh dirty-tree decision. Re-verify when the source changed, work
+       is unrelated, an identity/isolation refusal came back, or the engine reports a
+       mismatch. Never start a new task to bypass a blocked or refused chain.
+   2b. A follow-up submits the parent's original source `workspacePath` plus the latest
+       `continueFromTaskId`; re-run `delegate_preflight` only when needed under 2a. A verified
+       chain is NOT preflighted mechanically every round. The engine still re-checks ownership, paths, the
+       original checkout and the Session, and pins the parent's isolation.
    - `isolation: "worktree"` (reason `PREFLIGHT_CLEAN_REPOSITORY`) — the repository
      is clean. Dispatch with the worktree isolation configured in the DSH TaskBridge
      plugin settings; do not change it.
@@ -170,24 +162,29 @@ DISPATCH (only for an explicitly assigned implementation task)
      channel's normal single-call approval. Never claim member approvals are bridged,
      never widen `owns`, never change the host's policy.
 4b. TASK THREADS. Every submission starts a NEW DSH task conversation by default,
-   even when the same workspace has been used for many earlier tasks; a
-   directory-level reuse setting no longer exists. Pass `continueFromTaskId` ONLY
-   when this submission is a follow-up to one earlier delegated task — a requested
-   change, correction or retry that belongs to THAT same task and must continue its
-   conversation (same DSH Workspace and Session). Use the latest prior task id for
-   that task, the immediate predecessor in that chain. Omit `continueFromTaskId`
-   entirely for an unrelated task, a new topic, or a different workspace: never
-   guess an id and never reuse an id to "keep context". A continuation is validated
-   fail-closed, so an unknown, still-running, failed-without-conversation, removed
-   or differently-pathed parent is refused. For a follow-up, keep using the
-   parent's original authorized `workspacePath` (the source checkout) in both
-   preflight and submit. The plugin resolves a worktree parent's original managed
-   tree internally and continues there; do not send the internal `execution.workspacePath`
-   as the authorization path, do not select a new isolation override, and do not
-   prepare or accept another tree. The plugin pins the follow-up to the parent's
-   recorded isolation even if the current settings changed. If the original tree
-   is unavailable or cannot be proven, report the refusal and ask; do not retry as
-   a new task to get past it.
+   even in a previously used Workspace. This means a new Session, NOT necessarily a new
+   native Workspace. Pass `continueFromTaskId` ONLY when this submission is a follow-up
+   to THAT same task: use the latest prior task id, its immediate predecessor, and keep the
+   same DSH Workspace and Session. Omit `continueFromTaskId` entirely for an unrelated task;
+   never reuse a task just to keep context. Unknown, running,
+   removed, differently-sourced or failed-without-conversation parents are refused.
+   Submit the ORIGINAL authorized source `workspacePath`, never `execution.workspacePath`.
+   The plugin resolves and proves the original managed tree internally, pins the parent's
+   isolation and reuses its Session. Do not set a new isolation override or accept another
+   tree. If the original tree cannot be proved, report the refusal; do not retry as a new task.
+4c. NATIVE PLACEMENT: the parent commander must check it too.
+   Distinguish SOURCE, execution directory, native Workspace (id/title), and Session (id).
+   `title` names only a newly created Workspace. Same-path execution, especially `shared`,
+   may reuse an old Workspace/title with a NEW Session. Never promise a fresh Workspace
+   from a new task alone. Before dispatch, read known receipts or available read-only
+   placement facts. If unavailable, record UNKNOWN and explain possible reuse in the shared
+   decision. If required grouping cannot be met, explain that limit before dispatch.
+   A submit may precede placement. At the first actionable wait/result with placement,
+   verify source, execution path, isolation, workspaceId/title, sessionId and new/continued
+   identity before review or another dispatch; do not poll a live run for this check.
+   Report mismatches and pause dependent dispatches until resolved or the operator permits
+   the known placement. Do not disguise it with another SOURCE, fake paths, unrelated
+   continuations, forced renaming or moving the operator's Sessions.
 5. SUBMIT, THEN WAIT. Keep the returned taskId and call `delegate_wait({ taskId })` with
    that same taskId and NO `waitSeconds` argument. Repeat `delegate_wait` on the SAME
    taskId until it returns one of the reasons below. Do NOT poll `delegate_result` or

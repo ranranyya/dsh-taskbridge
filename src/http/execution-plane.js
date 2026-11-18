@@ -22,6 +22,10 @@ import { classifyError, HttpError, readJsonBody, sendJson } from '../http/respon
 import { preflightWorkspace } from '../workspace/preflight.js';
 import { redactText } from '../config/redact.js';
 import { REVIEW_NOTE_MAX_CHARS, normalizeReviewNote, reviewNoteOverflow } from '../jobs/review-note.js';
+import {
+  TASK_DESCRIPTION_FIELDS,
+  canonicalTaskDescription,
+} from '../jobs/task-descriptions.js';
 
 /** Route prefix owned by this plane. Deliberately not under `/api`. */
 export const EXECUTION_PREFIX = '/dsh-delegate/x';
@@ -238,6 +242,19 @@ async function submitTask({ req, res, connection, deps }) {
   const overrides = body.agentTeams === undefined
     ? body.overrides
     : { ...(body.overrides ?? {}), agentTeams: body.agentTeams };
+  // Checked here as well as in the engine: a bad or redaction-lengthened goal is refused
+  // before a task, slot or consumed grant exists.
+  const goal = canonicalTaskDescription(body.goalDescription, TASK_DESCRIPTION_FIELDS.goal, redactText);
+  if (goal.ok === false) {
+    throw new HttpError(400, 'TASK_GOAL_DESCRIPTION_INVALID', goal.refusal.message, {
+      field: goal.refusal.field,
+      limit: goal.refusal.limit,
+      length: goal.refusal.length,
+      unit: goal.refusal.unit,
+    });
+  }
+  // The canonical value travels on; the engine re-derives the same form (a no-op).
+  const goalField = goal.value === null ? {} : { goalDescription: goal.value };
   if (deps.engine.authorizationMode === 'switch') {
     const task = await deps.engine.start({
       connectionId: connection.connectionId,
@@ -246,6 +263,7 @@ async function submitTask({ req, res, connection, deps }) {
       ...(body.title === undefined ? {} : { title: body.title }),
       overrides,
       ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
+      ...goalField,
     });
     sendJson(res, 202, { ok: true, task });
     return;
@@ -264,6 +282,7 @@ async function submitTask({ req, res, connection, deps }) {
     ...(body.title === undefined ? {} : { title: body.title }),
     overrides,
     ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
+    ...goalField,
   });
   sendJson(res, 202, { ok: true, task });
 }
@@ -428,7 +447,7 @@ async function answerQuestion({ req, res, connection, deps }) {
   });
   sendJson(res, 200, { ok: true, ...result });
 }
-const REVIEW_FIELDS = Object.freeze(['taskId', 'decision', 'note']);
+const REVIEW_FIELDS = Object.freeze(['taskId', 'decision', 'note', 'completionSummary']);
 
 /**
  * Longest review note the route will even read, in Unicode code points.
@@ -479,6 +498,18 @@ async function recordHostReview({ req, res, connection, deps }) {
       unit: 'unicode-code-points',
     });
   }
+  // Optional, checked with the same rule as the goal, refused before any read or write.
+  const summary = canonicalTaskDescription(body.completionSummary, TASK_DESCRIPTION_FIELDS.summary, redactText);
+  if (summary.ok === false) {
+    throw new HttpError(400, 'REVIEW_COMPLETION_SUMMARY_INVALID', summary.refusal.message, {
+      field: summary.refusal.field,
+      limit: summary.refusal.limit,
+      length: summary.refusal.length,
+      unit: summary.refusal.unit,
+    });
+  }
+  // The canonical value is sent only when there is one, so `undefined` means "stated none".
+  const summaryField = summary.value === null ? {} : { completionSummary: summary.value };
   let result;
   try {
     result = await deps.engine.recordHostReview({
@@ -487,6 +518,7 @@ async function recordHostReview({ req, res, connection, deps }) {
       taskId: body.taskId,
       decision: body.decision,
       note,
+      ...summaryField,
     });
   } catch (error) {
     // A finished task read back from durable history (after a restart) is reviewed through
@@ -495,7 +527,7 @@ async function recordHostReview({ req, res, connection, deps }) {
     result = await deps.engine.recordHistoricalReview({
       taskId: body.taskId,
       connectionId: connection.connectionId,
-    }, body.decision, redactText(note), null);
+    }, body.decision, redactText(note), null, summary.value ?? undefined);
   }
   sendJson(res, 200, { ok: true, ...result });
 }

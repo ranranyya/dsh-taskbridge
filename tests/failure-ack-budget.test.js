@@ -9,12 +9,11 @@
 // while the reminder had already been cleared. A short answer kept it, which is why
 // the short control passed.
 //
-// Cases 1–3 below drive the REAL production `tools/call` handler and the real
-// `boundedJson`/rescue path (no internals stubbed, no constructed command executed —
-// the command is inert data). Case 4 documents, with explicit reachability reasons,
-// why the final `MCP_RESULT_OVER_BUDGET` branch cannot be reached from a wait answer
-// under production bounds; part of it is still exercised as a clearly labelled
-// SYNTHETIC-boundary unit of the refusal projection.
+// Cases 1–3 and the final question-rescue test drive the REAL production `tools/call`
+// handler and the real `boundedJson`/rescue path (no internals stubbed, no constructed
+// command executed — the command is inert data). The final `MCP_RESULT_OVER_BUDGET`
+// refusal branch is NOT independently reproduced here and is not claimed unreachable;
+// see the note beside the recorded-bounds test below.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';

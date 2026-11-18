@@ -89,6 +89,12 @@ import {
   reviewNoteOverflow,
   truncateCodePoints,
 } from '../jobs/review-note.js';
+import {
+  TASK_DESCRIPTION_FIELDS,
+  TASK_DESCRIPTION_MAX_CHARS,
+  canonicalTaskDescription,
+  readTaskDescription,
+} from '../jobs/task-descriptions.js';
 import { waitForTask } from './wait.js';
 import { QUESTION_ANSWER_KIND, createCallMetrics, correlationId } from './metrics.js';
 // The engine's own per-call permission bounds. Imported rather than re-stated so this
@@ -143,6 +149,10 @@ export const MAX_REVIEW_NOTE_PAGE_CHARS = 2_000;
 /** Default page size of a `reviewNoteOffset` read. */
 export const DEFAULT_REVIEW_NOTE_PAGE_CHARS = 2_000;
 
+/** Largest and default page size of a `completionSummaryOffset` read, in code points. */
+export const MAX_COMPLETION_SUMMARY_PAGE_CHARS = TASK_DESCRIPTION_MAX_CHARS;
+export const DEFAULT_COMPLETION_SUMMARY_PAGE_CHARS = TASK_DESCRIPTION_MAX_CHARS;
+
 /** Bound on one execution-plane request. */
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
@@ -174,6 +184,9 @@ export const MIN_WAIT_SECONDS = 1;
  * surrogate pair cannot be split by a bound.
  */
 export const MAX_REVIEW_NOTE_CHARS = REVIEW_NOTE_MAX_CHARS;
+
+/** Longest `goalDescription` / `completionSummary`, in Unicode code points. */
+export const MAX_TASK_DESCRIPTION_CHARS = TASK_DESCRIPTION_MAX_CHARS;
 
 /**
  * How many requests may be in flight at once on the stdio transport.
@@ -347,6 +360,20 @@ export const TOOLS = Object.freeze([
             + 'isolation override either. An unknown, still-running, removed or differently-sourced parent is '
             + 'refused, never replaced by a new conversation.',
         },
+        goalDescription: {
+          type: 'string',
+          maxLength: MAX_TASK_DESCRIPTION_CHARS,
+          // The bound is counted in Unicode code points, not in UTF-16 units.
+          codePointLength: true,
+          description: 'OPTIONAL. What THIS round of work is for, in your own words: the goal you planned, '
+            + 'not the packet of instructions (that is `prompt`). At most 2000 Unicode code points, so Chinese, '
+            + 'line breaks and emoji each count once; surrounding whitespace is trimmed and inner line breaks are '
+            + 'kept. A longer value, or one that is not a string (including `null`), is REFUSED before a task '
+            + 'exists \u2014 it is never shortened \u2014 and a blank value is the same as omitting it. It is stored with the '
+            + 'task record and appears in the `goalDescription` field of the task view that `delegate_submit` '
+            + 'returns and of `delegate_result`; it is never derived from the prompt, a parent task or the result, '
+            + 'and it does not change what the worker is told.',
+        },
       },
       required: ['workspacePath', 'prompt'],
       additionalProperties: false,
@@ -358,10 +385,10 @@ export const TOOLS = Object.freeze([
     description: 'Read one task this connection submitted: state, effective provider/model/effort, '
       + 'changed-file summary, bounded diff, validation evidence and review outcome. '
       + 'A finished execution is not host acceptance. '
-      + 'The review note is returned in full when it fits; when the whole answer is too large the answer says '
-      + '`hostAcceptance.noteOmitted: true` and the text is read in pages with `reviewNoteOffset` and '
-      + '`reviewNoteLimit` (a page answer carries only the slice, `noteChars`, `nextOffset` and `complete`). '
-      + 'A note is never silently shortened.',
+      + 'The review note and completion summary are returned in full when they fit; when the whole answer is '
+      + 'too large they are marked `hostAcceptance.noteOmitted: true` (read with `reviewNoteOffset`/'
+      + '`reviewNoteLimit`) or `hostAcceptance.completionSummaryOmitted: true` (read with '
+      + '`completionSummaryOffset`/`completionSummaryLimit`), never silently shortened.',
     // A read of a stored task: no work is created, changed or cancelled.
     annotations: Object.freeze({
       title: 'Read task result',
@@ -387,6 +414,19 @@ export const TOOLS = Object.freeze([
           maximum: MAX_REVIEW_NOTE_PAGE_CHARS,
           description: `Code points of the review note to return per page (1..${MAX_REVIEW_NOTE_PAGE_CHARS}, `
             + 'default 2000). Only meaningful together with reviewNoteOffset.',
+        },
+        completionSummaryOffset: {
+          type: 'integer',
+          minimum: 0,
+          description: 'Read hostAcceptance.completionSummary from this CODE-POINT offset when '
+            + 'completionSummaryOmitted is true. Returns ONLY the summary slice plus summaryChars, nextOffset and complete.',
+        },
+        completionSummaryLimit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: MAX_COMPLETION_SUMMARY_PAGE_CHARS,
+          description: `Code points of completionSummary per page (1..${MAX_COMPLETION_SUMMARY_PAGE_CHARS}, `
+            + 'default 2000). Only meaningful together with completionSummaryOffset.',
         },
       },
       required: ['taskId'],
@@ -726,6 +766,22 @@ export const TOOLS = Object.freeze([
             + 'note is refused with its actual length instead of being cut. '
             + 'It is evidence of your review, never a grant and never a place for credentials.',
         },
+        completionSummary: {
+          type: 'string',
+          maxLength: MAX_TASK_DESCRIPTION_CHARS,
+          codePointLength: true,
+          description: 'OPTIONAL. What was actually DONE in this round, in your own words, after reviewing the '
+            + 'evidence \u2014 the counterpart of the submission\u2019s `goalDescription`. At most 2000 Unicode code points '
+            + '(Chinese, line breaks and emoji count once); surrounding whitespace is trimmed and inner line breaks '
+            + 'are kept; a longer or non-string value is refused, never shortened; a blank value is the same as '
+            + 'omitting it. It may accompany `accepted` or `changes-requested` \u2014 with the latter it states only the '
+            + 'part that was completed and does NOT mean the task passed. It is recorded inside the same review '
+            + 'write as `decision` and `note`, under `hostAcceptance.completionSummary`, and becomes visible only '
+            + 'once that write is durable. A finished execution, worker output or a run that merely looked '
+            + 'successful never produces one. It is part of the review\u2019s identity: repeating the same decision and '
+            + 'note WITH the same summary is an idempotent no-op, and a different summary \u2014 or adding one to an '
+            + 'already recorded review \u2014 is refused like any other different conclusion.',
+        },
       },
       required: ['taskId', 'decision', 'note'],
       additionalProperties: false,
@@ -825,6 +881,16 @@ const TOOL_ROUTES = Object.freeze({
   // No plane route: the census is this process's own and travels to no backend.
   delegate_metrics: null,
 });
+
+/** Canonicalize a description argument (enforcing post-redaction code-point bound). */
+function canonicalizeToolDescription(tool, key, field) {
+  const read = canonicalTaskDescription(field, key, redactText);
+  if (read.ok === false) {
+    throw new McpError('MCP_ARGUMENT_RANGE',
+      `${tool.name}.${key} must be at most ${read.refusal.limit} Unicode code points, but it is ${read.refusal.length}`);
+  }
+  return read.value ?? '';
+}
 
 /**
  * The one argument this surface adds to a request it forwards.
@@ -985,7 +1051,10 @@ function validateArgs(tool, args) {
       if (typeof declared.minLength === 'number' && field.length < declared.minLength) {
         throw new McpError('MCP_ARGUMENT_REQUIRED', `${tool.name}.${key} must not be empty`);
       }
-      out[key] = field;
+      // The two commander descriptions also pass the redaction-length half of the rule.
+      out[key] = (key === TASK_DESCRIPTION_FIELDS.goal || key === TASK_DESCRIPTION_FIELDS.summary)
+        ? canonicalizeToolDescription(tool, key, field)
+        : field;
     } else if (declared.type === 'boolean') {
       // Strict: a model that sends the string "true" gets a refusal naming the
       // field instead of a silently truthy value reaching the plane.
@@ -1021,8 +1090,16 @@ function validateArgs(tool, args) {
       throw new McpError('MCP_ARGUMENT_ENUM', `${tool.name}.${key} must be one of ${declared.enum.join(', ')}`);
     }
   }
-  if (tool.name === 'delegate_result' && out.reviewNoteLimit !== undefined && out.reviewNoteOffset === undefined) {
-    throw new McpError('MCP_ARGUMENT_REQUIRED', 'delegate_result.reviewNoteLimit requires reviewNoteOffset');
+  if (tool.name === 'delegate_result') {
+    if (out.reviewNoteLimit !== undefined && out.reviewNoteOffset === undefined) {
+      throw new McpError('MCP_ARGUMENT_REQUIRED', 'delegate_result.reviewNoteLimit requires reviewNoteOffset');
+    }
+    if (out.completionSummaryLimit !== undefined && out.completionSummaryOffset === undefined) {
+      throw new McpError('MCP_ARGUMENT_REQUIRED', 'delegate_result.completionSummaryLimit requires completionSummaryOffset');
+    }
+    if (out.reviewNoteOffset !== undefined && out.completionSummaryOffset !== undefined) {
+      throw new McpError('MCP_ARGUMENTS_INVALID', 'delegate_result cannot combine reviewNoteOffset and completionSummaryOffset');
+    }
   }
   return out;
 }
@@ -1193,9 +1270,27 @@ function trimAllStrings(value, path, cap, collect, depth = 0) {
   const out = {};
   for (const [key, item] of Object.entries(value)) {
     const childPath = path === '' ? key : `${path}.${key}`;
+    if (isDescriptionField(key, item, path)) {
+      out[key] = item;
+      continue;
+    }
     out[key] = trimAllStrings(item, childPath, cap, collect, depth + 1);
   }
   return out;
+}
+
+/** True when `value` is a legal description string at a published task/acceptance position. */
+function isDescriptionField(key, value, parentPath) {
+  if (key !== TASK_DESCRIPTION_FIELDS.goal && key !== TASK_DESCRIPTION_FIELDS.summary) return false;
+  if (typeof value !== 'string') return false;
+  if (key === TASK_DESCRIPTION_FIELDS.goal) {
+    if (parentPath !== '' && parentPath !== 'task' && !/^tasks\[\d+\]$/u.test(parentPath)) return false;
+  } else if (parentPath !== 'hostAcceptance'
+    && parentPath !== 'task.hostAcceptance'
+    && !/^tasks\[\d+\]\.hostAcceptance$/u.test(parentPath)) {
+    return false;
+  }
+  return reviewNoteLength(value) <= TASK_DESCRIPTION_MAX_CHARS;
 }
 
 /**
@@ -1429,10 +1524,14 @@ function projectWithStage(value, stage, collect) {
     }
     // A full result KEEPS the whole note while it fits; when a stage has to give it up it
     // is marked `noteOmitted` and read back in pages, never shortened. (`prefix` already
-    // ends in a dot.)
-    const acceptance = target.hostAcceptance;
-    if (acceptance !== null && typeof acceptance === 'object') {
-      target.hostAcceptance = boundAcceptance(acceptance, `${prefix}hostAcceptance`, collect, stage.omitNote === true);
+    // ends in a dot.) Skeleton stages bound `hostAcceptance` once inside `skeletonize`.
+    if (stage.skeletonChars === undefined) {
+      const acceptance = target.hostAcceptance;
+      if (acceptance !== null && typeof acceptance === 'object' && !Array.isArray(acceptance)) {
+        target.hostAcceptance = boundAcceptance(
+          acceptance, `${prefix}hostAcceptance`, collect, stage.omitNote === true, stage.omitSummary === true,
+        );
+      }
     }
     // The settled decision trail is HISTORY; the pending request is the thing the
     // commander must act on NOW. Under a bound the history goes first, so a running
@@ -1452,15 +1551,21 @@ function projectWithStage(value, stage, collect) {
       }
     }
   }
+  if (stage.skeletonChars === undefined && projected.hostAcceptance !== null
+    && typeof projected.hostAcceptance === 'object' && !Array.isArray(projected.hostAcceptance)) {
+    projected.hostAcceptance = boundAcceptance(
+      projected.hostAcceptance, 'hostAcceptance', collect, stage.omitNote === true, stage.omitSummary === true,
+    );
+  }
   if (Array.isArray(projected.tasks) && projected.tasks.length > stage.lists) {
     collect.push(truncationRecord('tasks', { total: projected.tasks.length, omitted: projected.tasks.length - stage.lists }));
     projected.tasks = projected.tasks.slice(0, stage.lists);
   }
   if (stage.skeletonChars !== undefined) {
     const cap = stage.skeletonChars;
-    if (projected.task !== undefined) projected.task = skeletonize(projected.task, 'task', cap, collect);
+    if (projected.task !== undefined) projected.task = skeletonize(projected.task, 'task', cap, collect, stage);
     if (Array.isArray(projected.tasks)) {
-      projected.tasks = projected.tasks.map((task, index) => skeletonize(task, `tasks[${index}]`, cap, collect));
+      projected.tasks = projected.tasks.map((task, index) => skeletonize(task, `tasks[${index}]`, cap, collect, stage));
     }
     // Anything else at the top level (a status answer's grants, a list's extras)
     // is trimmed rather than dropped, so nothing disappears unexplained. The
@@ -1486,13 +1591,52 @@ function projectWithStage(value, stage, collect) {
       }
       if (key === 'answerReceipt' || key === 'decisionReceipt') continue;
       if (key === 'hostAcceptance' && item !== null && typeof item === 'object' && !Array.isArray(item)) {
-        projected[key] = boundAcceptance(item, key, collect);
+        projected[key] = boundAcceptance(item, key, collect, stage.omitNote === true, stage.omitSummary === true);
         continue;
       }
       projected[key] = trimAllStrings(item, key, cap, collect);
     }
   }
+  guardDescriptionFields(projected, stage.skeletonChars ?? TRUNCATED_FIELD_CAPS.listItemChars, collect);
   return projected;
+}
+
+/** Bound any anomalous value sitting at `goalDescription` or `hostAcceptance.completionSummary`. */
+function guardDescriptionFields(answer, cap, collect) {
+  const inspect = (task, prefix) => {
+    if (task === null || typeof task !== 'object' || Array.isArray(task)) return;
+    if (Object.hasOwn(task, TASK_DESCRIPTION_FIELDS.goal)) {
+      const goal = task[TASK_DESCRIPTION_FIELDS.goal];
+      if (typeof goal !== 'string' || reviewNoteLength(goal) > TASK_DESCRIPTION_MAX_CHARS) {
+        task[TASK_DESCRIPTION_FIELDS.goal] = boundValue(
+          goal,
+          `${prefix}${TASK_DESCRIPTION_FIELDS.goal}`,
+          cap,
+          collect,
+        );
+      }
+    }
+    const acceptance = task.hostAcceptance;
+    if (acceptance !== null && typeof acceptance === 'object' && !Array.isArray(acceptance)
+      && Object.hasOwn(acceptance, TASK_DESCRIPTION_FIELDS.summary)) {
+      const summary = acceptance[TASK_DESCRIPTION_FIELDS.summary];
+      if (typeof summary !== 'string' || reviewNoteLength(summary) > TASK_DESCRIPTION_MAX_CHARS) {
+        acceptance[TASK_DESCRIPTION_FIELDS.summary] = boundValue(
+          summary,
+          `${prefix}hostAcceptance.${TASK_DESCRIPTION_FIELDS.summary}`,
+          cap,
+          collect,
+        );
+      }
+    }
+  };
+  inspect(answer.task ?? null, 'task.');
+  if (Array.isArray(answer.tasks)) {
+    for (let index = 0; index < answer.tasks.length; index += 1) inspect(answer.tasks[index], `tasks[${index}].`);
+  }
+  if (answer.hostAcceptance !== null && typeof answer.hostAcceptance === 'object') {
+    inspect({ hostAcceptance: answer.hostAcceptance }, '');
+  }
 }
 
 /**
@@ -1504,7 +1648,7 @@ function projectWithStage(value, stage, collect) {
  * @param {object[]} collect - truncation records.
  * @returns {object} skeleton.
  */
-function skeletonize(task, path, cap, collect) {
+function skeletonize(task, path, cap, collect, stage = {}) {
   if (task === null || typeof task !== 'object' || Array.isArray(task)) return task ?? null;
   const pick = (key) => (key in task ? boundValue(task[key], `${path}.${key}`, cap, collect) : undefined);
   const out = {};
@@ -1513,6 +1657,16 @@ function skeletonize(task, path, cap, collect) {
     // The Agent Teams verdict is four booleans and a short reason: it survives every
     // bound so a compressed answer still says whether teams are on for this run.
     'agentTeams', 'team']) {
+    if (key === 'hostAcceptance') {
+      // Projected directly from the uncut review block so the generic per-string cap never
+      // shortens `completionSummary` or `note` before their field-specific rules run.
+      if (!('hostAcceptance' in task)) continue;
+      const raw = task.hostAcceptance;
+      out.hostAcceptance = raw === null || typeof raw !== 'object' || Array.isArray(raw)
+        ? (raw ?? null)
+        : boundAcceptance(raw, `${path}.hostAcceptance`, collect, stage.omitNote === true, stage.omitSummary === true);
+      continue;
+    }
     const value = pick(key);
     if (value === undefined) continue;
     if (key === 'execution' && value !== null && typeof value === 'object') {
@@ -1522,12 +1676,6 @@ function skeletonize(task, path, cap, collect) {
       }
     } else if (key === 'route' || key === 'reviewRoute') {
       out[key] = value === null ? null : boundValue(value, `${path}.${key}`, cap, collect);
-    } else if (key === 'hostAcceptance') {
-      // The recorded CONCLUSION is restored to its own bound after the generic walk, so a
-      // small per-string cap can never shorten what the host concluded while leaving a
-      // record that still reads as the whole note. A note beyond the accepted bound is
-      // cut once, and the cut is stated.
-      out[key] = value === null ? null : boundAcceptance(value, `${path}.hostAcceptance`, collect);
     } else {
       out[key] = value;
     }
@@ -1540,6 +1688,12 @@ function skeletonize(task, path, cap, collect) {
   // operation can never read as complete.
   const pending = pendingPermissionsOf(task, path, collect);
   if (pending !== undefined) out.permission = pending;
+  const goal = verbatimDescription(task);
+  if (goal !== null) {
+    out.goalDescription = goal;
+  } else if (task?.goalDescription !== undefined) {
+    out.goalDescription = boundValue(task.goalDescription, `${path}.goalDescription`, cap, collect);
+  }
   if (task.question?.pending !== null && typeof task.question?.pending === 'object') {
     out.question = boundQuestionBlock(task.question, `${path}.question`, collect, QUESTION_WIRE_BUDGET);
   }
@@ -1548,28 +1702,61 @@ function skeletonize(task, path, cap, collect) {
   return out;
 }
 
+function verbatimDescription(source) {
+  const value = source?.goalDescription;
+  if (typeof value !== 'string') return null;
+  return reviewNoteLength(value) <= TASK_DESCRIPTION_MAX_CHARS ? value : null;
+}
+
 /**
  * Bound a recorded host review for a skeletonised answer.
  *
  * The conclusion fields are carried as the engine states them — `accepted`, `state`,
  * `acceptedAt`, `by` — because they are the answer to "was this accepted?", and the note
- * keeps its own generous cap rather than the skeleton's per-string one. Anything else
- * present is bounded generically, so a widened record cannot smuggle a long value in
- * through this exception.
+ * keeps its own generous cap rather than the skeleton's per-string one. The completion
+ * summary is bounded the same way as the note: kept whole when the record carries one, and
+ * omitted explicitly with its length when the body has to be given up, so it is never
+ * silently cut. Anything else present is bounded generically, so a widened record cannot
+ * smuggle a long value in through this exception.
  * @param {object} acceptance - host-acceptance record.
  * @param {string} path - JSON path.
  * @param {object[]} collect - truncation records.
  * @returns {object} bounded record.
  */
-function boundAcceptance(acceptance, path, collect, omitNoteText = false) {
-  if (omitNoteText) return omitNote(acceptance, `${path}.note`, collect);
+function boundAcceptance(acceptance, path, collect, omitNoteText = false, omitSummaryText = false) {
+  if (omitNoteText) return omitNote(acceptance, `${path}.note`, collect, omitSummaryText);
   const out = {};
   for (const [key, value] of Object.entries(acceptance)) {
     if (key === 'note' && typeof value === 'string') {
-      out[key] = value;
+      out[key] = reviewNoteLength(value) <= REVIEW_NOTE_MAX_CHARS
+        ? value
+        : boundValue(value, `${path}.note`, REVIEW_NOTE_MAX_CHARS, collect);
       continue;
     }
-    if (['accepted', 'state', 'acceptedAt', 'by', 'noteChars', 'noteOmitted'].includes(key)) {
+    if (key === 'completionSummary') {
+      if (value === undefined || value === null) continue;
+      if (typeof value === 'string' && reviewNoteLength(value) <= TASK_DESCRIPTION_MAX_CHARS) {
+        if (omitSummaryText) {
+          const summaryLen = reviewNoteLength(value);
+          out.completionSummaryChars = acceptance.completionSummaryChars ?? summaryLen;
+          out.completionSummaryOmitted = true;
+          collect.push({
+            path: `${path}.completionSummary`,
+            field: 'text',
+            keptChars: 0,
+            omittedChars: summaryLen,
+            detail: 'the completion summary is read with delegate_result completionSummaryOffset/completionSummaryLimit',
+          });
+        } else {
+          out[key] = value;
+        }
+      } else {
+        out[key] = boundValue(value, `${path}.completionSummary`, 240, collect);
+      }
+      continue;
+    }
+    if (['accepted', 'state', 'acceptedAt', 'by', 'noteChars', 'noteOmitted',
+      'completionSummaryChars', 'completionSummaryOmitted'].includes(key)) {
       out[key] = value;
       continue;
     }
@@ -1579,16 +1766,15 @@ function boundAcceptance(acceptance, path, collect, omitNoteText = false) {
 }
 
 /**
- * Mark a review note the projection had to drop, instead of publishing a shortened body.
- *
- * The body is never silently cut: `noteOmitted: true` plus `noteChars` says the note is
- * still there, and `reviewNoteOffset`/`reviewNoteLimit` read it in full.
- * @param {object} acceptance - host-acceptance record (mutated copy).
+ * Drop the note body (it is pageable) and keep a legal summary unless explicitly omitted.
+ * @param {object} acceptance - host-acceptance record.
  * @param {string} path - JSON path of the note.
  * @param {object[]} collect - truncation records.
- * @returns {object} the acceptance with an explicitly omitted note.
+ * @param {boolean} [omitSummaryText] - omit a legal summary explicitly when even it cannot fit.
+ * @returns {object} the acceptance with an explicitly omitted note and bounded summary.
  */
-function omitNote(acceptance, path, collect) {
+function omitNote(acceptance, path, collect, omitSummaryText = false) {
+  const basePath = path.replace(/\.note$/u, '');
   const length = typeof acceptance.note === 'string' ? Array.from(acceptance.note).length : 0;
   if (acceptance.note !== undefined && acceptance.note !== null) {
     collect.push({
@@ -1599,9 +1785,46 @@ function omitNote(acceptance, path, collect) {
       detail: 'the review note is read with delegate_result reviewNoteOffset/reviewNoteLimit',
     });
   }
-  const { note, ...rest } = acceptance;
+  const { note, completionSummary, ...rest } = acceptance;
   void note;
-  return { ...rest, noteChars: acceptance.noteChars ?? length, noteOmitted: true };
+  const out = {};
+  for (const [key, value] of Object.entries(rest)) {
+    if (['accepted', 'state', 'acceptedAt', 'by', 'noteChars', 'noteOmitted',
+      'completionSummaryChars', 'completionSummaryOmitted'].includes(key)) {
+      out[key] = value;
+    } else {
+      out[key] = boundValue(value, `${basePath}.${key}`, 240, collect);
+    }
+  }
+  out.noteChars = acceptance.noteChars ?? length;
+  out.noteOmitted = true;
+  if (completionSummary !== undefined && completionSummary !== null) {
+    if (typeof completionSummary === 'string' && reviewNoteLength(completionSummary) <= TASK_DESCRIPTION_MAX_CHARS) {
+      if (omitSummaryText) {
+        const summaryLen = reviewNoteLength(completionSummary);
+        out.completionSummaryChars = acceptance.completionSummaryChars ?? summaryLen;
+        out.completionSummaryOmitted = true;
+        collect.push({
+          path: `${basePath}.completionSummary`,
+          field: 'text',
+          keptChars: 0,
+          omittedChars: summaryLen,
+          detail: 'the completion summary is read with delegate_result completionSummaryOffset/completionSummaryLimit',
+        });
+      } else {
+        out.completionSummary = completionSummary;
+      }
+    } else {
+      // Not a description this build would have stored: bound it and state the cut.
+      out.completionSummary = boundValue(
+        completionSummary,
+        `${basePath}.completionSummary`,
+        240,
+        collect,
+      );
+    }
+  }
+  return out;
 }
 
 /**
@@ -1886,7 +2109,9 @@ function boundedJson(value) {
     // full width, and only the body becomes `noteOmitted`, readable in pages.
     { executionText: 120, reviewText: 120, lists: 1, permissionEvidence: 1, omitNote: true },
     { executionText: 80, reviewText: 80, lists: 1, permissionEvidence: 0, skeletonChars: 240 },
-    { executionText: 40, reviewText: 40, lists: 1, permissionEvidence: 0, skeletonChars: 96 },
+    { executionText: 80, reviewText: 80, lists: 1, permissionEvidence: 0, skeletonChars: 240, omitNote: true },
+    { executionText: 40, reviewText: 40, lists: 1, permissionEvidence: 0, skeletonChars: 96, omitNote: true },
+    { executionText: 40, reviewText: 40, lists: 1, permissionEvidence: 0, skeletonChars: 96, omitNote: true, omitSummary: true },
   ];
   const apply = (stage) => {
     const records = [];
@@ -2423,9 +2648,11 @@ export function createMcpServer(options) {
       } else {
         result = await callExecution(route, payload);
       }
-      // A paged read of the review note returns only its slice: it is a different, small
-      // ANSWER shape, not a projection of the big one.
-      const page = name === 'delegate_result' ? reviewNotePage(payload, result) : null;
+      // A paged read of the review note or completion summary returns only its slice:
+      // it is a different, small ANSWER shape, not a projection of the big one.
+      const page = name === 'delegate_result'
+        ? (reviewNotePage(payload, result) ?? completionSummaryPage(payload, result))
+        : null;
       const bounded = boundedJson(page ?? result);
       producedText = bounded.text;
       // A structurally trimmed answer is a real answer, so `isError` stays unset;
@@ -3293,6 +3520,59 @@ function reviewNotePage(payload, result) {
         by: acceptance.by ?? null,
         noteChars: points.length,
         noteOmitted: true,
+        ...(typeof acceptance.completionSummary === 'string' && acceptance.completionSummary !== ''
+          ? {
+            completionSummaryChars: Array.from(acceptance.completionSummary).length,
+            completionSummaryOmitted: true,
+          }
+          : {}),
+      },
+    reviewPersistence: task?.reviewPersistence ?? null,
+  };
+}
+
+/**
+ * Build the page answer for one `completionSummaryOffset` read, or null for a normal result.
+ * @param {object} payload - validated `delegate_result` arguments.
+ * @param {object} result - the plane's answer.
+ * @returns {object | null} the page answer, or null when this is not a summary paged read.
+ */
+function completionSummaryPage(payload, result) {
+  if (payload?.completionSummaryOffset === undefined) return null;
+  const task = result?.task !== null && typeof result?.task === 'object' ? result.task : null;
+  const acceptance = task?.hostAcceptance ?? result?.hostAcceptance ?? null;
+  const summary = typeof acceptance?.completionSummary === 'string' ? acceptance.completionSummary : '';
+  const points = Array.from(summary);
+  const offset = Math.min(payload.completionSummaryOffset, points.length);
+  const limit = payload.completionSummaryLimit ?? DEFAULT_COMPLETION_SUMMARY_PAGE_CHARS;
+  const slice = points.slice(offset, offset + limit).join('');
+  const next = offset + (offset + limit < points.length ? limit : points.length - offset);
+  const noteChars = typeof acceptance?.note === 'string'
+    ? Array.from(acceptance.note).length
+    : (typeof acceptance?.noteChars === 'number' ? acceptance.noteChars : 0);
+  return {
+    ok: true,
+    taskId: task?.taskId ?? payload.taskId,
+    state: task?.state ?? null,
+    completionSummary: {
+      offset,
+      limit,
+      text: slice,
+      summaryChars: points.length,
+      nextOffset: next < points.length ? next : null,
+      complete: next >= points.length,
+      present: summary !== '',
+    },
+    hostAcceptance: acceptance === null
+      ? null
+      : {
+        accepted: acceptance.accepted === true,
+        state: acceptance.state ?? null,
+        acceptedAt: acceptance.acceptedAt ?? null,
+        by: acceptance.by ?? null,
+        noteChars,
+        noteOmitted: true,
+        ...(summary !== '' ? { completionSummaryChars: points.length, completionSummaryOmitted: true } : {}),
       },
     reviewPersistence: task?.reviewPersistence ?? null,
   };

@@ -468,6 +468,9 @@ export const KNOWN_AGENT_TEMPLATES = [
   // something unknown and stays the operator's file.
   { version: '1.5.3-test.2', sha256: '2a9058424f33b0a022b05aedc3ebfcf35c0cb10eac498b754597dd7f90d3c775' },
   { version: '1.5.3-test.2', sha256: '77a4e83459ef605826cfaa1057d19058c4ae36a5ed6080ebd70c88a0a3dd69fb' },
+  // Exact published 1.5.3 template (CRLF/LF), preserved before the placement-rule update.
+  { version: '1.5.3', sha256: 'd26428333420f6e37d6a2ed5b953268bb99642eec4c08d46c402002ca6793df8' },
+  { version: '1.5.3', sha256: '12c1caac42d461b143e23b0b1e1218e32a735ee665ce13ac56ebef7c0f46cfd3' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */

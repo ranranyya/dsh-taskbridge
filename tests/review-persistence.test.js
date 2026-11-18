@@ -897,3 +897,286 @@ test('a credential-shaped review note is still redacted before it is stored', as
     await h.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 8. G01-B: the completion summary under concurrency, timeout, failure and replay
+// ---------------------------------------------------------------------------
+//
+// The summary is part of the conclusion's IDENTITY, and it is published only once the write
+// that carries it is durable. These tests use the same controllable write gate as the rest of
+// this file, so "in flight", "timed out" and "failed" are deterministic rather than timing
+// dependent.
+
+test('the same decision, note and summary join ONE in-flight write; a different summary is refused', async () => {
+  const h = await harness();
+  try {
+    const taskId = await finishedTask(h);
+    // The bar: how many document writes the store has really completed so far.
+    const writesBefore = h.gated.state.renames;
+    h.gated.state.hold = true;
+    const first = h.engine.recordHostReview({
+      connectionId: 'local-mcp', taskId, decision: 'accepted', note: 'ok', completionSummary: '已完成 A',
+    });
+    await h.gated.state.arrive(0);
+    // The identical triple joins the write that is already running.
+    const joined = h.engine.recordHostReview({
+      connectionId: 'local-mcp', taskId, decision: 'accepted', note: 'ok', completionSummary: '已完成 A',
+    });
+    // A summary that differs by one character is a DIFFERENT conclusion.
+    const conflicted = h.engine.recordHostReview({
+      connectionId: 'local-mcp', taskId, decision: 'accepted', note: 'ok', completionSummary: '已完成 B',
+    });
+    await assert.rejects(conflicted, (error) => error.code === JOB_CODES.reviewNotReviewable);
+
+    // While the write is held, NO document write has completed for it: the held rename is still
+    // inside the gate, so the counter has not moved.
+    assert.equal(h.gated.state.renames, writesBefore, 'nothing has been renamed while the write is held');
+
+    h.gated.state.releaseAll();
+    h.gated.state.hold = false;
+    const [a, b] = await Promise.all([first, joined]);
+    await h.store.flush();
+    assert.equal(a.hostAcceptance.completionSummary, '已完成 A');
+    assert.equal(b.hostAcceptance.completionSummary, '已完成 A');
+    assert.equal(a.hostAcceptance.acceptedAt, b.hostAcceptance.acceptedAt, 'both joined the same record');
+    // EXACTLY ONE document write happened: the joined caller did not start a second one.
+    assert.equal(h.gated.state.renames - writesBefore, 1, 'exactly one durable write served both callers');
+    const row = await storedRecord(h, taskId);
+    assert.equal(row.hostAcceptance.completionSummary, '已完成 A');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a proposed summary is NOT visible anywhere while the write is unconfirmed', async () => {
+  const h = await harness();
+  try {
+    const taskId = await finishedTask(h);
+    h.gated.state.hold = true;
+    const pending = h.engine.recordHostReview({
+      connectionId: 'local-mcp', taskId, decision: 'accepted', note: 'ok', completionSummary: '提议中的完成说明',
+    });
+    pending.catch(() => undefined);
+    await h.gated.state.arrive(0);
+
+    // Every public read: the acceptance is absent AND no summary leaks through any field.
+    const view = h.engine.get(taskId);
+    assert.equal(view.hostAcceptance, null);
+    assert.equal(JSON.stringify(view).includes('提议中的完成说明'), false, 'the proposal never reaches a view');
+    assert.equal(view.reviewPersistence.state, REVIEW_PERSISTENCE_STATES.saving);
+    assert.equal(JSON.stringify(view.reviewPersistence).includes('提议中的完成说明'), false);
+    const observation = await h.engine.observeTask(taskId, { connectionId: 'local-mcp', waitMs: 1 });
+    assert.equal(observation.task.hostAcceptance, null);
+    assert.equal(JSON.stringify(observation).includes('提议中的完成说明'), false, 'nor an observation');
+    // Nor the document.
+    assert.equal(await storedAcceptance(h, taskId), null);
+
+    h.gated.state.release(0);
+    const recorded = await pending;
+    assert.equal(recorded.hostAcceptance.completionSummary, '提议中的完成说明');
+    assert.equal((await storedRecord(h, taskId)).hostAcceptance.completionSummary, '提议中的完成说明');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a timed-out review publishes the summary only when the late write SUCCEEDS', async () => {
+  const h = await harness();
+  try {
+    const taskId = await finishedTask(h);
+    h.gated.state.hold = true;
+    const timed = await h.engine.recordHostReview({
+      connectionId: 'local-mcp', taskId, decision: 'accepted', note: 'slow', completionSummary: '稍后落盘',
+      waitMs: 60,
+    });
+    assert.equal(timed.reviewPersistence.state, REVIEW_PERSISTENCE_STATES.timedOut);
+    assert.equal(timed.hostAcceptance, null, 'a timed-out review is not a conclusion');
+    assert.equal(h.engine.get(taskId).hostAcceptance, null);
+    assert.equal(JSON.stringify(h.engine.get(taskId)).includes('稍后落盘'), false, 'no early summary');
+
+    h.gated.state.release(0);
+    await h.engine.reviewWriteDone(taskId);
+    const view = h.engine.get(taskId);
+    assert.equal(view.hostAcceptance.completionSummary, '稍后落盘', 'the late success publishes it');
+    assert.equal(view.reviewPersistence.state, REVIEW_PERSISTENCE_STATES.saved);
+    assert.equal((await storedRecord(h, taskId)).hostAcceptance.completionSummary, '稍后落盘');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a timed-out review whose late write FAILS keeps no summary and no acceptance', async () => {
+  const h = await harness();
+  try {
+    const taskId = await finishedTask(h);
+    h.failNextWrite('EIO');
+    const timed = await h.engine.recordHostReview({
+      connectionId: 'local-mcp', taskId, decision: 'accepted', note: 'slow failure', completionSummary: '不会存在',
+      waitMs: 60,
+    });
+    assert.equal(timed.reviewPersistence.state, REVIEW_PERSISTENCE_STATES.timedOut);
+    h.gated.state.release(0);
+    await h.engine.reviewWriteDone(taskId)?.catch(() => undefined);
+    const view = h.engine.get(taskId);
+    assert.equal(view.hostAcceptance, null, 'a failed late write records nothing');
+    assert.equal(JSON.stringify(view).includes('不会存在'), false);
+    assert.equal(view.reviewPersistence.state, REVIEW_PERSISTENCE_STATES.failed);
+    assert.equal(view.reviewPersistence.retryable, true);
+    assert.equal(await storedAcceptance(h, taskId), null);
+
+    // The existing retry rule still applies, and only the CONFIRMED value is stored.
+    h.gated.state.hold = false;
+    const retried = await h.engine.recordHostReview({
+      connectionId: 'local-mcp', taskId, decision: 'accepted', note: 'slow failure', completionSummary: '重试后的说明',
+    });
+    assert.equal(retried.hostAcceptance.completionSummary, '重试后的说明');
+    const row = await storedRecord(h, taskId);
+    assert.equal(row.hostAcceptance.completionSummary, '重试后的说明');
+    assert.equal(JSON.stringify(row).includes('不会存在'), false, 'the failed proposal left no trace');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a terminal snapshot racing a review write neither erases nor replaces the summary', async () => {
+  const h = await harness();
+  try {
+    const taskId = await finishedTask(h);
+    // Save the review first, holding the write open.
+    h.gated.state.hold = true;
+    const pending = h.engine.recordHostReview({
+      connectionId: 'local-mcp', taskId, decision: 'accepted', note: 'ok', completionSummary: '已保存的说明',
+    });
+    await h.gated.state.arrive(0);
+    // A STALE snapshot of the same task, taken before the review, is queued behind it.
+    const stale = h.engine.get(taskId);
+    assert.equal(stale.hostAcceptance, null, 'the snapshot predates the review');
+    h.engine.persistTerminalRecord(h.engine.tasks.get(taskId)).catch(() => undefined);
+    h.gated.state.releaseAll();
+    h.gated.state.hold = false;
+    await pending;
+    await h.store.flush();
+    const late = h.engine.reviewWriteDone(taskId);
+    if (late !== null && typeof late.then === 'function') await late.catch(() => undefined);
+    // The confirmed review survives, summary included.
+    const row = await storedRecord(h, taskId);
+    assert.equal(row.hostAcceptance.completionSummary, '已保存的说明', 'a stale snapshot never erases the summary');
+  } finally {
+    await h.close();
+  }
+});
+
+test('the historical review path joins, refuses and publishes a summary under the same rules', async () => {
+  const h = await harness();
+  try {
+    const taskId = await finishedTask(h);
+    // The bar: how many document writes the store has really completed so far.
+    const writesBefore = h.gated.state.renames;
+    h.gated.state.hold = true;
+    const first = h.engine.recordHistoricalReview(
+      { taskId, connectionId: 'local-mcp' }, 'accepted', 'ok after restart', null, '历史说明',
+    );
+    await h.gated.state.arrive(0);
+    const joined = h.engine.recordHistoricalReview(
+      { taskId, connectionId: 'local-mcp' }, 'accepted', 'ok after restart', null, '历史说明',
+    );
+    await assert.rejects(
+      () => h.engine.recordHistoricalReview(
+        { taskId, connectionId: 'local-mcp' }, 'accepted', 'ok after restart', null, '另一个历史说明',
+      ),
+      (error) => error.code === JOB_CODES.reviewNotReviewable,
+    );
+    // Nothing is published while the write is open, and no write has completed yet.
+    assert.equal(JSON.stringify(await h.engine.storedTaskRow(taskId, 'local-mcp')).includes('历史说明'), false);
+    assert.equal(h.gated.state.renames, writesBefore, 'nothing has been renamed while the write is held');
+    h.gated.state.releaseAll();
+    h.gated.state.hold = false;
+    const [a, b] = await Promise.all([first, joined]);
+    await h.store.flush();
+    assert.equal(a.hostAcceptance.completionSummary, '历史说明');
+    assert.equal(b.hostAcceptance.completionSummary, a.hostAcceptance.completionSummary);
+    // The joined caller did NOT start a second document write.
+    assert.equal(h.gated.state.renames - writesBefore, 1, 'exactly one durable write served both callers');
+    const row = await storedRecord(h, taskId);
+    assert.equal(row.hostAcceptance.completionSummary, '历史说明');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a HISTORICAL review that times out publishes the summary only on a LATE SUCCESS', async () => {
+  const h = await harness();
+  try {
+    const taskId = await finishedTask(h);
+    h.gated.state.hold = true;
+    const timed = await h.engine.recordHistoricalReview(
+      { taskId, connectionId: 'local-mcp' }, 'accepted', 'slow historical', 60, '历史稍后落盘',
+    );
+    assert.equal(timed.reviewPersistence.state, REVIEW_PERSISTENCE_STATES.timedOut);
+    assert.equal(timed.hostAcceptance, null, 'a timed-out historical review is not a conclusion');
+    // Nothing is published while unconfirmed: no view, no observation, no document.
+    assert.equal(JSON.stringify(h.engine.get(taskId)).includes('历史稍后落盘'), false);
+    const observed = await h.engine.observeTask(taskId, { connectionId: 'local-mcp', waitMs: 1 });
+    assert.equal(observed.task.hostAcceptance, null);
+    assert.equal(JSON.stringify(observed).includes('历史稍后落盘'), false);
+    assert.equal(await storedAcceptance(h, taskId), null);
+
+    h.gated.state.releaseAll();
+    h.gated.state.hold = false;
+    const late = h.engine.reviewWriteDone(taskId);
+    if (late !== null && typeof late.then === 'function') await late.catch(() => undefined);
+    const row = await storedRecord(h, taskId);
+    assert.equal(row.hostAcceptance.completionSummary, '历史稍后落盘', 'the late success publishes it');
+    const view = h.engine.historyViewOf(await h.engine.storedTaskRow(taskId, 'local-mcp'));
+    assert.equal(view.hostAcceptance.completionSummary, '历史稍后落盘');
+    assert.equal(view.reviewPersistence.state, REVIEW_PERSISTENCE_STATES.saved);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a HISTORICAL review whose late write FAILS leaves nothing and may then be retried', async () => {
+  const h = await harness();
+  try {
+    const taskId = await finishedTask(h);
+    h.failNextWrite('EIO');
+    const timed = await h.engine.recordHistoricalReview(
+      { taskId, connectionId: 'local-mcp' }, 'accepted', 'slow failure', 60, '不会存在',
+    );
+    assert.equal(timed.reviewPersistence.state, REVIEW_PERSISTENCE_STATES.timedOut);
+    h.gated.state.releaseAll();
+    h.gated.state.hold = false;
+    const late = h.engine.reviewWriteDone(taskId);
+    if (late !== null && typeof late.then === 'function') await late.catch(() => undefined);
+    // A failed late write records NO acceptance and NO summary anywhere.
+    assert.equal(await storedAcceptance(h, taskId), null);
+    const view = h.engine.get(taskId);
+    assert.equal(view.hostAcceptance, null);
+    assert.equal(JSON.stringify(view).includes('不会存在'), false);
+    assert.equal(view.reviewPersistence.state, REVIEW_PERSISTENCE_STATES.failed);
+    assert.equal(view.reviewPersistence.retryable, true);
+
+    // The existing retry rule applies, and only the CONFIRMED value is stored.
+    const retried = await h.engine.recordHistoricalReview(
+      { taskId, connectionId: 'local-mcp' }, 'accepted', 'slow failure', null, '重试后的历史说明',
+    );
+    assert.equal(retried.hostAcceptance.completionSummary, '重试后的历史说明');
+    const row = await storedRecord(h, taskId);
+    assert.equal(row.hostAcceptance.completionSummary, '重试后的历史说明');
+    assert.equal(JSON.stringify(row).includes('不会存在'), false, 'the failed proposal left no trace');
+
+    // A replay of the CONFIRMED triple is idempotent, and only the summary differing is refused.
+    const replayed = await h.engine.recordHistoricalReview(
+      { taskId, connectionId: 'local-mcp' }, 'accepted', 'slow failure', null, '重试后的历史说明',
+    );
+    assert.equal(replayed.hostAcceptance.acceptedAt, retried.hostAcceptance.acceptedAt);
+    await assert.rejects(
+      () => h.engine.recordHistoricalReview(
+        { taskId, connectionId: 'local-mcp' }, 'accepted', 'slow failure', null, '只改历史说明',
+      ),
+      (error) => error.code === JOB_CODES.reviewNotReviewable,
+    );
+  } finally {
+    await h.close();
+  }
+});

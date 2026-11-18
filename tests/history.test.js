@@ -895,3 +895,401 @@ test('an interrupted record keeps the cut-off tool call as evidence', async () =
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Title and continuation reference: existing facts only, never inferred
+// ---------------------------------------------------------------------------
+
+test('an explicit CJK and emoji title at the engine 48-element bound survives unchanged', async () => {
+  const dir = await dataDir();
+  try {
+    // The engine names a task with at most 48 user-perceived characters, so a title at that
+    // bound must be stored and read back character for character — no trim, no ellipsis, no
+    // re-derived name. The CJK characters are one UTF-16 unit each and the emoji two, so the
+    // unit length differs from the element count while the element count is exactly 48.
+    const title = `${'修复历史投影😀🧪保留标题与续接引用'}${'好'.repeat(21)}${'😀'.repeat(10)}`;
+    assert.equal(Array.from(title).length, 48, 'the fixture is the engine bound');
+    assert.equal(title.length, 60, 'UTF-16 length differs from the element count');
+    assert.notEqual(Array.from(title).length, title.length);
+    const store = new HistoryStore(dir);
+    const saved = await store.save(fixtureView({ title, continueFromTaskId: null }));
+    await store.flush();
+    assert.equal(saved.title, title);
+    assert.equal(saved.truncation ?? null, null, 'a normal title is never marked as cut');
+    assert.equal(saved.continueFromTaskId ?? null, null, 'an independent first round names no parent');
+
+    const document = await readDocument(dir);
+    assert.equal(document.jobs[0].title, title);
+
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.title, title);
+    assert.equal(row.continueFromTaskId ?? null, null);
+    assert.equal(Array.from(row.title).length, 48, 'no character is dropped or added');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a record with no title, a blank title or a non-string title stores null and invents nothing', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    const cases = [
+      ['task-no-title', {}],
+      ['task-blank-title', { title: '   ' }],
+      ['task-null-title', { title: null }],
+      ['task-number-title', { title: 42 }],
+      ['task-object-title', { title: { text: '标题' } }],
+    ];
+    for (const [taskId, extra] of cases) {
+      const view = fixtureView({ taskId, createdAt: 1_700_000_000_000, ...extra });
+      if (!Object.hasOwn(extra, 'title')) delete view.title;
+      // Text the engine WOULD have named this task after. It must not become a title now.
+      // Only the PROMPT is planted: the execution and review blocks store their own
+      // pre-existing `text` by design, so they are checked where they belong — the title.
+      view.prompt = '目标：从提示词造出的标题';
+      const saved = await store.save(view);
+      assert.equal(saved.title ?? null, null, `${taskId} must store no title`);
+    }
+    await store.flush();
+    const raw = await readFile(historyFile(dir), 'utf8');
+    assert.equal(raw.includes('从提示词造出的标题'), false, 'a prompt is never turned into a stored title');
+    const rows = await new HistoryStore(dir).load();
+    assert.equal(rows.length, cases.length);
+    for (const row of rows) {
+      // Absent and `null` are the same reading: no title and no reference.
+      assert.equal(row.title ?? null, null);
+      assert.equal(row.continueFromTaskId ?? null, null);
+    }
+
+    // Neither the execution output, the review text, the task id nor the timing becomes a
+    // title: reading a row back yields exactly the null that was stored.
+    await store.save(fixtureView({
+      taskId: 'task-texts-not-titles',
+      createdAt: 1_700_000_000_001,
+      execution: { ...fixtureView().execution, text: 'EXECUTION TEXT SHOULD NOT BE A TITLE' },
+      review: { ...fixtureView().review, text: 'REVIEW TEXT SHOULD NOT BE A TITLE' },
+    }));
+    await store.flush();
+    const withTexts = (await new HistoryStore(dir).load()).find((row) => row.taskId === 'task-texts-not-titles');
+    assert.equal(withTexts.title ?? null, null);
+    assert.equal(withTexts.execution.text, 'EXECUTION TEXT SHOULD NOT BE A TITLE', 'the pre-existing execution text field is unchanged');
+    assert.equal(withTexts.review.text, 'REVIEW TEXT SHOULD NOT BE A TITLE');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a title is redacted on the way in but its ordinary text survives', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    await store.save(fixtureView({ title: `修复 ${SECRET} 相关的标题` }));
+    await store.flush();
+    const raw = await readFile(historyFile(dir), 'utf8');
+    assert.equal(raw.includes(SECRET), false, 'a credential shape in a title is masked');
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.title.includes(SECRET), false);
+    assert.equal(row.title.includes('修复'), true, 'the ordinary part of the title is kept');
+    assert.equal(row.title.includes('相关的标题'), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an over-bound title is cut once with the truncation marker and is stable across reloads', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    const long = '题'.repeat(300);
+    const saved = await store.save(fixtureView({ taskId: 'task-long-title', title: long }));
+    // The existing bounded-text rule, not a special title rule: 256 kept + the shared marker.
+    assert.equal(saved.title, `${'题'.repeat(256)}… [truncated]`);
+    assert.equal(saved.title.startsWith(long.slice(0, 256)), true);
+    assert.deepEqual(saved.truncation.fields, ['title'], 'the cut is stated, not silent');
+    assert.equal(saved.truncation.dropped.length, 0);
+    // The title still fits inside the engine's own 48-element budget, so this only comes
+    // from a caller that passed something longer.
+    assert.equal(Array.from(saved.title).length, 269);
+    await store.flush();
+
+    const first = await readFile(historyFile(dir), 'utf8');
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.title, saved.title, 'the stored title reads back exactly as written');
+    assert.deepEqual(row.truncation.fields, ['title'], 'the marker survives the reload');
+    // A second load changes nothing: the cut is recorded once, never re-applied.
+    assert.equal(await readFile(historyFile(dir), 'utf8'), first, 'a reload is idempotent');
+
+    // Saving the same record again does not double-mark the title.
+    const again = await store.save(fixtureView({ taskId: 'task-long-title', title: row.title }));
+    assert.equal(again.title, saved.title);
+    assert.equal(again.title.includes('[truncated]… [truncated]'), false);
+    assert.deepEqual(again.truncation.fields, ['title']);
+    await store.flush();
+    const [reread] = await new HistoryStore(dir).load();
+    assert.equal(reread.title, saved.title);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an explicit continuation reference survives a restart and is never validated or inferred', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    // The parent is never saved here: an explicit reference is stored even when the record
+    // it names is absent from this document, and it is never attached to anything.
+    const saved = await store.save(fixtureView({
+      taskId: 'task-child',
+      continueFromTaskId: '  task-parent-único-😀  ',
+    }));
+    assert.equal(saved.continueFromTaskId, 'task-parent-único-😀', 'only the surrounding whitespace is removed');
+    await store.flush();
+
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.continueFromTaskId, 'task-parent-único-😀');
+    // The row is exactly the record that was saved: the reference did not add a parent
+    // record, a conversation fact or any other relationship.
+    assert.equal((await store.load()).length, 1, 'no parent record is created from a reference');
+    assert.equal(row.execution.conversation ?? null, null, 'no conversation fact is invented from the reference');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a malformed, oversized or self-referential continuation reference stores null', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    const longId = `task-${'x'.repeat(251)}`;
+    assert.equal(longId.length, 256);
+    const cases = [
+      ['task-ref-blank', { continueFromTaskId: '   ' }],
+      ['task-ref-empty', { continueFromTaskId: '' }],
+      ['task-ref-number', { continueFromTaskId: 42 }],
+      ['task-ref-object', { continueFromTaskId: { taskId: 'task-parent' } }],
+      ['task-ref-too-long', { continueFromTaskId: `${longId}x` }],
+      ['task-ref-self', { continueFromTaskId: ' task-ref-self ' }],
+    ];
+    for (const [taskId, extra] of cases) {
+      const saved = await store.save(fixtureView({ taskId, createdAt: 1_700_000_000_000, ...extra }));
+      assert.equal(saved.continueFromTaskId ?? null, null, `${taskId} must store no reference`);
+    }
+    // A reference at the same bound as a stored task id is kept whole (not cut).
+    const atBound = await store.save(fixtureView({ taskId: 'task-ref-at-bound', createdAt: 1_700_000_000_001, continueFromTaskId: longId }));
+    assert.equal(atBound.continueFromTaskId, longId);
+    await store.flush();
+
+    const rows = await new HistoryStore(dir).load();
+    const stored = new Map(rows.map((row) => [row.taskId, row]));
+    for (const [taskId] of cases) assert.equal(stored.get(taskId).continueFromTaskId ?? null, null);
+    assert.equal(stored.get('task-ref-at-bound').continueFromTaskId, longId);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('two independent records with the same title stay separate and unrelated', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    const shared = '同名任务标题 😀';
+    // Same title, no continuation on either: two independent rounds, not a chain.
+    await store.save(fixtureView({ taskId: 'task-twin-1', createdAt: 1_000, title: shared }));
+    await store.save(fixtureView({ taskId: 'task-twin-2', createdAt: 2_000, title: shared }));
+    await store.flush();
+
+    const rows = await new HistoryStore(dir).load();
+    assert.equal(rows.length, 2, 'a shared title never merges two records');
+    const [newer, older] = rows;
+    assert.equal(newer.taskId, 'task-twin-2', 'load is newest first');
+    assert.equal(older.taskId, 'task-twin-1');
+    for (const row of rows) {
+      assert.equal(row.title, shared, 'each record keeps the title it was saved with');
+      assert.equal(row.continueFromTaskId ?? null, null, 'a similar title is not a continuation');
+    }
+    // Neither record grew a reference to the other, and no third record appeared.
+    const document = await readDocument(dir);
+    assert.equal(document.jobs.length, 2);
+    assert.equal(JSON.stringify(document).includes('task-twin-1'), true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a child keeps its explicit reference after the parent record is evicted', async () => {
+  const dir = await dataDir();
+  try {
+    // Room for two records only: saving the child pushes the parent out.
+    const store = new HistoryStore(dir, { maxEntries: 2 });
+    await store.save(fixtureView({ taskId: 'task-parent-evicted', createdAt: 1_000, title: '将被裁剪的父任务' }));
+    await store.save(fixtureView({ taskId: 'task-sibling', createdAt: 2_000 }));
+    const saved = await store.save(fixtureView({
+      taskId: 'task-child-kept',
+      createdAt: 3_000,
+      continueFromTaskId: 'task-parent-evicted',
+    }));
+    assert.equal(saved.continueFromTaskId, 'task-parent-evicted');
+    await store.flush();
+
+    const rows = await new HistoryStore(dir).load();
+    const ids = rows.map((row) => row.taskId).sort();
+    assert.deepEqual(ids, ['task-child-kept', 'task-sibling'], 'the oldest record was evicted');
+    const child = rows.find((row) => row.taskId === 'task-child-kept');
+    // The reference names a record that is no longer in the document. It is kept as the
+    // recorded REQUEST: the child is not deleted, not re-homed onto the surviving sibling,
+    // and nothing about the evicted parent is invented.
+    assert.equal(child.continueFromTaskId, 'task-parent-evicted');
+    assert.equal(child.title ?? null, null, 'the evicted parent title is not borrowed');
+    const sibling = rows.find((row) => row.taskId === 'task-sibling');
+    assert.equal(sibling.continueFromTaskId ?? null, null, 'the sibling is not made the parent');
+    // A restart reads the same facts back.
+    const [reloadedChild] = (await new HistoryStore(dir, { maxEntries: 2 }).load())
+      .filter((row) => row.taskId === 'task-child-kept');
+    assert.equal(reloadedChild.continueFromTaskId, 'task-parent-evicted');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a legacy record without the new keys is not rewritten just to add them', async () => {
+  const dir = await dataDir();
+  try {
+    // A record exactly as an earlier release wrote it: neither field exists. It is a
+    // shape-stable record (no missing block the re-projection would fill in and no live
+    // state to normalize), so the only reason the document could change is the two new
+    // keys — and they are omitted rather than added as `null`.
+    const legacy = {
+      taskId: 'task-legacy',
+      state: 'awaiting-host-review',
+      phase: 'awaiting-host-review',
+      createdAt: 1_700_000_000_000,
+      startedAt: 1_700_000_000_100,
+      endedAt: 1_700_000_000_900,
+      sourcePath: null,
+      workspacePath: null,
+      executionWorkspacePath: null,
+      sourcePathDigest: null,
+      executionPathDigest: null,
+      workspaceId: null,
+      sessionId: null,
+      isolation: null,
+      interruptedFrom: null,
+      connectionId: 'conn-legacy',
+      effective: null,
+      route: null,
+      reviewRoute: null,
+      reviewRouteError: null,
+      worktree: null,
+      baseline: null,
+      diff: null,
+      execution: null,
+      review: null,
+      permission: null,
+      activity: null,
+      error: null,
+      cancelledBy: null,
+      hostAcceptance: null,
+      agentTeams: null,
+      team: null,
+      selfApproved: false,
+    };
+    assert.equal(Object.hasOwn(legacy, 'title'), false);
+    assert.equal(Object.hasOwn(legacy, 'continueFromTaskId'), false);
+    // Written in the same compact serialization the store itself uses, so a rewrite would
+    // show up as a difference rather than as formatting.
+    const raw = `${JSON.stringify({ schemaVersion: 1, updatedAt: 1_700_000_001_000, jobs: [legacy] })}\n`;
+    await writeDocument(dir, raw);
+
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.taskId, 'task-legacy');
+    assert.equal(row.title ?? null, null, 'a stored record without a title says so instead of guessing');
+    assert.equal(row.continueFromTaskId ?? null, null);
+    // This load writes nothing: neither the stored job record nor the update stamp changed.
+    assert.deepEqual(await readDocument(dir), { schemaVersion: 1, updatedAt: 1_700_000_001_000, jobs: [legacy] });
+    assert.equal(await readFile(historyFile(dir), 'utf8'), raw);
+    assert.equal((await new HistoryStore(dir).load())[0].title ?? null, null);
+    assert.equal(await readFile(historyFile(dir), 'utf8'), raw);
+
+    // A legacy record that was LIVE when the process stopped IS normalized and persisted —
+    // the existing load-writes-on-change rule is unchanged — and that rewrite still adds no
+    // title and no reference.
+    await writeDocument(dir, {
+      schemaVersion: 1,
+      updatedAt: 1_700_000_001_000,
+      jobs: [{ ...legacy, taskId: 'task-legacy-live', state: 'running', endedAt: null }],
+    });
+    const [interrupted] = await new HistoryStore(dir).load();
+    assert.equal(interrupted.state, 'interrupted');
+    assert.equal(interrupted.title ?? null, null);
+    assert.equal(interrupted.continueFromTaskId ?? null, null);
+    const normalized = await readDocument(dir);
+    assert.equal(normalized.jobs[0].state, 'interrupted', 'the existing normalization is persisted once');
+    assert.equal(Object.hasOwn(normalized.jobs[0], 'title'), false, 'the normalization adds no title key');
+    assert.equal(Object.hasOwn(normalized.jobs[0], 'continueFromTaskId'), false);
+    // A second load of the normalized document is stable.
+    const afterNormalization = await readFile(historyFile(dir), 'utf8');
+    await new HistoryStore(dir).load();
+    assert.equal(await readFile(historyFile(dir), 'utf8'), afterNormalization);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a stored over-bound title is read back cut and marked, and the reload is idempotent', async () => {
+  const dir = await dataDir();
+  try {
+    // A document another build wrote: the title is past the shared bound. It must stay
+    // loadable, be bounded with the shared marker, and be stable on the next load.
+    const stored = {
+      taskId: 'task-big-title',
+      state: 'awaiting-host-review',
+      phase: 'awaiting-host-review',
+      createdAt: 1_700_000_000_000,
+      endedAt: 1_700_000_001_000,
+      connectionId: 'conn-big',
+      title: `头部${'多'.repeat(4096)}`,
+      continueFromTaskId: 'task-parent',
+      hostAcceptance: null,
+      selfApproved: false,
+    };
+    await writeDocument(dir, { schemaVersion: 1, updatedAt: 1_700_000_001_000, jobs: [stored] });
+    const [row] = await new HistoryStore(dir).load();
+    assert.equal(row.title, `头部${'多'.repeat(254)}… [truncated]`, 'the readable prefix is kept and the cut stated');
+    assert.equal(row.continueFromTaskId, 'task-parent', 'a reference in the same row is unaffected');
+
+    // The bounded form is what the document now holds, and reloading it changes nothing.
+    const afterFirst = await readFile(historyFile(dir), 'utf8');
+    const [again] = await new HistoryStore(dir).load();
+    assert.equal(again.title, row.title);
+    assert.equal(await readFile(historyFile(dir), 'utf8'), afterFirst, 'the second load is a no-op');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('identifying fields survive an entry fitted to its smallest budget', async () => {
+  const dir = await dataDir();
+  try {
+    const limits = { maxEntries: 4, maxBytes: 64 * 1024, maxEntryBytes: 4096 };
+    const title = '标题😀 与续接引用';
+    const store = new HistoryStore(dir, limits);
+    const saved = await store.save(fixtureView({
+      title,
+      continueFromTaskId: 'task-parent-fit',
+      diff: { ...fixtureView().diff, patchText: 'p'.repeat(64 * 1024) },
+      execution: { ...fixtureView().execution, text: 'e'.repeat(64 * 1024) },
+    }));
+    assert.equal(Buffer.byteLength(JSON.stringify(saved), 'utf8') <= 4096, true);
+    assert.equal(saved.title, title, 'a normal title is kept whole beside a fitted entry');
+    assert.equal(saved.continueFromTaskId, 'task-parent-fit', 'the reference is never cut by the entry fitter');
+    assert.equal(saved.diff.patchText.endsWith('… [truncated]'), true, 'the existing cut rule still applies to text');
+    await store.flush();
+
+    const [row] = await new HistoryStore(dir, limits).load();
+    assert.equal(row.title, title);
+    assert.equal(row.continueFromTaskId, 'task-parent-fit');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

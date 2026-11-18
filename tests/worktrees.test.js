@@ -10,7 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -103,7 +103,7 @@ function fakeWorktreeGit(options = {}) {
  * @returns {Promise<object>} harness.
  */
 async function harness(options = {}) {
-  const base = await makeTempDir();
+  const base = await realpath(await makeTempDir());
   const sourcePath = join(base, 'source');
   if (options.nestedSource === true || options.rootElsewhereInRepository === true) {
     // The supplied path is a directory inside the repository, not its root.

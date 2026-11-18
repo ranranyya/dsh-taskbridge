@@ -105,6 +105,22 @@ export interface DelegateRouteOptions {
   requireEffort?: boolean;
 }
 
+/** Commander-supplied submission fields (`delegate_submit`, `POST /tasks`; prose <= 2000 code points). */
+export interface DelegateSubmitRequest {
+  workspacePath: string;
+  prompt: string;
+  title?: string;
+  goalDescription?: string;
+  continueFromTaskId?: string;
+  overrides?: {
+    model?: string;
+    reasoningEffort?: string;
+    timeoutSeconds?: number;
+    [field: string]: unknown;
+  };
+  agentTeams?: boolean;
+}
+
 /**
  * One pending per-call permission request, as the task view publishes it.
  *
@@ -431,7 +447,7 @@ export type DelegateObserveReason =
   | 'cancelled'
   | 'interrupted';
 
-/** The compact task summary one observation returns. */
+/** Compact task summary one observation returns (carries summary length/omission flag, no prose). */
 export interface DelegateObservationSummary {
   taskId: string;
   state: 'pending' | 'running' | 'awaiting-host-review' | 'failed' | 'cancelled' | 'interrupted';
@@ -501,14 +517,16 @@ export interface DelegateAgentTeamsOutcome {
  * A replayed (idempotent) review request and its answer.
  *
  * `decision` is the closed vocabulary the review verb accepts; a note is required and
- * bounded. Repeating the same decision with the same note is a no-op; a different
- * conclusion is refused.
+ * bounded. Repeating the same decision with the same note — and the same optional
+ * completion summary — is a no-op; a different conclusion is refused.
  */
 export interface DelegateReviewRequest {
   taskId: string;
   decision: 'accepted' | 'changes-requested';
   /** Required after trimming; at most 8000 Unicode code points; stored redacted. */
   note: string;
+  /** Optional completion summary (<= 2000 code points, redacted, part of review identity). */
+  completionSummary?: string;
 }
 
 /** Answer of one recorded delivery review. */
@@ -542,10 +560,21 @@ export interface DelegateReviewPersistence {
   error: { code: string; message: string } | null;
 }
 
-/** A wait carries status and length, never repeats the note body. */
-export interface DelegateCompactHostAcceptance extends Omit<DelegateHostAcceptance, 'note'> {
+/** Wait/compact review projection: carries lengths and omission flags, never prose bodies. */
+export interface DelegateCompactHostAcceptance extends Omit<DelegateHostAcceptance, 'note' | 'completionSummary'> {
   noteChars: number;
   noteOmitted: true;
+  completionSummaryChars?: number;
+  completionSummaryOmitted?: true;
+}
+
+/** Bounded review projection where `note` is paged out while a legal `completionSummary` stays whole unless omitted. */
+export interface DelegateOmittedHostAcceptance extends Omit<DelegateHostAcceptance, 'note' | 'completionSummary'> {
+  noteChars: number;
+  noteOmitted: true;
+  completionSummary?: string;
+  completionSummaryChars?: number;
+  completionSummaryOmitted?: true;
 }
 
 /** Optional paged note read on delegate_result; omit offset for the old result shape. */
@@ -574,6 +603,32 @@ export interface DelegateReviewNotePageResult {
   reviewPersistence: DelegateReviewPersistence | null;
 }
 
+/** Optional paged completion-summary read on delegate_result when completionSummaryOmitted is true. */
+export interface DelegateCompletionSummaryPageRequest {
+  taskId: string;
+  /** Nonnegative Unicode code-point offset. */
+  completionSummaryOffset: number;
+  /** Integer from 1 to 2000, default 2000. Requires completionSummaryOffset. */
+  completionSummaryLimit?: number;
+}
+
+export interface DelegateCompletionSummaryPageResult {
+  ok: true;
+  taskId: string;
+  state: string | null;
+  completionSummary: {
+    offset: number;
+    limit: number;
+    text: string;
+    summaryChars: number;
+    nextOffset: number | null;
+    complete: boolean;
+    present: boolean;
+  };
+  hostAcceptance: DelegateCompactHostAcceptance | null;
+  reviewPersistence: DelegateReviewPersistence | null;
+}
+
 /**
  * The commander's recorded delivery review of one finished task.
  *
@@ -592,6 +647,8 @@ export interface DelegateHostAcceptance {
   by: string;
   /** The redacted, bounded conclusion. */
   note: string;
+  /** Optional redacted summary recorded with `note` (absent when omitted; never implies acceptance). */
+  completionSummary?: string;
 }
 
 /**

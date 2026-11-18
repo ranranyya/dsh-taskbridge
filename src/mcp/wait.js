@@ -180,17 +180,22 @@ export function compactTask(task) {
   // what a host needs to act, and the body is read on demand through `delegate_result`.
   // The object is kept (with `noteOmitted`) so an old client cannot read "no note" as
   // "not reviewed", and `reviewPersistence` states whether the conclusion is durable yet.
+  // A recorded summary is reported the same way, only when one exists, so an old shape holds.
   const acceptance = out.hostAcceptance;
   if (acceptance !== null && typeof acceptance === 'object' && !Array.isArray(acceptance)) {
+    const summaryChars = acceptance.completionSummaryChars
+      ?? (typeof acceptance.completionSummary === 'string' ? Array.from(acceptance.completionSummary).length : 0);
     out.hostAcceptance = {
       accepted: acceptance.accepted === true,
       state: acceptance.state ?? null,
       acceptedAt: acceptance.acceptedAt ?? null,
       by: acceptance.by ?? null,
-      // Counted from the body when it is here, so the summary states the REAL length even
-      // on a view that carries the full note.
+      // Counted from the body when it is here, so the real length is stated.
       noteChars: acceptance.noteChars ?? (typeof acceptance.note === 'string' ? Array.from(acceptance.note).length : 0),
       noteOmitted: true,
+      ...(summaryChars > 0
+        ? { completionSummaryChars: summaryChars, completionSummaryOmitted: true }
+        : {}),
     };
   }
   if (task.reviewPersistence !== undefined) out.reviewPersistence = task.reviewPersistence;

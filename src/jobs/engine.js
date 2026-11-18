@@ -97,6 +97,7 @@ import {
   reviewNoteLength,
   reviewNoteOverflow,
 } from './review-note.js';
+import { TASK_DESCRIPTION_FIELDS, canonicalTaskDescription } from './task-descriptions.js';
 
 /** Task lifecycle states. `awaiting-host-review` is terminal for this plugin. */
 export const TASK_STATES = Object.freeze({
@@ -165,6 +166,7 @@ export const JOB_CODES = Object.freeze({
   reviewNotReviewable: 'JOB_REVIEW_NOT_REVIEWABLE',
   reviewInvalid: 'JOB_REVIEW_INVALID',
   reviewNotPersisted: 'JOB_REVIEW_NOT_PERSISTED',
+  descriptionInvalid: 'JOB_DESCRIPTION_INVALID',
 });
 
 /** Default interval of the internal authorization sweep. */
@@ -521,7 +523,8 @@ export class JobEngine {
    * @param {object} request - `connectionId`, `grantId`, `workspacePath`, `prompt`, `overrides`,
    *   `authorization` (`'task'` consumes a single-use grant, `'session'` checks the named live session grant),
    *   and optional `continueFromTaskId` (this submission is a follow-up to that named
-   *   delegated task and must continue exactly its DSH thread).
+   *   delegated task and must continue exactly its DSH thread) plus optional
+   *   `goalDescription` (<= 2000 Unicode code points, trimmed; refused before side effects).
    * @returns {Promise<object>} the created task view.
    */
   async start(request) {
@@ -547,6 +550,15 @@ export class JobEngine {
       });
     }
     const continueFromTaskId = typeof rawContinuation === 'string' ? rawContinuation.trim() : '';
+    const goal = canonicalTaskDescription(request?.goalDescription, TASK_DESCRIPTION_FIELDS.goal, redactText);
+    if (goal.ok === false) {
+      throw new JobError(JOB_CODES.descriptionInvalid, goal.refusal.message, {
+        field: goal.refusal.field,
+        limit: goal.refusal.limit,
+        length: goal.refusal.length,
+        unit: goal.refusal.unit,
+      });
+    }
 
     const authorization = this.authorizationMode === 'switch'
       ? 'switch'
@@ -556,6 +568,7 @@ export class JobEngine {
     // Frozen before the first await so the task record states, from the moment it
     // exists, whether it starts a conversation or continues one.
     task.continueFromTaskId = continueFromTaskId === '' ? null : continueFromTaskId;
+    task.goalDescription = goal.value;
     this.tasks.set(task.taskId, task);
     this.prune();
 
@@ -601,6 +614,7 @@ export class JobEngine {
       // conversation. Frozen at creation: it is what the run does with its session,
       // and it must not be re-read after the first await.
       continueFromTaskId: null,
+      goalDescription: null,
       connectionId: null,
       grantId: null,
       grantKind: null,
@@ -2568,7 +2582,8 @@ export class JobEngine {
     // uses, so a stored conclusion cannot smuggle a credential into history or a view. It
     // is NOT cut here: the bound was already enforced above.
     const note = redactText(rawNote);
-    const entry = this.beginReviewWrite(task, decision, note);
+    const summary = reviewSummary(request?.completionSummary);
+    const entry = this.beginReviewWrite(task, decision, note, summary);
     return await this.awaitReviewWrite(task, entry, reviewWaitMs(request));
   }
 
@@ -2577,13 +2592,15 @@ export class JobEngine {
    * genuinely IN FLIGHT locks the conclusion: `saving`/`timed-out` join the same
    * conclusion and refuse a different one; `failed` with no confirmed record frees the
    * conclusion for a new attempt; `saved` replays idempotently or refuses a conflict.
+   * Decision, note and canonical `completionSummary` together form the review identity.
    * @param {object} task - task record (already proven reviewable and owned).
    * @param {string} decision - validated decision.
    * @param {string} note - normalized, redacted note.
+   * @param {string | null} [completionSummary] - canonical, already-redacted summary.
    * @returns {object} the persistence entry this request must wait on.
    * @throws {JobError} when a different conclusion is recorded or already in flight.
    */
-  beginReviewWrite(task, decision, note) {
+  beginReviewWrite(task, decision, note, completionSummary = null) {
     if (this.history === null || this.history === undefined || typeof this.history.save !== 'function') {
       // `persistHistory` answers success for the missing-store posture, which would let a
       // review be claimed as saved when nothing was written, so this is refused up front.
@@ -2596,11 +2613,11 @@ export class JobEngine {
 
     if (current !== null) {
       if (current.state === REVIEW_PERSISTENCE_STATES.saved) {
-        return this.replayOrRefuse(task, recorded, decision, note);
+        return this.replayOrRefuse(task, recorded, decision, note, completionSummary);
       }
       if (current.state === REVIEW_PERSISTENCE_STATES.saving
         || current.state === REVIEW_PERSISTENCE_STATES.timedOut) {
-        if (current.decision === decision && current.note === note) return current;
+        if (sameConclusion(current, decision, note, completionSummary)) return current;
         throw new JobError(JOB_CODES.reviewNotReviewable,
           'a different review decision is being recorded for this task; wait for it or send a follow-up task', {
             taskId: task.taskId,
@@ -2614,13 +2631,14 @@ export class JobEngine {
     }
 
     if (recorded !== null && recorded !== undefined) {
-      return this.replayOrRefuse(task, recorded, decision, note);
+      return this.replayOrRefuse(task, recorded, decision, note, completionSummary);
     }
 
     const entry = {
       state: REVIEW_PERSISTENCE_STATES.saving,
       decision,
       note,
+      completionSummary,
       token: (this.reviewSeq ?? 0) + 1,
       startedAt: this.clock(),
       confirmedAt: null,
@@ -2642,13 +2660,21 @@ export class JobEngine {
    * @param {object} recorded - the recorded `hostAcceptance`.
    * @param {string} decision - requested decision.
    * @param {string} note - requested note.
+   * @param {string | null} [completionSummary] - canonical summary this request states.
    * @returns {object} the saved persistence entry.
    * @throws {JobError} on a different conclusion.
    */
-  replayOrRefuse(task, recorded, decision, note) {
+  replayOrRefuse(task, recorded, decision, note, completionSummary = null) {
     if (recorded !== null && recorded !== undefined
-      && recorded.state === decision && recorded.note === note) {
-      return { state: REVIEW_PERSISTENCE_STATES.saved, decision, note, token: -1, done: Promise.resolve(true) };
+      && sameConclusion(recorded, decision, note, completionSummary)) {
+      return {
+        state: REVIEW_PERSISTENCE_STATES.saved,
+        decision,
+        note,
+        completionSummary: typeof recorded.completionSummary === 'string' ? recorded.completionSummary : null,
+        token: -1,
+        done: Promise.resolve(true),
+      };
     }
     throw new JobError(JOB_CODES.reviewNotReviewable,
       'this task already has a recorded review; send a follow-up task to record a correction', {
@@ -2707,6 +2733,7 @@ export class JobEngine {
         acceptedAt: entry.startedAt,
         by: HOST_REVIEW_BY,
         note: entry.note,
+        ...(typeof entry.completionSummary === 'string' ? { completionSummary: entry.completionSummary } : {}),
       };
       task.historyError = null;
       task.historySavedAt = this.clock();
@@ -4139,6 +4166,7 @@ export class JobEngine {
       acceptedAt: entry.startedAt,
       by: HOST_REVIEW_BY,
       note: entry.note,
+      ...(typeof entry.completionSummary === 'string' ? { completionSummary: entry.completionSummary } : {}),
     };
     return view;
   }
@@ -4244,13 +4272,15 @@ export class JobEngine {
    * @param {string} decision - validated decision.
    * @param {string} note - normalized, redacted note.
    * @param {number} waitMs - per-request wait bound.
+   * @param {string | null} [completionSummary] - raw summary (`undefined` = omitted).
    * @returns {Promise<object>} `{ task, hostAcceptance, reviewPersistence }`.
    * @throws {JobError} on any refusal.
    */
-  async recordHistoricalReview({ taskId, connectionId }, decision, note, waitMs) {
+  async recordHistoricalReview({ taskId, connectionId }, decision, note, waitMs, completionSummary = undefined) {
     const input = reviewInput({ decision, note });
     decision = input.decision;
     note = redactText(input.note);
+    const summary = reviewSummary(completionSummary);
     const row = await this.storedTaskRow(taskId, connectionId);
     // The SAME answer an unknown task gets: the live path refuses an unknown id with this
     // wording, so a restored task must not be distinguishable from a missing one.
@@ -4264,7 +4294,7 @@ export class JobEngine {
         state: row.state,
       });
     }
-    const entry = this.beginHistoryReviewWrite(row, decision, note);
+    const entry = this.beginHistoryReviewWrite(row, decision, note, summary);
     return await this.awaitHistoryReviewWrite(row, entry, waitMs);
   }
 
@@ -4277,10 +4307,11 @@ export class JobEngine {
    * @param {object} row - the stored row as first read.
    * @param {string} decision - validated decision.
    * @param {string} note - normalized note to record.
+   * @param {string | null} [completionSummary] - normalized summary to record, or null.
    * @returns {object} persistence entry to await.
    * @throws {JobError} on a recorded or in-flight conflict.
    */
-  beginHistoryReviewWrite(row, decision, note) {
+  beginHistoryReviewWrite(row, decision, note, completionSummary = null) {
     const history = this.history;
     if (history === null || history === undefined || typeof history.update !== 'function') {
       throw new JobError(JOB_CODES.reviewNotPersisted,
@@ -4294,7 +4325,7 @@ export class JobEngine {
     const current = this.reviewState.get(key) ?? null;
     if (current !== null
       && (current.state === REVIEW_PERSISTENCE_STATES.saving || current.state === REVIEW_PERSISTENCE_STATES.timedOut)) {
-      if (current.decision === decision && current.note === note) return current;
+      if (sameConclusion(current, decision, note, completionSummary)) return current;
       throw new JobError(JOB_CODES.reviewNotReviewable,
         'a different review decision is being recorded for this task; wait for it or send a follow-up task', {
           taskId: key,
@@ -4303,8 +4334,15 @@ export class JobEngine {
         });
     }
     if (recorded !== null && recorded !== undefined) {
-      if (recorded.state === decision && recorded.note === note) {
-        return { state: REVIEW_PERSISTENCE_STATES.saved, decision, note, token: -1, done: Promise.resolve(true) };
+      if (sameConclusion(recorded, decision, note, completionSummary)) {
+        return {
+          state: REVIEW_PERSISTENCE_STATES.saved,
+          decision,
+          note,
+          completionSummary,
+          token: -1,
+          done: Promise.resolve(true),
+        };
       }
       throw new JobError(JOB_CODES.reviewNotReviewable,
         'this task already has a recorded review; send a follow-up task to record a correction', {
@@ -4317,6 +4355,7 @@ export class JobEngine {
       state: REVIEW_PERSISTENCE_STATES.saving,
       decision,
       note,
+      completionSummary,
       token: (this.reviewSeq ?? 0) + 1,
       startedAt: this.clock(),
       confirmedAt: null,
@@ -4344,6 +4383,7 @@ export class JobEngine {
       acceptedAt: entry.startedAt,
       by: HOST_REVIEW_BY,
       note: entry.note,
+      ...(typeof entry.completionSummary === 'string' ? { completionSummary: entry.completionSummary } : {}),
     };
     try {
       await this.history.update(taskId, (row) => {
@@ -4357,7 +4397,7 @@ export class JobEngine {
           });
         }
         if (row.hostAcceptance !== null && row.hostAcceptance !== undefined) {
-          if (row.hostAcceptance.state === entry.decision && row.hostAcceptance.note === entry.note) return row;
+          if (sameConclusion(row.hostAcceptance, entry.decision, entry.note, entry.completionSummary)) return row;
           throw new JobError(JOB_CODES.reviewNotReviewable,
             'this task already has a recorded review; send a follow-up task to record a correction', { taskId });
         }
@@ -4740,6 +4780,9 @@ export class JobEngine {
       // Frozen on the task at creation, so the record states the intent even when
       // the run never got as far as driving a conversation.
       continueFromTaskId: task.continueFromTaskId ?? null,
+      ...(typeof task.goalDescription === 'string' && task.goalDescription !== ''
+        ? { goalDescription: task.goalDescription }
+        : {}),
       conversationSaved: task.conversationSaved,
       conversationError: task.conversationError,
       review: task.review,
@@ -5030,7 +5073,8 @@ async function raceOutcome(promise, ms, signal = null) {
  * A review conclusion as a WAIT reports it: status, time and length, never the body.
  *
  * The object is kept so an old client cannot read "no note" as "not reviewed"; the body is
- * read on demand (R5). `noteOmitted: true` states the omission explicitly.
+ * read on demand (R5). `noteOmitted: true` states the omission explicitly; any recorded
+ * `completionSummary` likewise reports length and `completionSummaryOmitted: true` only.
  * @param {object | null} acceptance - recorded acceptance.
  * @returns {object | null} summarized acceptance.
  */
@@ -5043,7 +5087,42 @@ function summarizedAcceptance(acceptance) {
     by: acceptance.by ?? null,
     noteChars: typeof acceptance.note === 'string' ? Array.from(acceptance.note).length : (acceptance.noteChars ?? 0),
     noteOmitted: true,
+    ...(typeof acceptance.completionSummary === 'string' && acceptance.completionSummary !== ''
+      ? {
+        completionSummaryChars: Array.from(acceptance.completionSummary).length,
+        completionSummaryOmitted: true,
+      }
+      : {}),
   };
+}
+
+/** Canonicalize one proposed completion summary once, or return null when absent. */
+function reviewSummary(value, field = TASK_DESCRIPTION_FIELDS.summary) {
+  const read = canonicalTaskDescription(value, field, redactText);
+  if (read.ok === false) {
+    throw new JobError(JOB_CODES.reviewInvalid, read.refusal.message, {
+      field: read.refusal.field,
+      limit: read.refusal.limit,
+      length: read.refusal.length,
+      unit: read.refusal.unit,
+    });
+  }
+  return read.value;
+}
+
+/** Compare decision, note and canonical completionSummary across live/stored/in-flight records. */
+function sameConclusion(recorded, decision, note, completionSummary) {
+  if (recorded === null || recorded === undefined) return false;
+  const recordedDecision = typeof recorded.decision === 'string' ? recorded.decision : recorded.state;
+  if (recordedDecision !== decision || recorded.note !== note) return false;
+  const recordedSummary = summaryIdentity(recorded);
+  const requestedSummary = summaryIdentity({ completionSummary });
+  return recordedSummary === requestedSummary;
+}
+
+function summaryIdentity(value) {
+  const source = value?.completionSummary;
+  return typeof source === 'string' && source !== '' ? source : null;
 }
 
 /**

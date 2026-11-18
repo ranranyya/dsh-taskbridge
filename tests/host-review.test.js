@@ -20,7 +20,7 @@ import { WorkspaceLocks } from '../src/workspace/locks.js';
 import { AuthorizationRegistry } from '../src/auth/grants.js';
 import { createExecutionHandler } from '../src/http/execution-plane.js';
 import { mockRequest, mockResponse } from './helpers/node-http-mocks.js';
-import { createMcpServer, MAX_REVIEW_NOTE_CHARS } from '../src/mcp/server.js';
+import { createMcpServer, MAX_REVIEW_NOTE_CHARS, MAX_TASK_DESCRIPTION_CHARS } from '../src/mcp/server.js';
 import { taskOutcome, taskProgress, hostReviewBadge, hostReviewLine } from '../src/client/api.js';
 import {
   cleanup,
@@ -626,13 +626,25 @@ test('the MCP catalog advertises delegate_review with a closed schema, and its r
   const listed = await server.handle({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const review = listed.result.tools.find((tool) => tool.name === 'delegate_review');
   assert.ok(review !== undefined, 'delegate_review must be advertised');
-  assert.deepEqual(Object.keys(review.inputSchema.properties).sort(), ['decision', 'note', 'taskId']);
+  // The set is CLOSED and still exactly the review's own fields. `completionSummary` is the
+  // one addition (G01-B): what was actually done, stated by the same review call, saved
+  // inside the same write and never as a second top-level record.
+  assert.deepEqual(
+    Object.keys(review.inputSchema.properties).sort(),
+    ['completionSummary', 'decision', 'note', 'taskId'],
+  );
   assert.deepEqual(review.inputSchema.required, ['taskId', 'decision', 'note']);
   assert.equal(review.inputSchema.additionalProperties, false);
   assert.deepEqual([...review.inputSchema.properties.decision.enum], ['accepted', 'changes-requested']);
   assert.equal(review.inputSchema.properties.note.maxLength, MAX_REVIEW_NOTE_CHARS);
   assert.equal(MAX_REVIEW_NOTE_CHARS, 8_000);
   assert.equal(review.inputSchema.properties.note.codePointLength, true, 'the bound is counted in code points');
+  // The summary is optional, bounded by code points (not UTF-16 units) and counted the same
+  // way everywhere: a 2000-code-point Chinese/emoji summary is legal, 2001 is refused.
+  assert.equal(review.inputSchema.properties.completionSummary.type, 'string');
+  assert.equal(review.inputSchema.properties.completionSummary.maxLength, MAX_TASK_DESCRIPTION_CHARS);
+  assert.equal(MAX_TASK_DESCRIPTION_CHARS, 2_000);
+  assert.equal(review.inputSchema.properties.completionSummary.codePointLength, true);
 
   const answer = await server.handle({
     jsonrpc: '2.0', id: 3, method: 'tools/call',
@@ -641,11 +653,30 @@ test('the MCP catalog advertises delegate_review with a closed schema, and its r
   assert.equal(answer.result.isError, undefined);
   assert.deepEqual(seen, [{ route: 'review', payload: { taskId: 't1', decision: 'accepted', note: 'ok' } }]);
 
-  // Undeclared arguments and an over-long note are refused before the plane.
+  // A supplied summary travels WITH the decision and the note, in the one review payload.
+  seen.length = 0;
+  const withSummary = await server.handle({
+    jsonrpc: '2.0', id: 5, method: 'tools/call',
+    params: {
+      name: 'delegate_review',
+      arguments: { taskId: 't1', decision: 'accepted', note: 'ok', completionSummary: '已完成目标 🎉' },
+    },
+  });
+  assert.equal(withSummary.result.isError, undefined);
+  assert.deepEqual(seen, [{
+    route: 'review',
+    payload: { taskId: 't1', decision: 'accepted', note: 'ok', completionSummary: '已完成目标 🎉' },
+  }]);
+
+  // Undeclared arguments, an over-long note and a wrong vocabulary are refused before the
+  // plane — and so is a summary over the bound or of the wrong type.
   for (const args of [
     { taskId: 't1', decision: 'accepted', note: 'ok', extra: 1 },
     { taskId: 't1', decision: 'accepted', note: 'q'.repeat(8_001) },
     { taskId: 't1', decision: 'approved', note: 'ok' },
+    { taskId: 't1', decision: 'accepted', note: 'ok', completionSummary: 'z'.repeat(2_001) },
+    { taskId: 't1', decision: 'accepted', note: 'ok', completionSummary: null },
+    { taskId: 't1', decision: 'accepted', note: 'ok', completionSummary: { text: '完成' } },
   ]) {
     seen.length = 0;
     const bad = await server.handle({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'delegate_review', arguments: args } });

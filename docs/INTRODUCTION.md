@@ -56,7 +56,7 @@ dsh-taskbridge
 To install this specific release:
 
 ```text
-dsh-taskbridge@1.5.3
+dsh-taskbridge@1.5.4
 ```
 
 Enable **DSH TaskBridge** and open its settings. Use the official npm registry if a regional mirror has not synchronized yet. GitHub Releases also provide `.tgz` packages.
@@ -260,6 +260,7 @@ The goal for 2.0 is to let more commanders use the execution models configured i
 | [Conversation placement](conversation-placement.md) | Workspace naming, conversation creation and explicit continuation. |
 | [Plugin discovery and updates](plugin-market.md) | Custom indexes, npm and GitHub installation sources. |
 | [Migration](taskbridge-upgrade.md) | Upgrading from DSH Delegate / TaskDispatch. |
+| [1.5.4 release notes](releases/1.5.4.zh.md) | Persisted task records, explicit goals and summaries, and placement checks. |
 | [1.5.3 release notes](releases/1.5.3.zh.md) | Review summaries, full-note layout, mixed line endings, and commander planning rules. |
 | [1.5.2 release notes](releases/1.5.2.zh.md) | The introduction update and its validation scope. |
 

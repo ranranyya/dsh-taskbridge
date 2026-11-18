@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.5.3 (commander-owned planning, bounded work packets, and mixed-line-ending template upgrades). This automatic installer covers Codex, the currently supported client. Claude Code and Claude Desktop integration is planned for 2.0; see the separate roadmap.
+Status: implemented in 1.5.4 (persisted task descriptions, commander planning, placement checks, and managed template upgrades). This automatic installer covers Codex, the currently supported client. Claude Code and Claude Desktop integration is planned for 2.0; see the separate roadmap.
 
 1.5.1 refreshes the manifest on each activation, resolves a normal linked home root, and upgrades exact shipped/candidate templates while preserving custom content. See [1.5.1 notes](releases/1.5.1.zh.md).
 
@@ -47,6 +47,12 @@ not apply to custom wrappers, other directories, or automatic startup refresh.
 `repair` remains MCP-only. TaskBridge CLI aliases point at the existing bin files.
 
 ---
+
+## Explicit task descriptions (1.5.4)
+
+`delegate_submit` and `POST /tasks` accept optional `goalDescription`; `delegate_review` and `POST /tasks/review` accept optional `completionSummary`. Both trim surrounding whitespace, preserve internal newlines, and allow at most 2000 Unicode code points before and after redaction. Missing or blank strings are absent; explicit null and other non-strings are refused. No value is inferred from prompts or earlier tasks.
+
+The goal is fixed at task creation. The completion summary exists only under `hostAcceptance.completionSummary`, is part of the review identity with decision and note, and becomes public only after the same review write is durable. A saved review cannot gain or change a summary. Compact waits return only its character count and an omission flag; full results contain the prose. History retains titles and explicit continuation references without inventing missing old data.
 
 ## 1. What is owned, and what is not
 
@@ -526,7 +532,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.5.3",
+  "packageVersion": "1.5.4",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,
