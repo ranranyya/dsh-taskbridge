@@ -72,6 +72,52 @@ export declare const describeError: (...args: unknown[]) => string;
 export declare const exportDocument: (...args: unknown[]) => unknown;
 
 /**
+ * The plan-creation form state, as one editable batch plus the batch's parent.
+ *
+ * `parent` on a row is `''` (root), `'row:<n>'` (another row of the same batch, by
+ * position) or a real plan `nodeId` the host returned. There is no title-based
+ * parent, by construction.
+ */
+export interface DelegatePlanCreateRow {
+  title: string;
+  goalDescription?: string;
+  parent?: string;
+}
+
+/** Draft the plan-creation form holds. */
+export interface DelegatePlanCreateDraft {
+  title?: string;
+  goal?: string;
+  parentNodeId?: string;
+  workspacePath?: string;
+  rows?: DelegatePlanCreateRow[];
+}
+
+/**
+ * The request body `POST /api/dsh-delegate/plans` takes. It names no connection:
+ * the host always writes for the fixed local caller and refuses a body that tries.
+ */
+export interface DelegatePlanCreateRequest {
+  nodes: Array<{
+    key: string;
+    title: string;
+    goalDescription?: string;
+    parentKey?: string;
+    parentNodeId?: string;
+  }>;
+  parentNodeId?: string;
+  workspacePath?: string;
+}
+
+/**
+ * Project the form draft onto the create request.
+ * @returns the request body plus the local precheck problems (empty when valid).
+ */
+export declare function planCreateRequest(
+  draft: DelegatePlanCreateDraft,
+): { body: DelegatePlanCreateRequest; problems: string[] };
+
+/**
  * Actions the Codex panel may send. `status` is absent on purpose: the page reads
  * that state through a `GET`, so only a real change is ever a `POST`.
  */
@@ -115,4 +161,9 @@ export interface DelegateClientModule {
   registerBundleConfiguration: typeof registerBundleConfiguration;
   apply: typeof apply;
   DelegateConfigPage: typeof DelegateConfigPage;
+  documentFromDraft: typeof documentFromDraft;
+  describeError: typeof describeError;
+  exportDocument: typeof exportDocument;
+  /** G09 batch plan creation: the pure form-draft → request projection. */
+  planCreateRequest: typeof planCreateRequest;
 }

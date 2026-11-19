@@ -55,6 +55,9 @@ export const ROUTES = Object.freeze({
   tasks: `${USER_PLANE_PREFIX}/tasks`,
   tasksGet: `${USER_PLANE_PREFIX}/tasks/get`,
   tasksCancel: `${USER_PLANE_PREFIX}/tasks/cancel`,
+  // The one planning write the page has: a batch of planning nodes. It creates
+  // records only — it cannot dispatch, authorize or review anything.
+  plans: `${USER_PLANE_PREFIX}/plans`,
   models: `${USER_PLANE_PREFIX}/models`,
   credentialsStatus: `${USER_PLANE_PREFIX}/credentials/status`,
   credentialsSet: `${USER_PLANE_PREFIX}/credentials/set`,
@@ -269,6 +272,18 @@ export function createApi(options = {}) {
      */
     async cancelTask(taskId) {
       return await request('POST', ROUTES.tasksCancel, { taskId });
+    },
+    /**
+     * Create a batch of planning nodes.
+     *
+     * The body is exactly `{ workspacePath?, parentNodeId?, nodes: [...] }`. It
+     * deliberately names no connection: the host always writes for the fixed local
+     * caller, and a body that tried to name one is refused rather than ignored.
+     * @param {object} body - `{ workspacePath?, parentNodeId?, nodes }`.
+     * @returns {Promise<object>} `{ nodes, executed: false, switch }`.
+     */
+    async createPlans(body) {
+      return await request('POST', ROUTES.plans, body);
     },
     /**
      * Discover one provider's model list from its own API (remote discovery).
@@ -1828,6 +1843,245 @@ export function describeError(error) {
 }
 
 // ---------------------------------------------------------------------------
+// Task tree: the host's projection, read as data (never re-derived here)
+// ---------------------------------------------------------------------------
+
+/**
+ * Chinese label for one projected node status.
+ *
+ * These are the host's own status keys (`src/jobs/task-tree.js`). The page maps the
+ * key to a word; it never invents a status, and an unknown key is shown verbatim so
+ * a newer host degrades to a readable string instead of a blank.
+ */
+export const TREE_STATUS_LABELS = Object.freeze({
+  planned: '计划中（尚未执行）',
+  running: '执行中',
+  'awaiting-permission': '等待逐次授权',
+  'awaiting-question': '等待回答问题',
+  'awaiting-host-review': '等待宿主审查',
+  'changes-requested': '需要修正',
+  accepted: '审查通过',
+  'children-accepted': '子项均已通过，等待汇总审查',
+  'in-progress': '进行中',
+  failed: '已失败',
+  cancelled: '已取消',
+  interrupted: '已中断',
+  unknown: '状态未知',
+});
+
+/** Badge tone for one projected node status. */
+export const TREE_STATUS_TONES = Object.freeze({
+  accepted: 'on',
+  running: 'on',
+  planned: 'off',
+  'children-accepted': 'warn',
+  'in-progress': 'off',
+  'awaiting-host-review': 'warn',
+  'awaiting-permission': 'warn',
+  'awaiting-question': 'warn',
+  'changes-requested': 'warn',
+  failed: 'warn',
+  cancelled: 'off',
+  interrupted: 'warn',
+  unknown: 'off',
+});
+
+/** How a broken relation is described, in the operator's own terms. */
+export const TREE_ORPHAN_LABELS = Object.freeze({
+  'missing-parent': '父节点不在当前记录中，暂列在此',
+  'missing-plan-node': '计划节点不在当前记录中，暂列在此',
+  'cycle-broken': '检测到父节点环路，已在此处断开',
+});
+
+/**
+ * The tree as the page should render it, or `null` when there is nothing to draw.
+ *
+ * Two inputs are accepted, both from the host: the structured `tree` (with `roots`)
+ * and the flat `tree` (`flatNodes` only). The flat form is not re-parented — doing
+ * that in the browser would be exactly the relation guessing the projection
+ * exists to prevent — it only ORDERs the host's own `depth` values per `nodeId`,
+ * and every identity still comes from the host.
+ *
+ * A host that answered no tree at all (an older version) yields `null`, and the
+ * caller falls back to the flat list. An EMPTY tree is a real answer and is
+ * reported separately (`roots: []` with counts), so "nothing planned yet" never
+ * reads like "this host cannot show plans".
+ * @param {object} body - the `/tasks` response body.
+ * @returns {{ roots: object[], flatNodes: object[], counts: object, projects: object[] } | null} view.
+ */
+export function taskTreeView(body) {
+  const tree = body?.tree;
+  if (tree === null || tree === undefined || typeof tree !== 'object' || Array.isArray(tree)) return null;
+  const projects = Array.isArray(tree.projects) ? tree.projects : [];
+  const counts = tree.counts !== null && typeof tree.counts === 'object' && !Array.isArray(tree.counts)
+    ? tree.counts
+    : {};
+  if (Array.isArray(tree.roots)) {
+    return { roots: tree.roots.filter(isRenderableNode), flatNodes: flatOfRoots(tree.roots), counts, projects };
+  }
+  if (Array.isArray(tree.flatNodes)) {
+    const roots = rootsFromFlatNodes(tree.flatNodes);
+    return { roots, flatNodes: tree.flatNodes.filter(isRenderableNode), counts, projects };
+  }
+  // A tree object with neither shape is not a tree: treat it as an older host.
+  return null;
+}
+
+/**
+ * Rebuild the nesting a flat projection already describes.
+ *
+ * Only `resolvedParentNodeId` (the host's RESOLVED parent, after orphan detection
+ * and cycle breaking) is used, and only to nest; nothing is matched by title,
+ * time or position. A node whose resolved parent is missing from the same answer
+ * stays at the root rather than disappearing.
+ * @param {object[]} flatNodes - host `flatNodes` in pre-order.
+ * @returns {object[]} root nodes with `children`.
+ */
+export function rootsFromFlatNodes(flatNodes) {
+  const list = Array.isArray(flatNodes) ? flatNodes.filter(isRenderableNode) : [];
+  const byId = new Map();
+  const wrappers = list.map((node) => {
+    const wrapper = { ...node, children: [] };
+    if (!byId.has(node.nodeId)) byId.set(node.nodeId, wrapper);
+    return wrapper;
+  });
+  const roots = [];
+  for (const wrapper of wrappers) {
+    const parentId = typeof wrapper.resolvedParentNodeId === 'string' ? wrapper.resolvedParentNodeId : null;
+    const parent = parentId === null || parentId === wrapper.nodeId ? undefined : byId.get(parentId);
+    if (parent === undefined) roots.push(wrapper);
+    else parent.children.push(wrapper);
+  }
+  return roots;
+}
+
+/** Pre-order flatten of structured roots, for counting and for tests. */
+function flatOfRoots(roots) {
+  const out = [];
+  const walk = (node) => {
+    if (!isRenderableNode(node)) return;
+    out.push(node);
+    for (const child of Array.isArray(node.children) ? node.children : []) walk(child);
+  };
+  for (const node of roots) walk(node);
+  return out;
+}
+
+/** A node the page can key and draw: a stable identity is the one hard requirement. */
+function isRenderableNode(node) {
+  return node !== null && typeof node === 'object' && typeof node.nodeId === 'string' && node.nodeId !== '';
+}
+
+/** The tree slice of one `/tasks` answer, or null when the host sent none. */
+function treeOf(body) {
+  return taskTreeView(body);
+}
+
+/** The plan-document section of one `/tasks` answer, bounded to what the page states. */
+function plansSummaryOf(body) {
+  const plans = body?.plans;
+  if (plans === null || plans === undefined || typeof plans !== 'object' || Array.isArray(plans)) return null;
+  return {
+    available: plans.available === true,
+    count: Number.isFinite(plans.count) ? plans.count : 0,
+    reason: typeof plans.reason === 'string' ? plans.reason : null,
+  };
+}
+
+/** The state patch one successful list read produces. */
+function listPatchOf(body) {
+  const view = treeOf(body);
+  return {
+    tasks: Array.isArray(body?.tasks) ? body.tasks : [],
+    tree: view,
+    treeAvailable: view !== null,
+    plans: plansSummaryOf(body),
+    tasksError: null,
+  };
+}
+
+/**
+ * Project the plan-creation form state onto the request body `PlanStore.create` takes.
+ *
+ * It lives in this framework-free module so the browser page, the DOM tests and any
+ * future caller share ONE projection; `src/client/index.jsx` re-exports it.
+ *
+ * Rules:
+ *   * rows become a batch with positional keys (`row-1`, `row-2`, …), so two rows may
+ *     carry the SAME title and still be two distinct nodes;
+ *   * a row pointing at another row becomes `parentKey` — the only in-batch link
+ *     `plan.json` understands, and how one request builds several levels;
+ *   * a row pointing at an existing node, or a whole batch attached through the
+ *     selector, becomes `parentNodeId` with the REAL id (never a title);
+ *   * a blank row is dropped, so an empty trailing row cannot fail a valid batch; a
+ *     link to a row that is blank or gone is REFUSED rather than quietly creating the
+ *     node at another level;
+ *   * a root row keeps its own title/goal; the form's dedicated title/goal describe
+ *     the FIRST root, and are refused when every row already has a parent (they would
+ *     otherwise become a node nobody asked for);
+ *   * nothing is invented: no `connectionId` (the host fixes the owner), no id, no
+ *     acceptance, and a workspace only when one was actually chosen.
+ * @param {object} draft - `{ title, goal, parentNodeId, workspacePath, rows }`.
+ * @returns {{ body: object, problems: string[] }} request and local precheck problems.
+ */
+export function planCreateRequest(draft) {
+  const rows = Array.isArray(draft?.rows) ? draft.rows : [];
+  const problems = [];
+  const kept = [];
+  const batchKeyOf = new Map();
+  rows.forEach((row, index) => {
+    const title = typeof row?.title === 'string' ? row.title.trim() : '';
+    if (title === '') return;
+    kept.push({ row, index, title });
+    batchKeyOf.set(index, `row-${kept.length}`);
+  });
+  if (kept.length === 0) {
+    problems.push('至少填写一个节点标题');
+    return { body: { nodes: [] }, problems };
+  }
+  const items = kept.map(({ row, index, title }) => {
+    const item = { key: batchKeyOf.get(index), title };
+    const goal = typeof row.goalDescription === 'string' ? row.goalDescription.trim() : '';
+    if (goal !== '') item.goalDescription = goal;
+    const parent = typeof row.parent === 'string' ? row.parent : '';
+    if (parent.startsWith('row:')) {
+      const target = Number.parseInt(parent.slice(4), 10);
+      const key = Number.isInteger(target) ? batchKeyOf.get(target) : undefined;
+      if (key === undefined) {
+        problems.push(`第 ${index + 1} 行的父节点“第 ${target + 1} 行”没有标题，无法作为父节点`);
+      } else if (key === item.key) {
+        problems.push(`第 ${index + 1} 行不能作为自己的父节点`);
+      } else {
+        item.parentKey = key;
+      }
+    } else if (parent !== '') {
+      item.parentNodeId = parent;
+    }
+    return item;
+  });
+  if (problems.length > 0) return { body: { nodes: items }, problems };
+
+  const firstRoot = items.findIndex((item) => item.parentKey === undefined && item.parentNodeId === undefined);
+  const formTitle = typeof draft?.title === 'string' ? draft.title.trim() : '';
+  const formGoal = typeof draft?.goal === 'string' ? draft.goal.trim() : '';
+  if (firstRoot >= 0) {
+    if (formTitle !== '') items[firstRoot].title = formTitle;
+    if (formGoal !== '') items[firstRoot].goalDescription = formGoal;
+  } else if (formTitle !== '') {
+    // Every row already names a parent: the batch is a set of children, and the title
+    // cannot silently become a node the operator did not add a row for.
+    problems.push('所有行都指定了父节点；标题只用于根节点，请清空标题或加一行根节点');
+  }
+
+  const body = { nodes: items };
+  const attachTo = typeof draft?.parentNodeId === 'string' ? draft.parentNodeId : '';
+  if (attachTo !== '') body.parentNodeId = attachTo;
+  const workspacePath = typeof draft?.workspacePath === 'string' ? draft.workspacePath.trim() : '';
+  if (workspacePath !== '') body.workspacePath = workspacePath;
+  return { body, problems };
+}
+
+// ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
 
@@ -1902,6 +2156,24 @@ export function createStore(options = {}) {
     selectedConnectionId: null,
     grants: [],
     tasks: [],
+    /**
+     * The host's task-tree projection, exactly as `/tasks` served it.
+     *
+     * `null` means "this host answered no tree" — either an older host (the key is
+     * absent) or a failed read. The two are kept apart on purpose: a failed read
+     * publishes `tasksError`, an older host only publishes `treeAvailable: false`,
+     * and the page falls back to the flat list in BOTH cases instead of rendering
+     * an invented hierarchy. Relations are never re-derived in the browser.
+     */
+    tree: null,
+    treeAvailable: false,
+    plans: null,
+    /** The refused list read, or null. Distinguishes "failed" from "empty". */
+    tasksError: null,
+    /** The last refused plan create, or null; the form shows it and keeps its input. */
+    planCreateError: null,
+    /** Node ids of the last SUCCESSFUL plan create, in the host's order. */
+    planCreateResult: null,
     taskDetail: null,
     // Visible feedback for the detail click: a spinner flag, and the refusal itself so
     // the panel can say WHY nothing opened instead of staying silent.
@@ -2780,14 +3052,61 @@ export function createStore(options = {}) {
             }
             return merged;
           })();
-        patch({ tasks, taskDetail: detail });
+        patch({
+          ...listPatchOf(body),
+          tasks,
+          taskDetail: detail,
+        });
         return { ok: true, tasks, reason };
       } catch (error) {
         if (reason === 'manual') notify('error', describeError(error));
+        // The REASON a read failed is kept even for a silent background refresh: the
+        // page must be able to say "this list is stale" instead of presenting the
+        // previous rows as current. A failed read never clears the rows already shown.
+        patch({ tasksError: error });
         return { ok: false, error };
       } finally {
         if (!disposed) patch({ loading: { ...state.loading, tasks: false } });
       }
+    },
+
+    /**
+     * Create planning nodes from the page, then read them back from the host.
+     *
+     * The form owns its own input (the page keeps the draft, including on failure, so
+     * a refused batch never costs the operator what they typed); this method only
+     * sends one batch and then re-reads the records through the EXISTING refresh
+     * path, which is what makes the new nodes appear with the host's own status,
+     * sequence and parent resolution instead of a locally guessed one.
+     * @param {object} body - `{ workspacePath?, parentNodeId?, nodes }`.
+     * @returns {Promise<{ ok: boolean, nodes?: object[], error?: unknown }>} outcome.
+     */
+    async createPlans(body) {
+      return await track('planCreate', async () => {
+        let created = [];
+        try {
+          const answer = await api.createPlans(body);
+          created = Array.isArray(answer.nodes) ? answer.nodes : [];
+          patch({ planCreateError: null, planCreateResult: created.map((node) => node.nodeId) });
+          notify('success', `已创建 ${created.length} 个规划节点（只记录计划，不会执行）。`);
+        } catch (error) {
+          // The refusal is KEPT so the form can show why nothing was created and let
+          // the operator fix one field; nothing was written (the host validates the
+          // whole batch atomically).
+          patch({ planCreateError: error, planCreateResult: null });
+          notify('error', `创建规划失败：${describeError(error)}`);
+          return { ok: false, error };
+        }
+        // Re-read through the normal path. A failure here is reported separately: the
+        // nodes exist on disk even when this read failed, and saying otherwise would
+        // invite a duplicate create.
+        const refreshed = await store.refreshTasks('manual');
+        if (refreshed?.ok === false) {
+          notify('error', '规划已写入，但列表暂时读取失败；可点“刷新”重试（不要重复创建）。');
+          return { ok: true, nodes: created, refreshFailed: true };
+        }
+        return { ok: true, nodes: created };
+      });
     },
 
     /** Read the task list. */
@@ -2795,9 +3114,10 @@ export function createStore(options = {}) {
       return await track('tasks', async () => {
         try {
           const body = await api.listTasks();
-          patch({ tasks: Array.isArray(body.tasks) ? body.tasks : [] });
+          patch(listPatchOf(body));
           return { ok: true, tasks: body.tasks ?? [] };
         } catch (error) {
+          patch({ tasksError: error });
           notify('error', describeError(error));
           return { ok: false, error };
         }

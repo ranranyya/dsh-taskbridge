@@ -165,6 +165,10 @@ function statusForCode(code) {
     || code === 'PLAN_MALFORMED' || code === 'PLAN_SCHEMA_UNSUPPORTED' || code === 'PLAN_DISPOSED') {
     return 503;
   }
+  // The settings page writes planning nodes for the fixed local caller; a body that
+  // tries to name a connection is refused outright, like every other identity write
+  // on this plane.
+  if (code === 'PLAN_CONNECTION_UNTRUSTED') return 403;
   if (code === 'PLAN_INVALID' || code === 'PLAN_TITLE_INVALID'
     || code === 'PLAN_DESCRIPTION_INVALID' || code === 'PLAN_REVIEW_INVALID') {
     return 400;

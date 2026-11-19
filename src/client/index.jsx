@@ -66,6 +66,9 @@ import {
   REVIEW_VERDICT_LABELS,
   SUPPORTED_PROTOCOLS,
   TASK_STATES,
+  TREE_ORPHAN_LABELS,
+  TREE_STATUS_LABELS,
+  TREE_STATUS_TONES,
   boundedText,
   changedFiles,
   clone,
@@ -96,6 +99,7 @@ import {
   monitoringOf,
   pendingPermission,
   permissionSummary,
+  planCreateRequest,
   precheckDraft,
   precheckMonitoring,
   previewEffective,
@@ -2188,7 +2192,11 @@ function autosaveLine(snapshot, problems) {
 /**
  * The review-note preview of one task row: at most 200 code points, plus a clear way to
  * read the whole note. The preview is a display cut; the saved body is untouched.
- * @param {object} props - `task`, `onOpen`.
+ *
+ * `onOpen` takes the TASK ID, exactly like every other "open the detail" entry point on
+ * this page. The row passes its own id (a bound call), so the link can never end up
+ * reading whatever detail happens to be selected at click time.
+ * @param {object} props - `task`, `onOpen(taskId)`.
  * @returns {object | null} the preview line, or null when there is no conclusion.
  */
 function TaskListNote({ task, onOpen }) {
@@ -2213,12 +2221,619 @@ function TaskListNote({ task, onOpen }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Task tree (G09: visualise the host's projection) and plan creation (G02/G05)
+// ---------------------------------------------------------------------------
+//
+// Everything below renders the host's `/tasks` projection. It is deliberately a
+// READER: no relation is re-derived from titles, times, prompts or list order, and
+// no status is computed here — `nodeStatus`, `orphan`, `depth`, `executions` and
+// each chain's `rounds` all arrive from `src/jobs/task-tree.js` on the server. The
+// only additions are display text, and a Set of node ids the operator expanded.
+//
+// The one interaction the tree offers is a per-round "详情"/"取消", which reuse the
+// EXISTING store actions and the EXISTING `TaskDetail` panel. Every click carries a
+// stable `taskId`, so a later background refresh (which replaces the whole tree)
+// cannot re-point a button at a different task.
+
+/** How many rounds of one chain are listed without expanding that chain further. */
+const CHAIN_ROUNDS_VISIBLE = 3;
+
+/**
+ * Whether `node` is visible, given the set of COLLAPSED keys.
+ *
+ * The model is "expanded by default, minus what the operator collapsed", not "a
+ * fresh set of open ids". A background refresh replaces every node object, so an
+ * expansion state kept as "open ids" would silently re-collapse everything the
+ * operator had opened (the bug this shape prevents): a retained set of CLOSED keys
+ * survives the replacement and keeps the tree exactly as the operator left it.
+ * @param {object} node - projected node (its `nodeId` is the identity).
+ * @param {Set<string>} collapsed - keys the operator closed.
+ * @returns {boolean} true when the node itself should be drawn.
+ */
+function isNodeVisible(node, collapsed) {
+  return !collapsed.has(node.nodeId);
+}
+
+/** Display title of one node: the host's own (a missing one is already labelled upstream). */
+function treeNodeTitle(node) {
+  if (typeof node.displayTitle === 'string' && node.displayTitle !== '') return node.displayTitle;
+  if (typeof node.title === 'string' && node.title !== '') return node.title;
+  return '未命名节点';
+}
+
+/**
+ * The node ids a create form may offer as a parent, in tree order.
+ *
+ * It lists exactly what the host returned: a node id from the projection, with its
+ * title as the label. The SELECTED value is the real id, so "same title in two
+ * projects" stays two distinct choices, and nothing is inferred from a title.
+ * @param {object | null} view - `taskTreeView(...)`.
+ * @returns {object[]} `{ nodeId, label, depth }` entries.
+ */
+function planParentChoices(view) {
+  if (view === null || view === undefined) return [];
+  const choices = [];
+  const walk = (node, depth) => {
+    if (node === null || typeof node !== 'object' || typeof node.nodeId !== 'string') return;
+    if (node.kind === 'plan') choices.push({ nodeId: node.nodeId, label: treeNodeTitle(node), depth });
+    for (const child of Array.isArray(node.children) ? node.children : []) walk(child, depth + 1);
+  };
+  for (const root of Array.isArray(view.roots) ? view.roots : []) walk(root, 0);
+  return choices;
+}
+
+/** One chain round as one short line: round number, title, status. */
+function chainRoundsOf(node) {
+  const rounds = [];
+  const chains = node.kind === 'plan'
+    ? (Array.isArray(node.executions) ? node.executions : [])
+    : (node.chain === null || node.chain === undefined ? [] : [node.chain]);
+  for (const chain of chains) {
+    const list = Array.isArray(chain?.rounds) ? chain.rounds : [];
+    for (let index = 0; index < list.length; index += 1) {
+      rounds.push({
+        round: index + 1,
+        // The chain's own scope keeps a rectification round distinguishable from a
+        // SIBLING node's first round, which is the whole point of drawing rounds
+        // inside their chain rather than in one flat task list.
+        chainLabel: chain.displayTitle ?? chain.title ?? chain.chainId,
+        roundCount: chain.roundCount ?? list.length,
+        task: list[index],
+      });
+    }
+  }
+  return rounds;
+}
+
+/**
+ * One chain round, with the detail/cancel controls the rest of the page already has.
+ * @param {object} props - `store`, `round`, `snapshot`, `onOpen`.
+ * @returns {object} the round row.
+ */
+function ChainRoundRow({ store, round, snapshot, onOpen }) {
+  const task = round.task ?? {};
+  const outcome = taskOutcome(task);
+  const expanded = round.expanded === true;
+  return (
+    <li className="dshdg-tree-round" data-dshdg-round={`${task.taskId ?? ''}`}>
+      <div className="dshdg-tree-round-head">
+        <span className="dshdg-faint dshdg-mono">{`第 ${round.round} 轮`}</span>
+        <span>{task.title || task.taskId || '未记录标题'}</span>
+        <Badge tone={isAwaitingPermission(task) ? 'warn' : outcome.tone}>{outcome.label}</Badge>
+        <span className="dshdg-spacer" />
+        {round.position === 'first' ? <span className="dshdg-faint">首轮</span> : <span className="dshdg-faint">整改轮次</span>}
+        <button
+          type="button"
+          data-dshdg-round-detail={task.taskId ?? ''}
+          disabled={snapshot.taskDetailLoading === true}
+          onClick={() => { void onOpen(task.taskId); }}
+        >
+          详情
+        </button>
+        <button
+          type="button"
+          className="dshdg-danger"
+          data-dshdg-round-cancel={task.taskId ?? ''}
+          disabled={!isCancellable(task.state)}
+          onClick={() => { void store.cancelTask(task.taskId); }}
+        >
+          取消
+        </button>
+      </div>
+      {expanded ? null : <p className="dshdg-hint">{taskProgress(task).headline}</p>}
+      {typeof task.hostAcceptance?.note === 'string' && task.hostAcceptance.note !== ''
+        ? <p className="dshdg-hint dshdg-note-preview">{`审查意见：${boundedText(task.hostAcceptance.note, 200)}`}</p>
+        : null}
+    </li>
+  );
+}
+
+/**
+ * One projected node: header, goals, completion, children and every chain round.
+ *
+ * Accessibility/behaviour choices that are load-bearing:
+ *   * the expand/collapse control is a real `<button>` with `aria-expanded` and
+ *     `aria-controls`, so it is reachable and operable by keyboard; Enter and Space
+ *     both reach it through the native button behaviour;
+ *   * the indented child list is a `<ul role="group">`, which is the structure a
+ *     screen reader announces as a nested group;
+ *   * nothing focuses itself on render, so a refresh cannot steal focus;
+ *   * a `plan` node with no execution and no execution anywhere below it is drawn
+ *     as unexecuted, and the page never labels it "done".
+ * @param {object} props - `node`, `store`, `snapshot`, `collapsed`, `setCollapsed`,
+ *   `expandedRounds`, `setExpandedRounds`, `onOpen`.
+ * @returns {object} the node.
+ */
+function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expandedRounds, setExpandedRounds, onOpen }) {
+  const children = Array.isArray(node.children) ? node.children : [];
+  const key = node.nodeId;
+  const open = !collapsed.has(key);
+  const status = typeof node.nodeStatus === 'string' ? node.nodeStatus : 'unknown';
+  const rounds = chainRoundsOf(node);
+  const allRoundsShown = expandedRounds.has(key);
+  const visibleRounds = allRoundsShown ? rounds : rounds.slice(0, CHAIN_ROUNDS_VISIBLE);
+  const orphanLabel = node.orphan === null || node.orphan === undefined
+    ? null
+    : (TREE_ORPHAN_LABELS[node.orphan.kind] ?? '关系不完整，暂列在此');
+  const goal = typeof node.goalDescription === 'string' && node.goalDescription.trim() !== ''
+    ? node.goalDescription.trim()
+    : null;
+  const completion = typeof node.completionSummary === 'string' && node.completionSummary.trim() !== ''
+    ? node.completionSummary.trim()
+    : null;
+  const toggle = () => {
+    const next = new Set(collapsed);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    setCollapsed(next);
+  };
+  return (
+    <li className="dshdg-tree-node" data-dshdg-tree-node={key} data-dshdg-node-kind={node.kind ?? 'unknown'}>
+      <div className="dshdg-tree-row">
+        <button
+          type="button"
+          className="dshdg-tree-toggle"
+          data-dshdg-tree-toggle={key}
+          aria-expanded={open}
+          aria-controls={`dshdg-tree-children-${key}`}
+          onClick={toggle}
+        >
+          {open ? '收起' : '展开'}
+        </button>
+        <span className="dshdg-tree-title">{treeNodeTitle(node)}</span>
+        <Badge tone={TREE_STATUS_TONES[status] ?? 'off'}>{TREE_STATUS_LABELS[status] ?? status}</Badge>
+        {node.kind === 'plan' && node.executed !== true
+          ? <span className="dshdg-faint">尚未执行</span>
+          : null}
+        {node.kind === 'task' && node.standalone === true ? <span className="dshdg-faint">独立任务</span> : null}
+        {typeof node.projectKey === 'string' && node.projectKey !== ''
+          ? <span className="dshdg-mono dshdg-faint" title={node.projectKey}>{node.projectKey === 'unverified' ? '来源未确认' : `项目 ${shortProjectKey(node.projectKey)}`}</span>
+          : null}
+        {typeof node.roundCount === 'number' && node.roundCount > 0
+          ? <span className="dshdg-faint">{`${node.roundCount} 轮`}</span>
+          : null}
+      </div>
+      {orphanLabel === null ? null : <p className="dshdg-warn">{orphanLabel}</p>}
+      {open ? (
+        <div id={`dshdg-tree-children-${key}`} className="dshdg-tree-body">
+          {goal === null ? null : <p className="dshdg-hint">{`目标：${boundedText(goal, 400)}`}</p>}
+          {completion === null ? null : <p className="dshdg-hint">{`已完成：${boundedText(completion, 400)}`}</p>}
+          {rounds.length === 0 ? null : (
+            <ul className="dshdg-tree-rounds" data-dshdg-chain={key}>
+              {visibleRounds.map((round) => (
+                <ChainRoundRow
+                  key={round.task.taskId ?? `${key}-${round.round}`}
+                  store={store}
+                  round={{ ...round, position: round.round === 1 ? 'first' : 'rectification' }}
+                  snapshot={snapshot}
+                  onOpen={onOpen}
+                />
+              ))}
+            </ul>
+          )}
+          {rounds.length > CHAIN_ROUNDS_VISIBLE ? (
+            <button
+              type="button"
+              data-dshdg-chain-more={key}
+              onClick={() => {
+                const next = new Set(expandedRounds);
+                if (next.has(key)) next.delete(key);
+                else next.add(key);
+                setExpandedRounds(next);
+              }}
+            >
+              {allRoundsShown
+                ? `只看最近 ${CHAIN_ROUNDS_VISIBLE} 轮`
+                : `显示全部 ${rounds.length} 轮（这条链逐轮整改，轮次不是子节点）`}
+            </button>
+          ) : null}
+          {children.length === 0 ? null : (
+            <ul className="dshdg-tree-children" role="group" aria-label={`${treeNodeTitle(node)} 的子节点`}>
+              {children.map((child) => (
+                <TaskTreeItem
+                  key={child.nodeId}
+                  node={child}
+                  store={store}
+                  snapshot={snapshot}
+                  collapsed={collapsed}
+                  setCollapsed={setCollapsed}
+                  expandedRounds={expandedRounds}
+                  setExpandedRounds={setExpandedRounds}
+                  onOpen={onOpen}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : null}
+    </li>
+  );
+}
+
+/** A project key is a digest or a path key; only the last characters identify it. */
+function shortProjectKey(key) {
+  if (key.startsWith('sha256:')) return key.slice(-6);
+  if (key.startsWith('path:')) {
+    const parts = key.slice(5).split(/[\\/]+/u).filter(Boolean);
+    return parts.slice(-2).join('/');
+  }
+  return key.slice(-8);
+}
+
+/**
+ * The tree panel: the host's projected hierarchy, with a counted header.
+ *
+ * Reading states are kept apart, because they mean different things to an operator:
+ * a host that sends no tree at all (`treeAvailable: false`) is an OLD host, an empty
+ * tree is "nothing planned or dispatched yet", and a refused read is a FAILURE and
+ * says so. The flat list is still rendered in the first two cases, so no record is
+ * hidden when the projection is unavailable.
+ * @param {object} props - `store`, `snapshot`, `onOpen`.
+ * @returns {object} the panel.
+ */
+function TaskTreePanel({ store, snapshot, onOpen }) {
+  const view = snapshot.tree ?? null;
+  const [collapsed, setCollapsed] = useState(() => new Set());
+  const [expandedRounds, setExpandedRounds] = useState(() => new Set());
+  if (view === null) {
+    return (
+      <p className="dshdg-faint" data-dshdg-tree-unavailable="">
+        {snapshot.tasksError === null || snapshot.tasksError === undefined
+          ? '当前宿主没有返回任务树（插件版本可能较旧），下面按平铺列表显示。'
+          : '任务树这次没有读到，下面按平铺列表显示已有的记录。'}
+      </p>
+    );
+  }
+  const counts = view.counts ?? {};
+  const roots = view.roots ?? [];
+  return (
+    <section className="dshdg-card" aria-labelledby="dshdg-tree-title" data-dshdg-task-tree="">
+      <div className="dshdg-row">
+        <h3 id="dshdg-tree-title">任务树</h3>
+        <span className="dshdg-spacer" />
+        <span className="dshdg-hint" data-dshdg-tree-counts="">
+          {`规划节点 ${counts.planNodes ?? 0} · 执行链 ${counts.taskChains ?? 0} · 顶层 ${counts.roots ?? roots.length}`}
+          {Number.isFinite(counts.orphans) && counts.orphans > 0 ? ` · 关系不完整 ${counts.orphans}` : ''}
+        </span>
+      </div>
+      <p className="dshdg-hint">
+        层级和轮次都来自宿主的记录：续接关系只来自 continueFromTaskId，层级只来自计划节点/父节点字段，不会按标题推测。
+      </p>
+      {roots.length === 0 ? (
+        <p className="dshdg-faint" data-dshdg-tree-empty="">还没有规划节点或执行记录。</p>
+      ) : (
+        <ul className="dshdg-tree-roots">
+          {roots.map((node) => (
+            <TaskTreeItem
+              key={node.nodeId}
+              node={node}
+              store={store}
+              snapshot={snapshot}
+              collapsed={collapsed}
+              setCollapsed={setCollapsed}
+              expandedRounds={expandedRounds}
+              setExpandedRounds={setExpandedRounds}
+              onOpen={onOpen}
+            />
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+/**
+ * One editable batch row of the creation form.
+ *
+ * `parent` is one of:
+ *   * `''`                  — a root row (a top-level node, unless the form's own
+ *                             "关联父节点" selector attaches the batch);
+ *   * `'row:<n>'`           — an EARLIER row of the same batch (by position);
+ *   * a real plan `nodeId`  — an existing node the host returned.
+ * Nothing else is expressible, which is what keeps a parent reference an identity
+ * rather than a guess from a title.
+ */
+function emptyPlanRow(overrides = {}) {
+  return {
+    title: '',
+    goalDescription: '',
+    parent: '',
+    ...overrides,
+  };
+}
+
+/**
+ * The plan-creation form (G09 batch create).
+ *
+ * Rules it keeps:
+ *   * the parent selector offers ONLY real ids the host returned (a plan node id) or
+ *     a row position from the SAME batch — never a title, never a guessed parent;
+ *   * a row may name another row as its parent (`parentKey` after projection), which
+ *     is what makes "add one deeper level" possible without a second round trip;
+ *   * the batch is created in ONE request, so the host's atomic validation decides:
+ *     either every row exists or none does;
+ *   * a refusal keeps every field exactly as typed and shows the host's reason;
+ *   * success reads the records back through the normal refresh, so nothing here
+ *     invents ids, order or statuses;
+ *   * it never dispatches, authorizes or approves execution — the text says so.
+ * @param {object} props - `store`, `snapshot`, `view`.
+ * @returns {object} the form.
+ */
+function PlanCreateForm({ store, snapshot, view }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(() => ({
+    title: '',
+    goal: '',
+    parentNodeId: '',
+    workspacePath: '',
+    rows: [emptyPlanRow()],
+  }));
+  const [problems, setProblems] = useState([]);
+  const [saved, setSaved] = useState(null);
+  const openerRef = useRef(null);
+  const formRef = useRef(null);
+  const error = snapshot.planCreateError ?? null;
+  const busy = snapshot.loading?.planCreate === true;
+  const choices = planParentChoices(view);
+  // A parent picked from the tree keeps offering exactly that id even when the node is
+  // currently COLLAPSED (and therefore absent from the visible choices), so collapsing
+  // a subtree can never silently clear the parent the operator selected. The entry is
+  // still an id the host returned, never a title.
+  const selectedParent = draft.parentNodeId === '' || choices.some((choice) => choice.nodeId === draft.parentNodeId)
+    ? null
+    : { nodeId: draft.parentNodeId };
+  const close = () => {
+    setOpen(false);
+    // Focus returns to the button that opened the form, so a keyboard operator is
+    // never dropped back to the top of a long page (Escape does the same).
+    openerRef.current?.focus?.();
+  };
+  const openForm = () => {
+    setOpen(true);
+    setSaved(null);
+    setProblems([]);
+  };
+  const edit = (patchDraft) => setDraft((current) => ({ ...current, ...patchDraft }));
+  const updateRow = (index, patchRow) => {
+    setDraft((current) => ({
+      ...current,
+      rows: current.rows.map((row, at) => (at === index ? { ...row, ...patchRow } : row)),
+    }));
+  };
+  const addRow = () => {
+    setDraft((current) => (current.rows.length >= 32
+      // A new row is a CHILD of the row above by default: that is the "add a deeper
+      // level in one batch" gesture, and it is always expressed as a real row link.
+      ? current
+      : { ...current, rows: [...current.rows, emptyPlanRow({ parent: `row:${current.rows.length - 1}` })] }));
+  };
+  const removeRow = (index) => {
+    setDraft((current) => (current.rows.length <= 1
+      ? current
+      : {
+        ...current,
+        // Positions shift after a removal, so a link into a removed (or renumbered)
+        // row is dropped rather than left pointing at a different node.
+        rows: current.rows
+          .filter((_row, at) => at !== index)
+          .map((row) => (row.parent.startsWith('row:') && Number.parseInt(row.parent.slice(4), 10) >= index
+            ? { ...row, parent: '' }
+            : row)),
+      }));
+  };
+  const submit = async () => {
+    const request = planCreateRequest(draft);
+    setProblems(request.problems);
+    if (request.problems.length > 0) return;
+    const outcome = await store.createPlans(request.body);
+    if (outcome?.ok !== true) return;
+    // ONLY a confirmed create clears the form. A refusal keeps everything, so the
+    // operator fixes the one field the host objected to instead of retyping a batch.
+    setDraft({ title: '', goal: '', parentNodeId: '', workspacePath: '', rows: [emptyPlanRow()] });
+    setSaved(outcome.nodes ?? []);
+    setOpen(false);
+    openerRef.current?.focus?.();
+  };
+  return (
+    <section className="dshdg-card" aria-labelledby="dshdg-plan-create-title" data-dshdg-plan-create="">
+      <div className="dshdg-row">
+        <h3 id="dshdg-plan-create-title">规划任务节点</h3>
+        <span className="dshdg-spacer" />
+        <button
+          type="button"
+          ref={openerRef}
+          data-dshdg-plan-create-open=""
+          aria-expanded={open}
+          aria-controls="dshdg-plan-create-form"
+          disabled={busy}
+          onClick={() => { if (open) close(); else openForm(); }}
+        >
+          {open ? '关闭' : '新建规划'}
+        </button>
+      </div>
+      <p className="dshdg-hint">
+        这里只记录计划：创建节点不会派发任务、不会授权执行，也不会替你验收。
+      </p>
+      {saved === null ? null : (
+        <p className="dshdg-hint" role="status" data-dshdg-plan-create-result="">
+          {`已创建 ${saved.length} 个规划节点，可在上方任务树中查看。`}
+        </p>
+      )}
+      {error === null ? null : (
+        <p className="dshdg-warn" role="alert" data-dshdg-plan-create-error="">
+          {`创建失败：${describeError(error)} 已保留你填写的全部内容；整批没有保存任何节点。`}
+        </p>
+      )}
+      {problems.length === 0 ? null : (
+        <p className="dshdg-warn" role="alert" data-dshdg-plan-create-problems="">
+          {`请先修正：${problems.join('；')}。`}
+        </p>
+      )}
+      {open ? (
+        <div
+          id="dshdg-plan-create-form"
+          ref={formRef}
+          className="dshdg-card"
+          role="group"
+          aria-label="新建规划节点"
+          onKeyDown={(event) => {
+            // Escape closes the form from ANY field inside it, which is what a
+            // keyboard operator expects; the input is kept, only the form closes.
+            if (event.key === 'Escape') {
+              event.stopPropagation();
+              close();
+            }
+          }}
+        >
+          <div className="dshdg-grid">
+            <Field label="标题" htmlFor="dshdg-plan-title" hint="第一个根节点的名称（1–120 个字）">
+              <input
+                id="dshdg-plan-title"
+                type="text"
+                value={draft.title}
+                data-dshdg-plan-title=""
+                onChange={(event) => edit({ title: event.target.value })}
+              />
+            </Field>
+            <Field label="目标" htmlFor="dshdg-plan-goal" hint="可选：这个根节点要达成什么">
+              <input
+                id="dshdg-plan-goal"
+                type="text"
+                value={draft.goal}
+                data-dshdg-plan-goal=""
+                onChange={(event) => edit({ goal: event.target.value })}
+              />
+            </Field>
+            <Field label="关联父节点" htmlFor="dshdg-plan-parent" hint="可选：挂到已有规划节点下（发送真实节点 ID，不按标题推断）">
+              <select
+                id="dshdg-plan-parent"
+                value={draft.parentNodeId}
+                data-dshdg-plan-parent=""
+                onChange={(event) => edit({ parentNodeId: event.target.value })}
+              >
+                <option value="">（不关联，作为顶层）</option>
+                {selectedParent === null ? null : (
+                  <option value={selectedParent.nodeId}>{`（已选，当前不可见）${selectedParent.nodeId}`}</option>
+                )}
+                {choices.map((choice) => (
+                  <option key={choice.nodeId} value={choice.nodeId}>
+                    {`${'　'.repeat(Math.min(choice.depth, 6))}${choice.label}（${choice.nodeId}）`}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          </div>
+          <h4>同批节点</h4>
+          <ul className="dshdg-list">
+            {draft.rows.map((row, index) => (
+              <li className="dshdg-item" key={`plan-row-${index}`}>
+                <div className="dshdg-row">
+                  <span className="dshdg-faint dshdg-mono">{`第 ${index + 1} 行`}</span>
+                  <span className="dshdg-spacer" />
+                  <button type="button" disabled={draft.rows.length <= 1} onClick={() => removeRow(index)}>
+                    移除
+                  </button>
+                </div>
+                <div className="dshdg-grid">
+                  <Field label="节点标题" htmlFor={`dshdg-plan-row-title-${index}`}>
+                    <input
+                      id={`dshdg-plan-row-title-${index}`}
+                      type="text"
+                      value={row.title}
+                      data-dshdg-plan-row-title={index}
+                      onChange={(event) => updateRow(index, { title: event.target.value })}
+                    />
+                  </Field>
+                  <Field label="节点目标" htmlFor={`dshdg-plan-row-goal-${index}`}>
+                    <input
+                      id={`dshdg-plan-row-goal-${index}`}
+                      type="text"
+                      value={row.goalDescription}
+                      data-dshdg-plan-row-goal={index}
+                      onChange={(event) => updateRow(index, { goalDescription: event.target.value })}
+                    />
+                  </Field>
+                  <Field label="父节点" htmlFor={`dshdg-plan-row-parent-${index}`} hint="可选：选本批的另一行，可一次建出更深一级">
+                    <select
+                      id={`dshdg-plan-row-parent-${index}`}
+                      value={row.parent}
+                      data-dshdg-plan-row-parent={index}
+                      onChange={(event) => updateRow(index, { parent: event.target.value })}
+                    >
+                      <option value="">{index === 0 ? '（不关联，作为顶层）' : '（与第一行同级）'}</option>
+                      {draft.rows.map((_candidate, at) => (at === index ? null : (
+                        <option key={`row-option-${at}`} value={`row:${at}`}>{`第 ${at + 1} 行`}</option>
+                      )))}
+                    </select>
+                  </Field>
+                </div>
+              </li>
+            ))}
+          </ul>
+          <div className="dshdg-row">
+            <button type="button" data-dshdg-plan-add-row="" disabled={busy || draft.rows.length >= 32} onClick={addRow}>
+              再加一行（作为上一行的子节点）
+            </button>
+            <span className="dshdg-spacer" />
+            <button type="button" onClick={close}>取消</button>
+            <button
+              type="button"
+              className="dshdg-primary"
+              data-dshdg-plan-create-submit=""
+              disabled={busy}
+              onClick={() => { void submit(); }}
+            >
+              {busy ? '创建中…' : '创建规划'}
+            </button>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function TasksPanel({ store, snapshot }) {
   const tasks = snapshot.tasks ?? [];
   const detail = snapshot.taskDetail;
   const plan = useTaskAutoRefresh({ store, snapshot });
   const liveCount = tasks.filter(isLiveTask).length;
   const detailRef = useRef(null);
+  /**
+   * Open one task's detail from ANYWHERE in this panel (tree round, flat row, note).
+   *
+   * One handler for every entry point, so the tree cannot grow a second, subtly
+   * different way of opening a task. It is the store's existing action: the same
+   * request, the same refusal reporting, the same focus/scroll counter.
+   * @param {string} taskId - stable task identity from the projection.
+   * @returns {void}
+   */
+  const openTask = useCallback((taskId) => {
+    if (typeof taskId !== 'string' || taskId === '') return;
+    void store.openTask(taskId);
+  }, [store]);
+  const treeView = snapshot.tree ?? null;
+  const flatOnly = treeView === null;
   // The dependency is the count of SUCCESSFUL opens, not the task object: a background
   // list refresh recomposes `taskDetail` (same task, merged row) and must NOT steal the
   // operator's focus. A first open, a repeat open of the SAME task and a switch to a
@@ -2262,6 +2877,14 @@ function TasksPanel({ store, snapshot }) {
           自动刷新失败（{String(plan.refreshError)}），下面仍是上次读取的内容；可点“刷新”重试。
         </p>
       ) : null}
+      {/* A read that FAILED is stated once, here, right above what it could not
+          refresh. It is separate from "no records": an empty list must never stand in
+          for a refused read. */}
+      {snapshot.tasksError !== null && snapshot.tasksError !== undefined ? (
+        <p className="dshdg-warn" role="alert" data-dshdg-tasks-error="">
+          {`读取任务记录失败：${describeError(snapshot.tasksError)}。下面仍是上次读取的内容，可能已经过时；可点“刷新”重试。`}
+        </p>
+      ) : null}
       {snapshot.taskDetailError !== null && snapshot.taskDetailError !== undefined ? (
         <p className="dshdg-warn" role="alert">
           {`打开任务详情失败：${describeError(snapshot.taskDetailError)}。可再点一次“详情”重试。`}
@@ -2283,8 +2906,11 @@ function TasksPanel({ store, snapshot }) {
           <TaskDetail store={store} task={detail} />
         </div>
       )}
-      {tasks.length === 0 ? <p className="dshdg-faint">还没有任务记录。</p> : (
-        <div className="dshdg-list">
+      <TaskTreePanel store={store} snapshot={snapshot} onOpen={openTask} />
+      <PlanCreateForm store={store} snapshot={snapshot} view={treeView} />
+      {flatOnly && tasks.length === 0 ? <p className="dshdg-faint">还没有任务记录。</p> : null}
+      {flatOnly ? (
+        <div className="dshdg-list" data-dshdg-flat-list="">
           {tasks.map((task) => {
             const progress = taskProgress(task);
             // The ONE headline for this task: it already reflects a recorded review, so
@@ -2312,7 +2938,7 @@ function TasksPanel({ store, snapshot }) {
                   <button
                     type="button"
                     disabled={snapshot.taskDetailLoading === true}
-                    onClick={() => { void store.openTask(task.taskId); }}
+                    onClick={() => openTask(task.taskId)}
                   >
                     {snapshot.taskDetailLoading === true && snapshot.taskDetail?.taskId !== task.taskId
                       ? '读取中…'
@@ -2328,7 +2954,7 @@ function TasksPanel({ store, snapshot }) {
                   </button>
                 </div>
                 <p className="dshdg-hint">{progress.headline}</p>
-                <TaskListNote task={task} onOpen={() => { void store.openTask(task.taskId); }} />
+                <TaskListNote task={task} onOpen={() => openTask(task.taskId)} />
                 {isAwaitingPermission(task)
                   ? <p className="dshdg-hint">{permissionSummary(task).note}</p>
                   : null}
@@ -2336,7 +2962,7 @@ function TasksPanel({ store, snapshot }) {
             );
           })}
         </div>
-      )}
+      ) : null}
       <p className="dshdg-faint">{`状态集合：${TASK_STATES.map(taskStateLabel).join(' / ')}`}</p>
     </div>
   );
@@ -2588,4 +3214,4 @@ export function DelegateConfigPage(props) {
 }
 
 /** Re-exported so the documented contract and tests share one name for the body document. */
-export { documentFromDraft, describeError, exportDocument };
+export { documentFromDraft, describeError, exportDocument, planCreateRequest };

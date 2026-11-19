@@ -38,12 +38,25 @@ import { MAX_CREDENTIAL_VALUE_CHARS } from '../credentials/seam.js';
 import { CODEX_ACTIONS, publicCodexStatus, runCodexAction } from '../codex/installer.js';
 import { classifyError, HttpError, jsonResponse, readJsonRequest } from '../http/respond.js';
 import { buildTaskTree } from '../jobs/task-tree.js';
+import { MAX_PLAN_BATCH, PLAN_CODES } from '../jobs/plan-store.js';
 
 /**
  * Route prefix, already below `/api` because the native exact-route registry
  * validates that prefix itself. A full URL is therefore `/api/dsh-delegate/...`.
  */
 export const USER_PLANE_PREFIX = '/api/dsh-delegate';
+
+/**
+ * The ONE connection identity a switch-mode dispatch is recorded under.
+ *
+ * `src/jobs/engine.js` stamps exactly this string on every task admitted in
+ * switch mode (`task.connectionId = 'local-mcp'`), so a planning node created
+ * from the operator page must carry the same owner or it could never be the
+ * parent of — or appear beside — a dispatched task. It is a FIXED value, never
+ * read from a request: the page cannot choose whose plan it writes, and a body
+ * field that tries to name another connection is refused rather than ignored.
+ */
+export const USER_PLANE_PLAN_CONNECTION_ID = 'local-mcp';
 
 /** Body mode every user-plane route declares. Only `buffered`/`streaming` exist. */
 const BODY_MODE = 'buffered';
@@ -376,6 +389,69 @@ export function userPlaneRoutes(deps) {
           ok: true,
           task: { ...archivedRecord(deps, archived), prompt: null, promptArchived: false },
           history: historyStatus({ available: true, archived: jobs.length }),
+        });
+      },
+    },
+    // ---- planning nodes (create only) ---------------------------------------
+    // One narrow write: a batch of planning nodes, created through the SAME
+    // `PlanStore.create` the MCP `delegate_plan create` action uses. Nothing is
+    // re-implemented here, so every rule that makes a plan document trustworthy is
+    // the store's own — atomic all-or-nothing batch validation, `parentKey`
+    // resolution inside the batch, depth and document bounds, redaction — and a
+    // refused batch writes no bytes at all.
+    //
+    // Three boundaries this route deliberately keeps:
+    //
+    //   * The owner is FIXED (`USER_PLANE_PLAN_CONNECTION_ID`). A body that names a
+    //     `connectionId` is refused with `PLAN_CONNECTION_UNTRUSTED` rather than
+    //     silently rewritten, so a caller can never believe it addressed another
+    //     connection.
+    //   * The body is a closed field set. Only `workspacePath`, `parentNodeId` and a
+    //     `nodes` batch of `{ key, parentKey, parentNodeId, title, goalDescription,
+    //     workspacePath }` entries are accepted; anything else — a `connectionId`, a
+    //     pre-minted `nodeId`, a `hostAcceptance` — is a 400, never dropped.
+    //   * Creating a plan NEVER dispatches, authorizes or approves execution. No
+    //     engine, agent, workspace-lease or grant call is reachable from this block;
+    //     the response is the stored nodes plus the switch posture it did not change.
+    //
+    // The parent of a child is the CALLER-NAMED id (`parentNodeId`) or a batch key
+    // (`parentKey`), both resolved by the store against records that already exist
+    // there. Nothing here infers ancestry from a title.
+    {
+      path: `${USER_PLANE_PREFIX}/plans`,
+      methods: ['POST'],
+      requestBody: BODY_MODE,
+      fetch: async (request) => {
+        const method = String(request.method ?? 'POST').toUpperCase();
+        if (method !== 'POST') return methodRefusal(request, ['POST']);
+        const body = await readJsonRequest(request);
+        const planRequest = projectPlanCreateRequest(body);
+        const store = requirePlanStore(deps);
+        let outcome;
+        try {
+          outcome = await store.create(
+            { ...planRequest, connectionId: USER_PLANE_PLAN_CONNECTION_ID },
+            { resolveExternalParent: externalPlanParentResolver(deps) },
+          );
+        } catch (error) {
+          throw planCreateRefusal(error);
+        }
+        const nodes = Array.isArray(outcome?.nodes) ? outcome.nodes : [];
+        deps.logger?.info?.('dsh-delegate: planning nodes created from the settings page', {
+          count: nodes.length,
+          rootCount: nodes.filter((node) => node.parentNodeId === null).length,
+        });
+        // The answer carries the STORED records. `plan.json` is the durable copy, so
+        // this is what a later `/tasks` read (and therefore the tree view) will show.
+        return jsonResponse(201, {
+          ok: true,
+          nodes,
+          // Stated, not implied: this route created data and nothing else.
+          executed: false,
+          switch: {
+            authorized: deps.engine?.posture?.()?.authorized === true,
+            changedByThisAction: false,
+          },
         });
       },
     },
@@ -847,6 +923,201 @@ async function readTaskRecords(deps, options = {}) {
     },
     tree: buildTaskTree({ planNodes: planState.nodes, tasks: merged }),
   };
+}
+
+// ---- planning-node creation (narrow operator write) ------------------------
+
+/**
+ * Fields a planning-node create request may carry.
+ *
+ * A closed list, not a preference: the store would accept several more shapes
+ * (a pre-minted `nodeId`, an acceptance record) and an operator page must not be
+ * able to write any of them. `connectionId` is *checked* separately so that a
+ * request which tries to name one is refused with its own code instead of a
+ * generic "unknown field", which would hide that the attempt was about identity.
+ */
+const PLAN_CREATE_FIELDS = Object.freeze(['workspacePath', 'parentNodeId', 'nodes']);
+const PLAN_CREATE_ITEM_FIELDS = Object.freeze([
+  'key',
+  'parentKey',
+  'parentNodeId',
+  'title',
+  'goalDescription',
+  'workspacePath',
+]);
+
+/**
+ * Validate one browser create request and project it onto the store's shape.
+ *
+ * Every check here is a *shape* check whose refusal names the field; the meaning
+ * of the values (title length, batch cycles, depth, source-repository agreement)
+ * stays with `PlanStore.create`, which is the single authority the MCP surface
+ * uses too. Nothing is coerced: a numeric title is a 400, never `String(...)`.
+ * @param {object} body - parsed request body.
+ * @returns {{ workspacePath?: string, parentNodeId?: string, nodes: object[] }} store request.
+ * @throws {HttpError} 400 with `PLAN_CONNECTION_UNTRUSTED` or `PLAN_INVALID`.
+ */
+function projectPlanCreateRequest(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new HttpError(400, PLAN_CODES.invalid, 'the plan create body must be a JSON object');
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'connectionId')) {
+    throw new HttpError(
+      403,
+      'PLAN_CONNECTION_UNTRUSTED',
+      'the settings page always writes planning nodes for the local caller; a body cannot name a connection',
+      { field: 'connectionId', connectionId: USER_PLANE_PLAN_CONNECTION_ID },
+    );
+  }
+  for (const key of Object.keys(body)) {
+    if (!PLAN_CREATE_FIELDS.includes(key)) {
+      throw new HttpError(400, PLAN_CODES.invalid, `plan create does not accept field ${JSON.stringify(key)}`, { field: key });
+    }
+  }
+  const request = {};
+  if (body.workspacePath !== undefined && body.workspacePath !== null) {
+    if (typeof body.workspacePath !== 'string' || body.workspacePath.trim() === '') {
+      throw new HttpError(400, PLAN_CODES.invalid, 'workspacePath must be a non-empty string when provided', {
+        field: 'workspacePath',
+      });
+    }
+    request.workspacePath = body.workspacePath;
+  }
+  if (body.parentNodeId !== undefined && body.parentNodeId !== null) {
+    if (typeof body.parentNodeId !== 'string' || body.parentNodeId.trim() === '') {
+      throw new HttpError(400, PLAN_CODES.invalid, 'parentNodeId must be a non-empty string when provided', {
+        field: 'parentNodeId',
+      });
+    }
+    request.parentNodeId = body.parentNodeId;
+  }
+  if (!Array.isArray(body.nodes) || body.nodes.length === 0) {
+    throw new HttpError(400, PLAN_CODES.invalid, 'nodes must be a non-empty batch of planning nodes', {
+      field: 'nodes',
+      limit: MAX_PLAN_BATCH,
+    });
+  }
+  if (body.nodes.length > MAX_PLAN_BATCH) {
+    throw new HttpError(400, PLAN_CODES.invalid, `nodes may contain at most ${MAX_PLAN_BATCH} entries`, {
+      field: 'nodes',
+      limit: MAX_PLAN_BATCH,
+      count: body.nodes.length,
+    });
+  }
+  request.nodes = body.nodes.map((item, index) => projectPlanCreateItem(item, index));
+  return request;
+}
+
+/**
+ * Validate one batch entry, keeping only the fields the operator form can set.
+ * @param {unknown} item - caller-supplied entry.
+ * @param {number} index - position in the batch, for the refusal detail.
+ * @returns {object} projected entry.
+ * @throws {HttpError} 400 `PLAN_INVALID`.
+ */
+function projectPlanCreateItem(item, index) {
+  if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+    throw new HttpError(400, PLAN_CODES.invalid, `nodes[${index}] must be an object`, { index });
+  }
+  for (const key of Object.keys(item)) {
+    if (!PLAN_CREATE_ITEM_FIELDS.includes(key)) {
+      throw new HttpError(400, PLAN_CODES.invalid, `nodes[${index}] does not accept field ${JSON.stringify(key)}`, {
+        index,
+        field: key,
+      });
+    }
+  }
+  // `title` is the one field the store refuses late (it mints ids while iterating);
+  // refusing it here keeps "the form's mistake" a 400 that names the field, while
+  // every other rule stays the store's own.
+  if (typeof item.title !== 'string' || item.title.trim() === '') {
+    throw new HttpError(400, PLAN_CODES.titleInvalid, `nodes[${index}].title must be a non-empty string`, {
+      index,
+      field: 'title',
+    });
+  }
+  const projected = { title: item.title };
+  for (const key of ['key', 'parentKey', 'parentNodeId', 'goalDescription', 'workspacePath']) {
+    if (item[key] !== undefined) projected[key] = item[key];
+  }
+  return projected;
+}
+
+/**
+ * The plan store this route writes through, or a refusal.
+ *
+ * It is the same instance the MCP surface and the read projection use, so a node
+ * created here is immediately visible to `/tasks` and to `delegate_plan list`.
+ * @param {object} deps - dependency object with `plans` (or an engine exposing it).
+ * @returns {object} the store.
+ * @throws {HttpError} 503 `JOB_PLAN_STORE_UNAVAILABLE`.
+ */
+function requirePlanStore(deps) {
+  const store = deps.plans ?? deps.engine?.plans ?? null;
+  if (store === null || store === undefined || typeof store.create !== 'function') {
+    throw new HttpError(
+      503,
+      'JOB_PLAN_STORE_UNAVAILABLE',
+      'the plan store is unavailable in this deployment',
+    );
+  }
+  return store;
+}
+
+/**
+ * Resolve a parent id that names an execution record (rather than a plan node).
+ *
+ * Without this the store could only parent a node under another planning node, so
+ * "add a step under this running task" would be refused as unknown parent. It
+ * forwards the engine's own resolver when the host has one and otherwise reports
+ * "not found", which keeps every refusal the store already knows.
+ * @param {object} deps - dependency object with an optional engine.
+ * @returns {Function | undefined} resolver passed to `PlanStore.create`.
+ */
+function externalPlanParentResolver(deps) {
+  const engine = deps.engine;
+  if (engine === null || engine === undefined || typeof engine.resolveHierarchyParentFacts !== 'function') {
+    return undefined;
+  }
+  return (parentId, connectionId, existingPlanMap) => engine.resolveHierarchyParentFacts(
+    parentId,
+    connectionId,
+    existingPlanMap,
+  );
+}
+
+/**
+ * Translate a plan-store refusal into an HTTP refusal that keeps its identity.
+ *
+ * `classifyError` already knows every `PLAN_*` code, so the mapping is mostly a
+ * pass-through; a depth overflow or a `parentKey` cycle is unambiguously the
+ * caller's batch shape and would otherwise be reported as a conflict, so those two
+ * are answered as 400 while keeping the store's own code and details.
+ * @param {unknown} error - thrown by the store.
+ * @returns {HttpError} refusal to throw.
+ */
+function planCreateRefusal(error) {
+  if (error instanceof HttpError) return error;
+  const code = typeof error?.code === 'string' && error.code !== '' ? error.code : PLAN_CODES.invalid;
+  const details = error?.details !== null && typeof error.details === 'object' && error.details !== undefined
+    ? redactDeep(error.details)
+    : {};
+  const message = typeof error?.message === 'string' && error.message !== ''
+    ? error.message
+    : 'the planning nodes could not be created';
+  const status = code === PLAN_CODES.depthExceeded || code === PLAN_CODES.cycleDetected ? 400 : statusForPlanCode(code);
+  return new HttpError(status, code, message, details);
+}
+
+/**
+ * The status this plane answers for one plan-store code, computed by the shared
+ * translator rather than copied, so the two can never drift apart.
+ * @param {string} code - plan-store code.
+ * @returns {number} HTTP status.
+ */
+function statusForPlanCode(code) {
+  const mapped = classifyError({ code, message: '', details: {} });
+  return mapped.status;
 }
 
 /**

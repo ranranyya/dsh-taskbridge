@@ -245,6 +245,38 @@ export const CSS_TEXT = `
   overflow-wrap: anywhere;
   word-break: break-word;
 }
+/* ---- task tree (G09) -------------------------------------------------------
+   The tree is drawn with indentation measured in em units, so a deep level adds
+   its own small step and a narrow window still fits the text before wrapping.
+   Every row is a flex line that WRAPS: a long node title or a long status never
+   pushes the round buttons out of the panel, and nothing is clipped. */
+.dshdg-tree-roots, .dshdg-tree-children, .dshdg-tree-rounds { list-style: none; margin: 0; padding: 0; }
+.dshdg-tree-roots { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.dshdg-tree-node { min-width: 0; }
+.dshdg-tree-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; padding: 3px 0; }
+.dshdg-tree-title { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+.dshdg-tree-toggle { padding: 1px 8px; font-size: 12px; }
+.dshdg-tree-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  /* One indent step per level, bounded so a 16-level plan cannot march off-screen. */
+  margin-inline-start: 1.25em;
+  padding-inline-start: 10px;
+  border-inline-start: 1px dashed var(--dsw-alias-border-l2, #e2e5e9);
+  min-width: 0;
+}
+.dshdg-tree-children { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dshdg-tree-round { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dshdg-tree-round-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+.dshdg-tree-round-head > span { overflow-wrap: anywhere; min-width: 0; }
+.dshdg-tree-round-head button { padding: 1px 8px; font-size: 12px; }
+@media (max-width: 560px) {
+  /* Narrow window: halve the indent so the deepest level still leaves room for
+     text, and let the round controls wrap under the title instead of squeezing. */
+  .dshdg-tree-body { margin-inline-start: 0.6em; padding-inline-start: 6px; }
+  .dshdg-tree-round-head { gap: 4px; }
+}
 @media (max-width: 560px) {
   .dshdg-layer, .dshdg-kv { grid-template-columns: minmax(0, 1fr); }
 }
