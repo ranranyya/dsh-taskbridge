@@ -448,8 +448,8 @@ export function buildTaskTree(input = {}) {
       if (node.children.length > 0) {
         sortAndFinalize(node.children, depth + 1);
       }
-      if (node.kind === 'plan') {
-        finalizePlanNodeStatus(node);
+      if (node.kind === 'plan' || node.children.length > 0) {
+        finalizeNodeStatus(node);
       }
     }
   };
@@ -537,15 +537,16 @@ function makeTaskTreeNode(chain, projectKey, orphan) {
   };
 }
 
-function finalizePlanNodeStatus(node) {
-  const hasExecutions = node.executions.length > 0;
-  const anyChildExecuted = node.children.some((c) => c.executed);
-  node.executed = hasExecutions || anyChildExecuted;
+function finalizeNodeStatus(node) {
+  const isPlan = node.kind === 'plan';
+  const executions = isPlan ? node.executions : [node.chain];
+  const hasExecutions = executions.length > 0;
+  node.executed = hasExecutions || node.children.some((child) => child.executed);
 
-  // Priority of active attention states in own executions or children:
-  const childStatuses = node.children.map((c) => c.nodeStatus);
-  const execStatuses = node.executions.map((e) => e.nodeStatus);
-  const allSub = [...execStatuses, ...childStatuses];
+  const allSub = [
+    ...executions.map((chain) => chain.nodeStatus),
+    ...node.children.map((child) => child.nodeStatus),
+  ];
 
   for (const urgent of ['awaiting-permission', 'awaiting-question', 'running', 'failed', 'changes-requested', 'awaiting-host-review', 'interrupted', 'cancelled']) {
     if (allSub.includes(urgent)) {
@@ -554,18 +555,21 @@ function finalizePlanNodeStatus(node) {
     }
   }
 
-  // Own explicit commander review on the plan node:
+  const allAccepted = allSub.every((status) => status === 'accepted');
+  if (!isPlan) {
+    // The chain keeps its own verdict; the tree node also represents its children.
+    if (node.chain.nodeStatus === 'accepted' && !allAccepted) {
+      node.nodeStatus = 'in-progress';
+    }
+    return;
+  }
+
   if (acceptanceVerdictOf(node.hostAcceptance) === 'changes-requested') {
     node.nodeStatus = 'changes-requested';
     return;
   }
   if (node.hostAcceptance?.accepted === true) {
-    // Only mark accepted when no child is unexecuted/pending!
-    if (allSub.some((st) => st === 'planned')) {
-      node.nodeStatus = 'in-progress';
-      return;
-    }
-    node.nodeStatus = 'accepted';
+    node.nodeStatus = allAccepted ? 'accepted' : 'in-progress';
     return;
   }
 
@@ -575,7 +579,7 @@ function finalizePlanNodeStatus(node) {
     return;
   }
 
-  if (allSub.length > 0 && allSub.every((st) => st === 'accepted')) {
+  if (allSub.length > 0 && allAccepted) {
     // All children accepted, awaiting final goal review by commander (G04 rule).
     node.nodeStatus = 'children-accepted';
     return;

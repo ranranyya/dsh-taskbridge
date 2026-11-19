@@ -726,6 +726,75 @@ test('Engine enforces hierarchy boundaries: continuation cannot switch nodes, mi
   }
 });
 
+test('G04: an early goal approval does not complete unfinished or unreviewed nested plans', () => {
+  const accepted = { decision: 'accepted', accepted: true };
+  const goalPlan = { nodeId: 'plan-goal', title: 'Release' };
+  const groupPlan = { nodeId: 'plan-group', parentNodeId: 'plan-goal', title: 'Implementation' };
+  const planNodes = [
+    { ...goalPlan, hostAcceptance: accepted },
+    groupPlan,
+    { nodeId: 'plan-api', parentNodeId: 'plan-group', title: 'API' },
+    { nodeId: 'plan-ui', parentNodeId: 'plan-group', title: 'UI' },
+  ];
+  const reviewedExecution = {
+    state: 'awaiting-host-review',
+    hostAcceptance: accepted,
+    reviewPersistence: { state: 'saved' },
+  };
+  const tasks = [{ ...reviewedExecution, taskId: 'task-api', planNodeId: 'plan-api' }];
+
+  let [goal] = buildTaskTree({ planNodes, tasks }).roots;
+  assert.equal(goal.hostAcceptance.accepted, true);
+  assert.equal(goal.children[0].nodeStatus, 'in-progress');
+  assert.equal(goal.children[0].children.find((child) => child.nodeId === 'plan-ui').nodeStatus, 'planned');
+  assert.equal(goal.nodeStatus, 'in-progress');
+
+  tasks.push({ ...reviewedExecution, taskId: 'task-ui', planNodeId: 'plan-ui' });
+  [goal] = buildTaskTree({ planNodes, tasks }).roots;
+  assert.equal(goal.children[0].nodeStatus, 'children-accepted');
+  assert.equal(goal.nodeStatus, 'in-progress');
+
+  planNodes[1] = { ...groupPlan, hostAcceptance: accepted };
+  [goal] = buildTaskTree({ planNodes, tasks }).roots;
+  assert.equal(goal.children[0].nodeStatus, 'accepted');
+  assert.equal(goal.nodeStatus, 'accepted');
+
+  planNodes[0] = goalPlan;
+  [goal] = buildTaskTree({ planNodes, tasks }).roots;
+  assert.equal(goal.nodeStatus, 'children-accepted');
+});
+
+test('G04: an accepted execution parent still surfaces a child review that has not been saved', () => {
+  const accepted = { decision: 'accepted', accepted: true };
+  const planNodes = [{ nodeId: 'plan-goal', title: 'Release', hostAcceptance: accepted }];
+  const parent = {
+    taskId: 'task-parent',
+    parentNodeId: 'plan-goal',
+    state: 'awaiting-host-review',
+    hostAcceptance: accepted,
+    reviewPersistence: { state: 'saved' },
+  };
+  const child = {
+    taskId: 'task-child',
+    parentNodeId: parent.taskId,
+    state: 'awaiting-host-review',
+    hostAcceptance: accepted,
+    reviewPersistence: { state: 'failed' },
+  };
+
+  let [goal] = buildTaskTree({ planNodes, tasks: [parent, child] }).roots;
+  const [parentNode] = goal.children;
+  assert.equal(parentNode.chain.nodeStatus, 'accepted');
+  assert.equal(parentNode.children[0].nodeStatus, 'awaiting-host-review');
+  assert.equal(parentNode.nodeStatus, 'awaiting-host-review');
+  assert.equal(goal.nodeStatus, 'awaiting-host-review');
+
+  const confirmedChild = { ...child, reviewPersistence: { state: 'saved' } };
+  [goal] = buildTaskTree({ planNodes, tasks: [parent, confirmedChild] }).roots;
+  assert.equal(goal.children[0].nodeStatus, 'accepted');
+  assert.equal(goal.nodeStatus, 'accepted');
+});
+
 // ---------------------------------------------------------------------------
 // 3. Same-name projects/nodes, legacy records, HistoryStore protection, orphans & cycles
 // ---------------------------------------------------------------------------
