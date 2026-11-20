@@ -58,6 +58,7 @@ export const ROUTES = Object.freeze({
   // The one planning write the page has: a batch of planning nodes. It creates
   // records only — it cannot dispatch, authorize or review anything.
   plans: `${USER_PLANE_PREFIX}/plans`,
+  displayArchive: `${USER_PLANE_PREFIX}/tasks/display-archive`,
   models: `${USER_PLANE_PREFIX}/models`,
   credentialsStatus: `${USER_PLANE_PREFIX}/credentials/status`,
   credentialsSet: `${USER_PLANE_PREFIX}/credentials/set`,
@@ -284,6 +285,9 @@ export function createApi(options = {}) {
      */
     async createPlans(body) {
       return await request('POST', ROUTES.plans, body);
+    },
+    async setDisplayArchive(nodeId, archived) {
+      return await request('POST', ROUTES.displayArchive, { nodeId, archived });
     },
     /**
      * Discover one provider's model list from its own API (remote discovery).
@@ -1763,6 +1767,10 @@ export function describeError(error) {
   const messages = {
     USER_PLANE_UNREACHABLE: '无法连接宿主设置接口：请确认 DSH 网页仍在运行，并刷新页面后重试。',
     USER_PLANE_MALFORMED: '宿主返回了无法识别的内容。',
+    TASK_DISPLAY_NOT_ACCEPTED: '任务通过验收后才能归档。',
+    TASK_DISPLAY_NOT_FOUND: '任务已不在当前历史中，请刷新。',
+    TASK_DISPLAY_UNAVAILABLE: '归档暂不可用，请刷新后再试。',
+    TASK_DISPLAY_LIMIT: '归档记录已达上限，请恢复部分记录后再试。',
     SETTINGS_MISSING: '请求中没有设置文档。',
     SETTINGS_INVALID: '设置内容不合法，已保留你的草稿。',
     SETTINGS_NO_PROVIDERS: '至少需要配置一个提供方。',
@@ -1916,12 +1924,15 @@ export function taskTreeView(body) {
   const counts = tree.counts !== null && typeof tree.counts === 'object' && !Array.isArray(tree.counts)
     ? tree.counts
     : {};
+  const display = tree.displayArchiveAvailable === undefined ? {} : {
+    displayArchiveAvailable: tree.displayArchiveAvailable, displayArchiveError: tree.displayArchiveError,
+  };
   if (Array.isArray(tree.roots)) {
-    return { roots: tree.roots.filter(isRenderableNode), flatNodes: flatOfRoots(tree.roots), counts, projects };
+    return { roots: tree.roots.filter(isRenderableNode), flatNodes: flatOfRoots(tree.roots), counts, projects, ...display };
   }
   if (Array.isArray(tree.flatNodes)) {
     const roots = rootsFromFlatNodes(tree.flatNodes);
-    return { roots, flatNodes: tree.flatNodes.filter(isRenderableNode), counts, projects };
+    return { roots, flatNodes: tree.flatNodes.filter(isRenderableNode), counts, projects, ...display };
   }
   // A tree object with neither shape is not a tree: treat it as an older host.
   return null;
@@ -3081,6 +3092,20 @@ export function createStore(options = {}) {
      * @param {object} body - `{ workspacePath?, parentNodeId?, nodes }`.
      * @returns {Promise<{ ok: boolean, nodes?: object[], error?: unknown }>} outcome.
      */
+    async setDisplayArchive(nodeId, archived) {
+      return await track('displayArchive', async () => {
+        try {
+          await api.setDisplayArchive(nodeId, archived);
+          const outcome = await store.refreshTasks('manual');
+          if (outcome.skipped === 'in-flight') await store.loadTasks();
+          return { ok: true };
+        } catch (error) {
+          notify('error', `无法更新展示归档。${describeError(error)}`);
+          return { ok: false, error };
+        }
+      });
+    },
+
     async createPlans(body) {
       return await track('planCreate', async () => {
         let created = [];

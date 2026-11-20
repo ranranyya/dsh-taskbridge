@@ -1,6 +1,6 @@
 # DSH TaskBridge
 
-> 当前版本：**1.6.0**。本次小更新保存任务名称、续接关系、目标与完成说明，并补齐派工归属核查规则。详见[更新说明](docs/releases/1.5.4.zh.md)。
+> **1.6.0** 增加多层任务树、整改轮次、项目筛选、展示归档和 DSH 会话导航。详见 [1.6.0 更新说明](docs/releases/1.6.0.zh.md)。
 
 **让 Codex 指挥 DSH 工作，在 DSH 插件里选择执行所用的 API、模型和思考强度。**
 
@@ -262,6 +262,7 @@ TaskBridge 自身无需 dsh-crew。执行任务使用的项目依赖仍按任务
 | [会话放置与续接](docs/conversation-placement.md) | DSH 工作区命名、会话创建和同任务续接。 |
 | [插件发现与更新](docs/plugin-market.md) | 自定义索引、npm 与 GitHub 安装来源。 |
 | [旧名称迁移](docs/taskbridge-upgrade.md) | 从 DSH Delegate / TaskDispatch 升级。 |
+| [1.6.0 更新说明](docs/releases/1.6.0.zh.md) | 多层任务树、整改轮次、搜索筛选、展示归档与侧栏会话定位。 |
 | [1.5.4 更新说明](docs/releases/1.5.4.zh.md) | 任务记录保存、目标与完成说明、派工归属核查。 |
 | [1.5.3 更新说明](docs/releases/1.5.3.zh.md) | 验收展示、全文排版、混合换行修复与指挥规则更新。 |
 | [1.5.2 更新说明](docs/releases/1.5.2.zh.md) | 产品介绍更新及验证范围。 |

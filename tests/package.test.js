@@ -258,21 +258,12 @@ test('the client bundle registers the bundle configuration page, keyed exactly d
   // A registration under any other key or slot name is invisible, which is a
   // defect no type checker in this repository would catch.
   const bundle = readFileSync(join(ROOT, 'lib', 'client.js'), 'utf8');
-
-  // The slot name is a single module-level constant, so its exact value is
-  // asserted once and every use site is asserted to reference the constant. A
-  // duplicated string literal would let the two halves drift apart silently.
-  assert.match(bundle, /var PLUGIN_CONFIG_SLOT = "plugins\.bundle\.config";/u);
-  assert.match(bundle, /var PLUGIN_BUNDLE_KEY = "dsh-taskbridge";/u);
-  assert.match(bundle, /name: PLUGIN_CONFIG_SLOT/u);
-  assert.match(bundle, /key: PLUGIN_BUNDLE_KEY/u);
-  // The page must be attached through `ctx.slots.inject(<constant>, ...)`: the
-  // keyed slot is declared by the manager bundle, which `dsh.client.inject` orders
-  // this bundle after, and `inject` is what defers the registration until that
-  // declaration exists. Registering directly would run before the slot is known.
-  assert.match(bundle, /return ctx\.slots\.inject\(PLUGIN_CONFIG_SLOT,/u);
-  assert.doesNotMatch(bundle, /inject\("plugins\.bundle\.config"/u, 'the slot name must be read from the constant, not repeated inline');
-  assert.match(bundle, /ctx\.slots\.register\(/u);
+  const source = readFileSync(join(ROOT, 'src/client/index.jsx'), 'utf8');
+  // The constants belong to the source. tests/client.test.js evaluates the shipped
+  // registration with the host slot API, independent of generated names.
+  assert.match(source, /\bPLUGIN_CONFIG_SLOT\s*=\s*['"]plugins\.bundle\.config['"]/u);
+  assert.match(source, /\bPLUGIN_BUNDLE_KEY\s*=\s*['"]dsh-taskbridge['"]/u);
+  assert.match(source, /return ctx\.slots\.inject\(PLUGIN_CONFIG_SLOT,/u);
 
   // The key must be the package name the manager matches on, not a bundle id
   // from the patch row (`dsh-delegate` happens to be both here; the assertion is

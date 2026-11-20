@@ -391,12 +391,13 @@ test('DOM G09: a round 详情 opens the existing detail, and after a real refres
     assert.deepEqual(calls.getTask, ['task-ui-2'], 'the round button asked for THAT task');
     const detail = page.root.querySelector('[data-dshdg-task-detail]');
     assert.ok(detail !== null, 'the existing detail panel opened');
+    assert.equal(detail.closest('[data-dshdg-round]')?.dataset.dshdgRound, 'task-ui-2');
     assert.match(detail.textContent, /修正窄窗口状态条对齐/u, 'the detail describes the round that was clicked');
 
     // A real store refresh (the same call the auto-refresh timer makes).
     await page.act(async () => { await store.refreshTasks('auto'); });
     await page.settle();
-    assert.ok(page.root.querySelector('[data-dshdg-task-detail]') !== null, 'the open detail survives the refresh');
+    assert.equal(page.root.querySelector('[data-dshdg-task-detail]'), detail, 'the same inline detail survives refresh');
     assert.equal(
       page.root.querySelector('[data-dshdg-round-detail="task-ui-2"]').getAttribute('data-dshdg-round-detail'),
       'task-ui-2',

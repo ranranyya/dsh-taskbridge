@@ -114,6 +114,8 @@ import {
   WAIT_REASON_LABELS,
 } from './api.js';
 import { injectStyles } from './styles.js';
+import { registerTasksNavigation, resolveUiWorkspace, resolveWorkspaces } from './sidebar.jsx';
+import { projectTaskView } from './task-view.js';
 
 /** Plugins-manager config slot this page occupies. */
 export const PLUGIN_CONFIG_SLOT = 'plugins.bundle.config';
@@ -157,6 +159,11 @@ export function apply(ctx) {
   const store = createStore({ api: createApi() });
   ctx.effect(() => () => store.dispose(), 'dsh-delegate: settings store');
   ctx.effect(() => registerBundleConfiguration(ctx, { store }), 'dsh-delegate: bundle configuration');
+  ctx.effect(() => registerTasksNavigation(ctx, {
+    store,
+    uiWorkspace: () => resolveUiWorkspace(ctx),
+    workspaces: () => resolveWorkspaces(ctx),
+  }), 'dsh-delegate: sidebar navigation');
 }
 
 // ---------------------------------------------------------------------------
@@ -2283,38 +2290,54 @@ function planParentChoices(view) {
   return choices;
 }
 
-/** One chain round as one short line: round number, title, status. */
-function chainRoundsOf(node) {
-  const rounds = [];
-  const chains = node.kind === 'plan'
-    ? (Array.isArray(node.executions) ? node.executions : [])
-    : (node.chain === null || node.chain === undefined ? [] : [node.chain]);
-  for (const chain of chains) {
-    const list = Array.isArray(chain?.rounds) ? chain.rounds : [];
-    for (let index = 0; index < list.length; index += 1) {
-      rounds.push({
-        round: index + 1,
-        // The chain's own scope keeps a rectification round distinguishable from a
-        // SIBLING node's first round, which is the whole point of drawing rounds
-        // inside their chain rather than in one flat task list.
-        chainLabel: chain.displayTitle ?? chain.title ?? chain.chainId,
-        roundCount: chain.roundCount ?? list.length,
-        task: list[index],
-      });
-    }
-  }
-  return rounds;
+function chainsOfTreeNode(node) {
+  if (node.kind === 'plan') return node.executions ?? [];
+  return node.chain ? [node.chain] : [];
 }
 
-/**
- * One chain round, with the detail/cancel controls the rest of the page already has.
- * @param {object} props - `store`, `round`, `snapshot`, `onOpen`.
- * @returns {object} the round row.
- */
+function ChainRounds({ chain, store, snapshot, onOpen, expanded, onToggle }) {
+  const rounds = chain.rounds ?? [];
+  return (
+    <div className="dshdg-tree-execution" data-dshdg-chain={chain.chainId}>
+      <ul className="dshdg-tree-rounds">
+        {rounds.map((task, index) => expanded || index >= rounds.length - CHAIN_ROUNDS_VISIBLE || task.taskId === snapshot.taskDetail?.taskId ? (
+          <ChainRoundRow key={task.taskId} store={store} round={{ task, round: index + 1,
+            position: index === 0 ? 'first' : 'rectification' }} snapshot={snapshot} onOpen={onOpen} />
+        ) : null)}
+      </ul>
+      {rounds.length > CHAIN_ROUNDS_VISIBLE ? <button type="button" data-dshdg-chain-more={chain.chainId}
+        onClick={onToggle} aria-expanded={expanded}>
+        {expanded ? '只看最近三轮' : '显示全部 ' + rounds.length + ' 轮'}
+      </button> : null}
+    </div>
+  );
+}
+
+function InlineTaskDetail({ store, task, view, onClose }) {
+  const detailRef = useRef(null);
+  useLayoutEffect(() => {
+    const element = detailRef.current;
+    element?.focus({ preventScroll: true });
+    element?.scrollIntoView?.({ block: 'nearest' });
+  }, [view]);
+  return (
+    <div ref={detailRef} tabIndex={-1} data-dshdg-task-detail="" aria-label="任务详情">
+      <div className="dshdg-row">
+        <button type="button" onClick={onClose}>收起详情</button>
+      </div>
+      <TaskDetail store={store} task={task} />
+    </div>
+  );
+}
+
 function ChainRoundRow({ store, round, snapshot, onOpen }) {
   const task = round.task ?? {};
   const outcome = taskOutcome(task);
-  const expanded = round.expanded === true;
+  const progress = taskProgress(task);
+  const model = task.route?.model ?? task.effective?.worker?.model ?? null;
+  const activityAt = task.activity?.lastActivityAt;
+  const detailButton = useRef(null);
+  const detail = snapshot.taskDetail?.taskId === task.taskId ? snapshot.taskDetail : null;
   return (
     <li className="dshdg-tree-round" data-dshdg-round={`${task.taskId ?? ''}`}>
       <div className="dshdg-tree-round-head">
@@ -2325,6 +2348,8 @@ function ChainRoundRow({ store, round, snapshot, onOpen }) {
         {round.position === 'first' ? <span className="dshdg-faint">首轮</span> : <span className="dshdg-faint">整改轮次</span>}
         <button
           type="button"
+          ref={detailButton}
+          aria-expanded={detail !== null}
           data-dshdg-round-detail={task.taskId ?? ''}
           disabled={snapshot.taskDetailLoading === true}
           onClick={() => { void onOpen(task.taskId); }}
@@ -2341,10 +2366,20 @@ function ChainRoundRow({ store, round, snapshot, onOpen }) {
           取消
         </button>
       </div>
-      {expanded ? null : <p className="dshdg-hint">{taskProgress(task).headline}</p>}
+      {detail ? null : (
+        <p className="dshdg-hint">
+          {[progress.headline, model, Number.isFinite(activityAt) ? `最近活动 ${formatTime(activityAt)}` : null].filter(Boolean).join(' · ')}
+        </p>
+      )}
       {typeof task.hostAcceptance?.note === 'string' && task.hostAcceptance.note !== ''
         ? <p className="dshdg-hint dshdg-note-preview">{`审查意见：${boundedText(task.hostAcceptance.note, 200)}`}</p>
         : null}
+      {detail === null ? null : (
+        <InlineTaskDetail store={store} task={detail} view={snapshot.taskDetailView} onClose={() => {
+          store.closeTask();
+          detailButton.current?.focus({ preventScroll: true });
+        }} />
+      )}
     </li>
   );
 }
@@ -2365,14 +2400,12 @@ function ChainRoundRow({ store, round, snapshot, onOpen }) {
  *   `expandedRounds`, `setExpandedRounds`, `onOpen`.
  * @returns {object} the node.
  */
-function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expandedRounds, setExpandedRounds, onOpen }) {
+function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expandedRounds, setExpandedRounds, onOpen, onArchive, forceOpen }) {
   const children = Array.isArray(node.children) ? node.children : [];
   const key = node.nodeId;
-  const open = !collapsed.has(key);
+  const open = forceOpen || !collapsed.has(key);
   const status = typeof node.nodeStatus === 'string' ? node.nodeStatus : 'unknown';
-  const rounds = chainRoundsOf(node);
-  const allRoundsShown = expandedRounds.has(key);
-  const visibleRounds = allRoundsShown ? rounds : rounds.slice(0, CHAIN_ROUNDS_VISIBLE);
+  const chains = chainsOfTreeNode(node);
   const orphanLabel = node.orphan === null || node.orphan === undefined
     ? null
     : (TREE_ORPHAN_LABELS[node.orphan.kind] ?? '关系不完整，暂列在此');
@@ -2397,6 +2430,7 @@ function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expanded
           data-dshdg-tree-toggle={key}
           aria-expanded={open}
           aria-controls={`dshdg-tree-children-${key}`}
+          disabled={forceOpen}
           onClick={toggle}
         >
           {open ? '收起' : '展开'}
@@ -2407,9 +2441,13 @@ function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expanded
           ? <span className="dshdg-faint">尚未执行</span>
           : null}
         {node.kind === 'task' && node.standalone === true ? <span className="dshdg-faint">独立任务</span> : null}
-        {typeof node.projectKey === 'string' && node.projectKey !== ''
-          ? <span className="dshdg-mono dshdg-faint" title={node.projectKey}>{node.projectKey === 'unverified' ? '来源未确认' : `项目 ${shortProjectKey(node.projectKey)}`}</span>
-          : null}
+        {node.childProgress?.total > 0 ? <span className="dshdg-faint">{`子任务 ${node.childProgress.total} · ${node.childProgress.accepted} 已通过`}</span> : null}
+        {onArchive && !node.displayArchiveInherited && (node.displayArchived || status === 'accepted') ? (
+          <button type="button" disabled={snapshot.loading?.displayArchive === true}
+            onClick={() => { void onArchive(node, !node.displayArchived); }}>
+            {node.displayArchived ? '恢复显示' : '归档'}
+          </button>
+        ) : null}
         {typeof node.roundCount === 'number' && node.roundCount > 0
           ? <span className="dshdg-faint">{`${node.roundCount} 轮`}</span>
           : null}
@@ -2419,35 +2457,13 @@ function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expanded
         <div id={`dshdg-tree-children-${key}`} className="dshdg-tree-body">
           {goal === null ? null : <p className="dshdg-hint">{`目标：${boundedText(goal, 400)}`}</p>}
           {completion === null ? null : <p className="dshdg-hint">{`已完成：${boundedText(completion, 400)}`}</p>}
-          {rounds.length === 0 ? null : (
-            <ul className="dshdg-tree-rounds" data-dshdg-chain={key}>
-              {visibleRounds.map((round) => (
-                <ChainRoundRow
-                  key={round.task.taskId ?? `${key}-${round.round}`}
-                  store={store}
-                  round={{ ...round, position: round.round === 1 ? 'first' : 'rectification' }}
-                  snapshot={snapshot}
-                  onOpen={onOpen}
-                />
-              ))}
-            </ul>
-          )}
-          {rounds.length > CHAIN_ROUNDS_VISIBLE ? (
-            <button
-              type="button"
-              data-dshdg-chain-more={key}
-              onClick={() => {
-                const next = new Set(expandedRounds);
-                if (next.has(key)) next.delete(key);
-                else next.add(key);
-                setExpandedRounds(next);
-              }}
-            >
-              {allRoundsShown
-                ? `只看最近 ${CHAIN_ROUNDS_VISIBLE} 轮`
-                : `显示全部 ${rounds.length} 轮（这条链逐轮整改，轮次不是子节点）`}
-            </button>
-          ) : null}
+          {chains.map((chain) => <ChainRounds key={chain.chainId} chain={chain} store={store} snapshot={snapshot}
+            onOpen={onOpen} expanded={expandedRounds.has(chain.chainId)} onToggle={() => setExpandedRounds((old) => {
+              const next = new Set(old);
+              if (next.has(chain.chainId)) next.delete(chain.chainId);
+              else next.add(chain.chainId);
+              return next;
+            })} />)}
           {children.length === 0 ? null : (
             <ul className="dshdg-tree-children" role="group" aria-label={`${treeNodeTitle(node)} 的子节点`}>
               {children.map((child) => (
@@ -2461,6 +2477,8 @@ function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expanded
                   expandedRounds={expandedRounds}
                   setExpandedRounds={setExpandedRounds}
                   onOpen={onOpen}
+                  onArchive={onArchive}
+                  forceOpen={forceOpen}
                 />
               ))}
             </ul>
@@ -2471,74 +2489,70 @@ function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expanded
   );
 }
 
-/** A project key is a digest or a path key; only the last characters identify it. */
-function shortProjectKey(key) {
-  if (key.startsWith('sha256:')) return key.slice(-6);
-  if (key.startsWith('path:')) {
-    const parts = key.slice(5).split(/[\\/]+/u).filter(Boolean);
-    return parts.slice(-2).join('/');
-  }
-  return key.slice(-8);
-}
-
-/**
- * The tree panel: the host's projected hierarchy, with a counted header.
- *
- * Reading states are kept apart, because they mean different things to an operator:
- * a host that sends no tree at all (`treeAvailable: false`) is an OLD host, an empty
- * tree is "nothing planned or dispatched yet", and a refused read is a FAILURE and
- * says so. The flat list is still rendered in the first two cases, so no record is
- * hidden when the projection is unavailable.
- * @param {object} props - `store`, `snapshot`, `onOpen`.
- * @returns {object} the panel.
- */
 function TaskTreePanel({ store, snapshot, onOpen }) {
   const view = snapshot.tree ?? null;
   const [collapsed, setCollapsed] = useState(() => new Set());
   const [expandedRounds, setExpandedRounds] = useState(() => new Set());
+  const [projectKey, setProjectKey] = useState('');
+  const [filter, setFilter] = useState('all');
+  const [search, setSearch] = useState('');
+  const [archiveError, setArchiveError] = useState(null);
   if (view === null) {
-    return (
-      <p className="dshdg-faint" data-dshdg-tree-unavailable="">
-        {snapshot.tasksError === null || snapshot.tasksError === undefined
-          ? '当前宿主没有返回任务树（插件版本可能较旧），下面按平铺列表显示。'
-          : '任务树这次没有读到，下面按平铺列表显示已有的记录。'}
-      </p>
-    );
+    return <p className="dshdg-faint" data-dshdg-tree-unavailable="">
+      {snapshot.tasksError ? '任务树读取失败，下面显示已有记录。' : '当前宿主按列表显示任务。'}
+    </p>;
   }
   const counts = view.counts ?? {};
-  const roots = view.roots ?? [];
+  const canArchive = view.displayArchiveAvailable === true;
+  const { groups, archiveCount } = projectTaskView(view, {
+    projectKey, filter: canArchive ? filter : (filter === 'archive' ? 'all' : filter), search,
+    selectedTaskId: snapshot.taskDetail?.taskId ?? null,
+  });
+  async function archive(node, archived) {
+    setArchiveError(null);
+    const result = await store.setDisplayArchive(node.nodeId, archived);
+    if (!result.ok) setArchiveError(describeError(result.error));
+    else if (archived && snapshot.taskDetail) store.closeTask();
+  }
   return (
     <section className="dshdg-card" aria-labelledby="dshdg-tree-title" data-dshdg-task-tree="">
       <div className="dshdg-row">
         <h3 id="dshdg-tree-title">任务树</h3>
         <span className="dshdg-spacer" />
         <span className="dshdg-hint" data-dshdg-tree-counts="">
-          {`规划节点 ${counts.planNodes ?? 0} · 执行链 ${counts.taskChains ?? 0} · 顶层 ${counts.roots ?? roots.length}`}
-          {Number.isFinite(counts.orphans) && counts.orphans > 0 ? ` · 关系不完整 ${counts.orphans}` : ''}
+          {`规划节点 ${counts.planNodes ?? 0} · 执行链 ${counts.taskChains ?? 0} · 顶层 ${counts.roots ?? view.roots.length}`}
         </span>
       </div>
-      <p className="dshdg-hint">
-        层级和轮次都来自宿主的记录：续接关系只来自 continueFromTaskId，层级只来自计划节点/父节点字段，不会按标题推测。
-      </p>
-      {roots.length === 0 ? (
-        <p className="dshdg-faint" data-dshdg-tree-empty="">还没有规划节点或执行记录。</p>
-      ) : (
-        <ul className="dshdg-tree-roots">
-          {roots.map((node) => (
-            <TaskTreeItem
-              key={node.nodeId}
-              node={node}
-              store={store}
-              snapshot={snapshot}
-              collapsed={collapsed}
-              setCollapsed={setCollapsed}
-              expandedRounds={expandedRounds}
-              setExpandedRounds={setExpandedRounds}
-              onOpen={onOpen}
-            />
-          ))}
-        </ul>
-      )}
+      <div className="dshdg-tree-filters">
+        <label>项目<select value={projectKey} onChange={(event) => { setProjectKey(event.target.value); store.closeTask(); }}>
+          <option value="">所有项目</option>
+          {view.projects.map((p) => <option key={p.projectKey} value={p.projectKey}>{p.shortPath ? `${p.name} · ${p.shortPath}` : p.name}</option>)}
+        </select></label>
+        <label>状态<select value={filter} onChange={(event) => { setFilter(event.target.value); store.closeTask(); }}>
+          <option value="all">全部</option>
+          <option value="attention">需要处理</option>
+          <option value="active">执行中</option>
+          <option value="done">已完成</option>
+          {canArchive ? <option value="archive">{`已归档（${archiveCount}）`}</option> : null}
+        </select></label>
+        <label>搜索<input type="search" value={search} onChange={(event) => { setSearch(event.target.value); store.closeTask(); }} placeholder="项目、标题或任务编号" /></label>
+      </div>
+      {filter === 'archive' ? <p className="dshdg-hint">归档只影响任务的显示。会话和历史仍按原规则保留。</p> : null}
+      {view.displayArchiveError ? <p className="dshdg-warn" role="alert">归档记录暂不可读，已显示全部任务。</p> : null}
+      {archiveError ? <p className="dshdg-warn" role="alert">{`更新归档失败。${archiveError}`}</p> : null}
+      {groups.length === 0 ? (
+        <p className="dshdg-faint" data-dshdg-tree-empty="">{view.roots.length === 0 ? '还没有规划节点或执行记录。' : '没有符合当前条件的任务。'}</p>
+      ) : groups.map((group) => (
+        <section className="dshdg-tree-project" key={group.projectKey} data-dshdg-project={group.projectKey}>
+          <h4>{group.name} {group.shortPath ? <small>{group.shortPath}</small> : null}</h4>
+          <p className="dshdg-hint">{`任务 ${group.count.total} · 需要处理 ${group.count.attention}`}</p>
+          <ul className="dshdg-tree-roots">
+            {group.roots.map((node) => <TaskTreeItem key={node.nodeId} node={node} store={store} snapshot={snapshot}
+              collapsed={collapsed} setCollapsed={setCollapsed} expandedRounds={expandedRounds} setExpandedRounds={setExpandedRounds}
+              onOpen={onOpen} onArchive={canArchive ? archive : null} forceOpen={search.trim() !== '' || filter !== 'all'} />)}
+          </ul>
+        </section>
+      ))}
     </section>
   );
 }
@@ -2725,12 +2739,21 @@ function PlanCreateForm({ store, snapshot, view }) {
                 onChange={(event) => edit({ goal: event.target.value })}
               />
             </Field>
-            <Field label="关联父节点" htmlFor="dshdg-plan-parent" hint="可选：挂到已有规划节点下（发送真实节点 ID，不按标题推断）">
+            {draft.parentNodeId === '' ? <Field label="所属项目" htmlFor="dshdg-plan-project">
+              <select id="dshdg-plan-project" value={draft.workspacePath}
+                onChange={(event) => edit({ workspacePath: event.target.value })}>
+                <option value="">暂不指定</option>
+                {(view?.projects ?? []).filter((project) => project.sourcePath && !project.unverified).map((project) => (
+                  <option key={project.projectKey} value={project.sourcePath}>{project.name} {project.shortPath}</option>
+                ))}
+              </select>
+            </Field> : null}
+            <Field label="关联父节点" htmlFor="dshdg-plan-parent">
               <select
                 id="dshdg-plan-parent"
                 value={draft.parentNodeId}
                 data-dshdg-plan-parent=""
-                onChange={(event) => edit({ parentNodeId: event.target.value })}
+                onChange={(event) => edit({ parentNodeId: event.target.value, workspacePath: '' })}
               >
                 <option value="">（不关联，作为顶层）</option>
                 {selectedParent === null ? null : (
@@ -2840,7 +2863,7 @@ function TasksPanel({ store, snapshot }) {
   // DIFFERENT task each bump the counter, so each one focuses and scrolls.
   const detailView = snapshot.taskDetailView ?? 0;
   useLayoutEffect(() => {
-    if (detailView === 0) return;
+    if (detailView === 0 || !flatOnly) return;
     const node = detailRef.current;
     if (node === null || node === undefined) return;
     try {
@@ -2853,7 +2876,7 @@ function TasksPanel({ store, snapshot }) {
     } catch {
       // Scrolling is best-effort; focus already moved the operator's reading point.
     }
-  }, [detailView]);
+  }, [detailView, flatOnly]);
   const changing = hasChangingRecords([
     ...tasks,
     ...(detail === null || detail === undefined ? [] : [detail]),
@@ -2893,10 +2916,8 @@ function TasksPanel({ store, snapshot }) {
       {detail === null && snapshot.taskDetailLoading === true ? (
         <p className="dshdg-hint" role="status">正在读取任务详情…</p>
       ) : null}
-      {/* The open detail sits ABOVE the list: it is the answer to the click, and burying
-          it under a long list made the click look like it did nothing. It is focusable
-          and takes focus + scroll when it (re)appears. */}
-      {detail === null ? null : (
+      {/* Legacy hosts keep the list's original detail presentation. */}
+      {detail === null || !flatOnly ? null : (
         <div
           ref={detailRef}
           tabIndex={-1}
@@ -3215,3 +3236,31 @@ export function DelegateConfigPage(props) {
 
 /** Re-exported so the documented contract and tests share one name for the body document. */
 export { documentFromDraft, describeError, exportDocument, planCreateRequest };
+
+
+/**
+ * Re-exported so a consumer (and `lib/client.d.ts`) reaches the native navigation
+ * through the one module the bundle exports, rather than a second module identity.
+ */
+export {
+  MAIN_SLOT,
+  SIDEBAR_PANEL_SLOT,
+  TASKS_NAV_KEY,
+  TASKS_NAV_LABEL,
+  archivedSourceNote,
+  groupTitle,
+  knownSessionIds,
+  locateSession,
+  navViewModel,
+  projectLabel,
+  registerTasksNavigation,
+  resolveService,
+  resolveUiWorkspace,
+  resolveWorkspaces,
+  sessionPlacement,
+  shortSessionId,
+  taskSessionId,
+  workspacesSnapshot,
+  TaskbridgeNavPanel,
+  TaskbridgeSidebarIcon,
+} from './sidebar.jsx';

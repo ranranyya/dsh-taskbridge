@@ -900,6 +900,61 @@ for (const fail of [false, true]) {
 // 12. Title and continuation reference survive the round trip to the page and tools
 // ---------------------------------------------------------------------------
 
+test('a saved live review preserves the session identity through a restart', async () => {
+  const f = await fixture();
+  try {
+    const first = await f.boot({ sessionStore: new SessionStore(join(f.dir, 'data')) });
+    const taskId = await finishedTask(f, first.engine);
+    const identity = await first.sessionStore.get(taskId);
+    assert.ok(identity?.sessionId, 'the original run recorded a native session');
+    const response = await callPlane(f.deps(first.engine), '/tasks/review', {
+      taskId, decision: 'accepted', note: 'The native session can still be located.',
+    });
+    assert.equal(response.status, 200);
+    await first.engine.dispose();
+
+    const second = await f.boot();
+    const [saved] = await second.store.load();
+    assert.equal(saved.taskId, taskId);
+    assert.equal(saved.hostAcceptance.accepted, true);
+    for (const key of ['sessionId', 'workspaceId', 'sourcePathDigest', 'executionPathDigest']) {
+      assert.equal(saved[key], identity[key], `a live review must preserve ${key}`);
+    }
+    const [listed] = await pageRecords({ ...f.deps(second.engine), history: second.store }, taskId);
+    assert.equal(listed.sessionId, identity.sessionId);
+  } finally {
+    await f.close();
+  }
+});
+
+test('the user plane restores a missing historical session link only when the saved identity agrees', async () => {
+  const f = await fixture();
+  try {
+    const first = await f.boot({ sessionStore: new SessionStore(join(f.dir, 'data')) });
+    const taskId = await finishedTask(f, first.engine);
+    const identity = await first.sessionStore.get(taskId);
+    const [stored] = await first.store.load();
+    // Match the older review write, which kept the paths and placement, but dropped the proofs.
+    await first.store.save({ ...stored, sessionId: null, workspaceId: null, sourcePathDigest: null, executionPathDigest: null });
+    await first.engine.dispose();
+
+    const second = await f.boot({ sessionStore: new SessionStore(join(f.dir, 'data')) });
+    const deps = { ...f.deps(second.engine), history: second.store, sessionStore: second.sessionStore };
+    const [listed, detailed] = await pageRecords(deps, taskId);
+    assert.equal(listed.sessionId, identity.sessionId);
+    assert.equal(detailed.sessionId, null, 'the identity is only projected for sidebar navigation');
+    assert.equal((await second.store.load())[0].sessionId, null, 'reading the list does not rewrite history');
+    await second.sessionStore.put({ ...identity, workspaceId: 'other-workspace' });
+    assert.equal((await pageRecords(deps, taskId))[0].sessionId, null);
+    await second.sessionStore.put({ ...identity, sourcePath: join(f.dir, 'other-project'), sourcePathDigest: null });
+    assert.equal((await pageRecords(deps, taskId))[0].sessionId, null);
+    const unavailable = { ...deps, sessionStore: { async list() { throw new Error('unreadable'); } } };
+    assert.equal((await pageRecords(unavailable, taskId))[0].sessionId, null);
+  } finally {
+    await f.close();
+  }
+});
+
 test('an explicit title and continuation reference survive a restart through the user plane', async () => {
   const f = await fixture();
   try {

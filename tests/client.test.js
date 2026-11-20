@@ -149,23 +149,32 @@ test('registerBundleConfiguration occupies plugins.bundle.config, keyed by dsh-d
   assert.equal(component, MODULE.exports.DelegateConfigPage);
 });
 
-test('apply wires the stylesheet, store and bundle page — and nothing else', () => {
+test('apply wires the stylesheet, store, bundle page and the native navigation — and nothing else', () => {
   const ctx = fakeClientContext();
   MODULE.exports.apply(ctx);
 
-  // Two effects for setup (stylesheet, registration) plus one for store disposal.
+  // Two effects for setup (stylesheet, registration) plus one for store disposal and
+  // one for the sidebar entry.
   assert.ok(ctx.effects.length >= 3, 'apply must register its effects');
   for (const effect of ctx.effects) {
     assert.equal(typeof effect.label, 'string');
     assert.doesNotMatch(effect.label, /settings section|settings\.section/u);
   }
 
-  assert.equal(ctx.injections.length, 1, 'apply must inject exactly one slot');
+  // Three slot injections, and exactly these: the Plugins-manager page (G08 adds the
+  // content panel on `main` and its icon on `sidebar.panellist`). `sidebar.workspaces`
+  // is deliberately absent — two public sibling plugins own or replace it.
+  assert.deepEqual(
+    ctx.injections.map((injection) => injection.name),
+    ['plugins.bundle.config', 'main', 'sidebar.panellist'],
+    'apply must inject the page and the two optional sidebar slots, nothing else',
+  );
   assert.equal(ctx.injections[0].name, 'plugins.bundle.config');
 
   // No duplicate Settings page in the shipped registration.
   assert.doesNotMatch(BUNDLE_TEXT, /settings\.section/u);
   assert.doesNotMatch(BUNDLE_TEXT, /registerSettingsSection/u);
+  assert.doesNotMatch(BUNDLE_TEXT, /['"]sidebar\.workspaces['"]/u, 'the sibling plugins keep that slot');
 });
 
 test('the page store exposes no task-submit action', () => {

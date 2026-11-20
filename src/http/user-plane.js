@@ -37,7 +37,9 @@ import { checkProviderConnectivity } from '../model/connectivity.js';
 import { MAX_CREDENTIAL_VALUE_CHARS } from '../credentials/seam.js';
 import { CODEX_ACTIONS, publicCodexStatus, runCodexAction } from '../codex/installer.js';
 import { classifyError, HttpError, jsonResponse, readJsonRequest } from '../http/respond.js';
+import { sameRecordedDirectory } from '../jobs/continuation-identity.js';
 import { buildTaskTree } from '../jobs/task-tree.js';
+import { findDisplayNode } from '../jobs/task-display.js';
 import { MAX_PLAN_BATCH, PLAN_CODES } from '../jobs/plan-store.js';
 
 /**
@@ -347,13 +349,36 @@ export function userPlaneRoutes(deps) {
         const { tasks, history, plans, tree } = await readTaskRecords(deps, { connectionId });
         return jsonResponse(200, {
           ok: true,
-          tasks,
+          tasks: await restoreSidebarSessionIds(tasks, deps.sessionStore),
           // Stated, not implied: a client must be able to tell a complete list
           // from one whose archive section could not be read.
           history,
           plans,
           tree,
         });
+      },
+    },
+    {
+      path: `${USER_PLANE_PREFIX}/tasks/display-archive`,
+      methods: ['POST'],
+      requestBody: BODY_MODE,
+      fetch: async (request) => {
+        const body = await readJsonRequest(request);
+        if (typeof body.nodeId !== 'string' || !body.nodeId.trim() || body.nodeId.length > 256 || typeof body.archived !== 'boolean') {
+          throw new HttpError(400, 'TASK_DISPLAY_INVALID', 'a task node id and an archive flag are required');
+        }
+        if (!deps.taskDisplay) throw new HttpError(503, 'TASK_DISPLAY_UNAVAILABLE', 'display archives are unavailable');
+        const { tree } = await readTaskRecords(deps);
+        const node = findDisplayNode(tree.roots, body.nodeId.trim());
+        if (node === null) throw new HttpError(404, 'TASK_DISPLAY_NOT_FOUND', 'this node is no longer in the task history');
+        let outcome;
+        try {
+          outcome = await deps.taskDisplay.setArchived(node, body.archived, new Set(tree.flatNodes.map((item) => item.nodeId)));
+        } catch {
+          throw new HttpError(503, 'TASK_DISPLAY_UNAVAILABLE', 'display archives could not be saved');
+        }
+        if (outcome.conflict) throw new HttpError(409, outcome.conflict, 'this task could not be archived');
+        return jsonResponse(200, { ok: true, archived: outcome.archived });
       },
     },
     {
@@ -906,6 +931,17 @@ async function readTaskRecords(deps, options = {}) {
     merged.push(archivedRecord(deps, job));
   }
   merged.sort(compareNewestFirst);
+  const tree = buildTaskTree({ planNodes: planState.nodes, tasks: merged });
+  if (deps.taskDisplay) {
+    try {
+      await deps.taskDisplay.project(tree);
+      tree.displayArchiveAvailable = true;
+    } catch (error) {
+      tree.displayArchiveAvailable = false;
+      tree.displayArchiveError = 'TASK_DISPLAY_UNAVAILABLE';
+      deps.logger?.warn?.('dsh-delegate: display archives could not be read', error?.code ?? 'STORE_UNREADABLE');
+    }
+  }
 
   return {
     tasks: merged,
@@ -921,8 +957,40 @@ async function readTaskRecords(deps, options = {}) {
       unreadable: false,
       ...(planState.available ? {} : { reason: planState.code }),
     },
-    tree: buildTaskTree({ planNodes: planState.nodes, tasks: merged }),
+    tree,
   };
+}
+
+// Older review writes could drop the top-level session id while retaining the
+// placement and paths. Only the operator's task list needs this navigation link.
+async function restoreSidebarSessionIds(tasks, sessionStore) {
+  const needsLink = (task) => task.archived === true && task.sessionId == null
+    && typeof task.execution?.conversation?.workspaceId === 'string';
+  if (typeof sessionStore?.list !== 'function' || !tasks.some(needsLink)) return tasks;
+
+  let identities;
+  try {
+    identities = new Map((await sessionStore.list()).map((identity) => [identity.taskId, identity]));
+  } catch {
+    return tasks;
+  }
+
+  return tasks.map((task) => {
+    if (!needsLink(task)) return task;
+    const identity = identities.get(task.taskId);
+    const workspaceId = task.execution.conversation.workspaceId;
+    if (!identity || workspaceId === '' || identity.workspaceId !== workspaceId
+      || typeof identity.sessionId !== 'string' || identity.sessionId === '') return task;
+    const sameSource = sameRecordedDirectory(
+      { path: task.sourcePath, digest: task.sourcePathDigest },
+      { path: identity.sourcePath, digest: identity.sourcePathDigest },
+    );
+    const sameExecution = sameRecordedDirectory(
+      { path: task.executionWorkspacePath, digest: task.executionPathDigest },
+      { path: identity.executionPath, digest: identity.executionPathDigest },
+    );
+    return sameSource && sameExecution ? { ...task, sessionId: identity.sessionId } : task;
+  });
 }
 
 // ---- planning-node creation (narrow operator write) ------------------------

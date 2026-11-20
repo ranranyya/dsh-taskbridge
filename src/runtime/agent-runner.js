@@ -750,6 +750,8 @@ export async function driveAgent(deps, request) {
     request.onEvent?.(event);
   };
 
+  let selectionContext = null;
+  let releaseEffort = null;
   try {
     // A cancellation that arrived before the factory was ever called must not
     // create an agent at all — creating one only to dispose it would still run
@@ -801,6 +803,7 @@ export async function driveAgent(deps, request) {
           // legacy harness it travels through `installModelSelection`. Nothing is
           // reported as applied that was not read back.
           state.selection = applySelection(agentCtx, agent, selection);
+          selectionContext = agentCtx;
           agentCtx.on('session/event', onEvent);
           agentCtx.on('agent/error', (payload) => {
             state.error = errorText(payload?.error);
@@ -892,6 +895,11 @@ export async function driveAgent(deps, request) {
       return finish(state, RUN_OUTCOMES.failed);
     }
 
+    const selected = state.selection;
+    if (request.delegated === true && selected?.applied === true
+      && selected.reasoningEffort !== null && selected.reasoningEffort !== 'auto') {
+      releaseEffort = preserveWorkerEffort(selectionContext, handle.agent, selected);
+    }
     handle.agent.followup(userMessage(prompt));
     await Promise.race([handle.agent.whenIdle(), aborted]);
 
@@ -917,6 +925,7 @@ export async function driveAgent(deps, request) {
       cause: diagnostic(error?.message ?? error),
     });
   } finally {
+    releaseEffort?.();
     // The deadline is disarmed on every exit path, which also clears a paused span
     // so a run that ends during a wait leaves no armed timer behind.
     if (state.deadline !== null) state.deadline.dispose();
@@ -988,6 +997,7 @@ export async function driveAgent(deps, request) {
     // task's name. `maxTokens` is not part of the selection: the native selection
     // carries only the provider route, model and effort.
     state.selection = applySelection(agentCtx, agent, runSelection);
+    selectionContext = agentCtx;
     agentCtx.on('session/event', onEvent);
     agentCtx.on('agent/error', (payload) => {
       state.error = errorText(payload?.error);
@@ -1855,6 +1865,44 @@ function selectThroughAgentModel(agent, wanted) {
     reasoningEffort: observedEffort ?? null,
     applied: true,
   };
+}
+
+/** Keep the delegated worker's concrete effort after step schedulers run. */
+function preserveWorkerEffort(agentCtx, agent, { provider, model, reasoningEffort }) {
+  const removers = [];
+  let active = true;
+  const sameRoute = (selection) => selection?.provider === provider && selection?.model === model;
+  const shouldKeep = (payload, selection) => active && payload.agent === agent
+    && payload.signal?.aborted !== true && sameRoute(selection) && selection.reasoningEffort !== reasoningEffort;
+  const release = () => {
+    active = false;
+    for (const remove of removers) {
+      if (typeof remove !== 'function') continue;
+      try { remove(); } catch { /* Agent disposal can remove the listener first. */ }
+    }
+  };
+  try {
+    // DSH 0.2.2 binds the model from this step selection before it validates
+    // agent/request. Prepending makes this listener unwind after the scheduler.
+    removers.push(agentCtx.on('agent/pre-step', async (payload, next) => {
+      const decision = await next();
+      const selection = payload.modelSelection;
+      if (decision?.kind !== 'reject' && shouldKeep(payload, selection)) {
+        selection.reasoningEffort = reasoningEffort;
+      }
+      return decision;
+    }, { prepend: true }));
+    // Earlier hosts let the scheduler rewrite the request directly. On 0.2.2
+    // the step already carries the selected effort, so the request passes through.
+    removers.push(agentCtx.on('agent/request', async (payload, next) => {
+      const request = await next();
+      return shouldKeep(payload, request) ? { ...request, reasoningEffort } : request;
+    }, { prepend: true }));
+  } catch (error) {
+    release();
+    throw error;
+  }
+  return release;
 }
 
 function numeric(value) {

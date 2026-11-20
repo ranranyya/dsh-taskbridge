@@ -88,6 +88,12 @@ Two consequences the plugin has to respect:
   default", which is a distinct value from any concrete effort, so a selection that
   omits it must not be reported as a concrete effort.
 
+When a delegated worker specifies a concrete effort, TaskBridge keeps it after
+step scheduling. DSH 0.2.2 binds the effort from the step selection before it
+validates `agent/request`. Older hosts can apply the effort through that request
+hook. The listeners are scoped to the worker and removed when the task ends.
+Leaving the TaskBridge effort unset allows the installed DSH scheduler to choose.
+
 ### 2.2 Asynchronous native policy initialization
 
 The two services this plugin's worker contract depends on are initialized

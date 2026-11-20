@@ -208,7 +208,7 @@ test('the built page carries the Codex panel, one explicit button per action', (
   assert.match(BUNDLE, /移除插件托管项/u);
   assert.match(BUNDLE, /刷新状态/u);
   // The panel is a tab, and the tab key routes to it.
-  assert.match(BUNDLE, /key: "codex"/u);
+  assert.match(BUNDLE, /key:\s*"codex"/u);
   assert.match(BUNDLE, /CodexPanel/u);
   // Each write button is a click handler over the one store action.
   const install = BUNDLE.match(/runCodexAction\("install"\)/gu) ?? [];

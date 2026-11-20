@@ -4378,6 +4378,8 @@ export class JobEngine {
    */
   viewForReviewWrite(task, entry) {
     const view = this.view(task);
+    // Saving a review replaces the stored snapshot, so keep the original session proof.
+    this.attachContinuationProof(view, task);
     view.hostAcceptance = {
       accepted: entry.decision === HOST_REVIEW_STATES.accepted,
       state: entry.decision,

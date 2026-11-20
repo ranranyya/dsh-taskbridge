@@ -42,6 +42,7 @@ import { bindAllowsExternalConnections } from './auth/fence.js';
 import { JobEngine } from './jobs/engine.js';
 import { HistoryStore } from './jobs/history.js';
 import { PlanStore } from './jobs/plan-store.js';
+import { TaskDisplayStore } from './jobs/task-display.js';
 import { WorkspaceLocks } from './workspace/locks.js';
 import { createGitRunner } from './workspace/audit.js';
 import { WorktreeManager } from './workspace/worktrees.js';
@@ -157,6 +158,7 @@ export async function apply(ctx, config = {}) {
 
   const history = new HistoryStore(dataDir);
   const plans = new PlanStore(dataDir);
+  const taskDisplay = new TaskDisplayStore(dataDir);
   const worktrees = new WorktreeManager({ runGit }, { rootDir: join(dataDir, 'worktrees') });
   // The task-thread identity map: task id -> the DSH Workspace/Session that task
   // drove, plus the paths and (for an isolated run) the tree ownership facts a
@@ -238,6 +240,7 @@ export async function apply(ctx, config = {}) {
     worktrees,
     history,
     plans,
+    taskDisplay,
     providerRegistry,
     credentials,
     logger,

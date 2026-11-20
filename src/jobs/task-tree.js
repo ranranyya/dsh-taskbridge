@@ -190,10 +190,12 @@ export function groupContinuationChains(tasks = []) {
       hierarchyMismatch,
       hasParallelContinuations,
       brokenContinuation: brokenByTask.get(rootId) ?? null,
-      nodeStatus: deriveChainStatus(rounds, hasParallelContinuations),
+      nodeStatus: deriveChainStatus(rounds, new Set(rounds.map((round) => parentOf.get(round.taskId)))),
       createdAt: finiteNumber(rootTask.createdAt) ?? 0,
       updatedAt: maxTimestampOfRounds(rounds),
-      sourcePath: rootTask.sourcePath ?? rootTask.workspacePath ?? null,
+      sourcePath: rootTask.sourcePath ??
+        (rootTask.isolation !== 'worktree' && (rootTask.isolation === 'shared' || rootTask.executionWorkspacePath == null)
+          ? rootTask.workspacePath : null) ?? null,
       sourcePathDigest: isDigest(rootTask.sourcePathDigest) ? rootTask.sourcePathDigest : null,
     });
   }
@@ -205,37 +207,26 @@ export function groupContinuationChains(tasks = []) {
  * Derive conservative status for a task continuation chain (foundation for G04).
  * Execution finishing (`awaiting-host-review`) is NEVER reported as `accepted`.
  */
-export function deriveChainStatus(rounds, hasParallelContinuations = false) {
-  if (!Array.isArray(rounds) || rounds.length === 0) return 'planned';
-  for (const r of rounds) {
-    if (r.state === 'running' && (r.phase === 'awaiting-permission' || r.permission?.waiting === true)) {
+export function deriveChainStatus(rounds, continuedTaskIds = new Set(rounds.map(explicitContinuationOf))) {
+  if (rounds.length === 0) return 'planned';
+  const statuses = new Set();
+  for (const round of rounds) {
+    if (round.state === 'running' && (round.phase === 'awaiting-permission' || round.permission?.waiting === true)) {
       return 'awaiting-permission';
     }
-    if (r.state === 'running' && (r.phase === 'awaiting-question' || r.question?.waiting === true)) {
-      return 'awaiting-question';
+    if (round.state === 'running' && (round.phase === 'awaiting-question' || round.question?.waiting === true)) {
+      statuses.add('awaiting-question');
+    } else if (round.state === 'pending' || round.state === 'running') {
+      statuses.add('running');
+    } else if (round.state === 'awaiting-host-review' && !isSavedAcceptance(round)) {
+      statuses.add('awaiting-host-review');
+    } else if (!continuedTaskIds.has(round.taskId)) {
+      const terminal = ['failed', 'cancelled', 'interrupted'].includes(round.state) ? round.state : 'unknown';
+      statuses.add(round.state === 'awaiting-host-review' ? acceptanceVerdictOf(round.hostAcceptance) : terminal);
     }
   }
-  if (rounds.some((r) => r.state === 'pending' || r.state === 'running')) {
-    return 'running';
-  }
-  const latest = rounds[rounds.length - 1];
-  // If parallel continuations exist and any leaf/sibling round is unaccepted or failed, do not mark accepted.
-  if (hasParallelContinuations) {
-    for (const r of rounds.slice(1)) {
-      if (r.state === 'awaiting-host-review' && !isSavedAcceptance(r)) return 'awaiting-host-review';
-      if (acceptanceVerdictOf(r.hostAcceptance) === 'changes-requested') return 'changes-requested';
-    }
-  }
-  if (latest.state === 'awaiting-host-review') {
-    if (isSavedAcceptance(latest)) {
-      return latest.hostAcceptance.accepted === true ? 'accepted' : 'changes-requested';
-    }
-    return 'awaiting-host-review';
-  }
-  if (latest.state === 'failed') return 'failed';
-  if (latest.state === 'cancelled') return 'cancelled';
-  if (latest.state === 'interrupted') return 'interrupted';
-  return 'unknown';
+  const attention = ['awaiting-question', 'running', 'failed', 'changes-requested', 'awaiting-host-review', 'interrupted', 'cancelled', 'unknown'];
+  return attention.find((status) => statuses.has(status)) ?? (statuses.has('accepted') ? 'accepted' : 'unknown');
 }
 
 function acceptanceVerdictOf(acceptance) {

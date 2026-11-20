@@ -635,6 +635,70 @@ test('an absent model surface keeps the legacy path; a present empty one does no
   }, empty);
 });
 
+// An installed scheduler can override the native readback later in the turn.
+// Drive the normal runner through both hook shapes, then reuse the same Agent
+// without a concrete effort to catch a guard leaking into the next task.
+for (const strict of [true, false]) {
+  const hook = strict ? 'agent/pre-step' : 'agent/request';
+  test(`a continued worker keeps its explicit effort through ${hook} and releases it after the run`, async () => {
+    const options = { model: strict };
+    const agent = await fakeAgent(options);
+    const originalFollowup = agent.followup;
+    const hookTable = new Map();
+    const sent = [];
+    agent.ctx.on = (name, listener, { prepend = false } = {}) => {
+      if (name === 'session/event' || name === 'agent/error') {
+        const entry = { event: name, listener };
+        agent.listeners.push(entry);
+        return () => { agent.listeners = agent.listeners.filter((row) => row !== entry); };
+      }
+      const entries = hookTable.get(name) ?? [];
+      hookTable.set(name, entries);
+      if (prepend) entries.unshift(listener);
+      else entries.push(listener);
+      return () => { entries.splice(entries.indexOf(listener), 1); };
+    };
+    const step = async (name, selection, owner = agent) => {
+      const payload = { agent: owner, modelSelection: strict ? selection : undefined,
+        signal: new AbortController().signal, step: 1, messages: [] };
+      let next = async () => (name === 'agent/pre-step' ? { kind: 'enter', messages: [] } : selection);
+      for (const listener of [...(hookTable.get(name) ?? [])].reverse()) {
+        const inner = next;
+        next = () => listener(payload, inner);
+      }
+      return await next();
+    };
+    agent.ctx.on(hook, async (payload, next) => {
+      const result = await next();
+      if (!strict) return { ...result, reasoningEffort: 'low' };
+      payload.modelSelection.reasoningEffort = 'low';
+      return result;
+    }, { prepend: true });
+    let turn;
+    agent.followup = (prompt) => {
+      turn = (async () => {
+        for (const owner of [agent, agent, {}]) {
+          const selection = agent.model?.current() ?? { provider: 'relay', model: 'deepseek-reasoner' };
+          await step('agent/pre-step', selection, owner);
+          sent.push((await step('agent/request', selection, owner)).reasoningEffort);
+        }
+        originalFollowup(prompt);
+      })();
+    };
+    agent.whenIdle = async () => { await turn; };
+    const runWorker = (reasoningEffort) => runPlaced(agent, {
+      delegated: true,
+      configureDelegatedSession: () => ({ approvalPolicy: 'never' }),
+      selection: { ...ROUTE_B, reasoningEffort },
+    }, 'continuation');
+
+    assert.equal((await runWorker('max')).outcome, RUN_OUTCOMES.completed);
+    assert.deepEqual(sent.splice(0), ['max', 'max', 'low']);
+    assert.equal((await runWorker(null)).outcome, RUN_OUTCOMES.completed);
+    assert.deepEqual(sent, ['low', 'low', 'low']);
+  });
+}
+
 // --- Cancellation and budget are untouched ----------------------------------
 
 test('a cancelled run never selects, never prompts and never reports applied', async () => {

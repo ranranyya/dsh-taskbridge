@@ -250,6 +250,12 @@ export const CSS_TEXT = `
    its own small step and a narrow window still fits the text before wrapping.
    Every row is a flex line that WRAPS: a long node title or a long status never
    pushes the round buttons out of the panel, and nothing is clipped. */
+.dshdg-tree-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-block: 8px; }
+.dshdg-tree-filters label { display: grid; gap: 2px; flex: 1 1 132px; min-width: 0; }
+.dshdg-tree-filters label > * { width: 100%; min-width: 0; }
+.dshdg-tree-project { border-top: 1px solid var(--dshdg-line); margin-top: 12px; padding-top: 8px; }
+.dshdg-tree-project h4 { margin: 0; overflow-wrap: anywhere; }
+.dshdg-tree-project h4 small { font-weight: normal; }
 .dshdg-tree-roots, .dshdg-tree-children, .dshdg-tree-rounds { list-style: none; margin: 0; padding: 0; }
 .dshdg-tree-roots { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .dshdg-tree-node { min-width: 0; }
@@ -280,6 +286,57 @@ export const CSS_TEXT = `
 @media (max-width: 560px) {
   .dshdg-layer, .dshdg-kv { grid-template-columns: minmax(0, 1fr); }
 }
+/* ---- native left navigation (G08) ------------------------------------------
+   This panel is NOT inside the settings dialog: it renders in the shell's own
+   sidebar, whose width the host owns. So it uses the same .dshdg-* names (same
+   tokens, same theme handling) but repeats no layout assumptions from the page:
+   every row wraps, every title may shrink, and nothing may force a minimum width
+   the sidebar does not have. */
+.dshdg-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 6px 2px;
+  min-width: 0;
+  color: var(--dsw-alias-label-primary, #1f2329);
+  font-family: var(--dsw-font-family, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.dshdg-nav * { box-sizing: border-box; }
+.dshdg-nav h3 { margin: 0; font-size: 13px; font-weight: 600; min-width: 0; }
+.dshdg-nav p { margin: 0; }
+.dshdg-nav-head, .dshdg-nav-project-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+.dshdg-nav-note { font-size: 12px; }
+.dshdg-nav-projects, .dshdg-nav-sessions { list-style: none; margin: 0; padding: 0; min-width: 0; }
+.dshdg-nav-projects { display: flex; flex-direction: column; gap: 4px; }
+.dshdg-nav-project { min-width: 0; }
+.dshdg-nav-project-title {
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.dshdg-nav-sessions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-inline-start: 0.8em;
+  padding-inline-start: 8px;
+  border-inline-start: 1px dashed var(--dsw-alias-border-l2, #e2e5e9);
+}
+.dshdg-nav-session { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+.dshdg-nav-session-title {
+  min-width: 0;
+  flex: 1 1 6em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dshdg-nav-session button { padding: 1px 8px; font-size: 12px; }
+.dshdg-nav-toggle-row { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.dshdg-nav-archived { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.dshdg-nav-icon { display: block; }
 `;
 
 /**
