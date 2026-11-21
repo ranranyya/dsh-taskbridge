@@ -253,6 +253,50 @@ export const CSS_TEXT = `
 .dshdg-tree-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-block: 8px; }
 .dshdg-tree-filters label { display: grid; gap: 2px; flex: 1 1 132px; min-width: 0; }
 .dshdg-tree-filters label > * { width: 100%; min-width: 0; }
+/* ---- creation-date range ---------------------------------------------------
+   Two native date inputs plus a clear button. The inputs stay inside the same
+   wrapping filter row, so a narrow window stacks them instead of overflowing;
+   the native picker supplies the calendar, so no date widget is shipped. */
+.dshdg-root input[type="date"] {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 8px;
+  color: inherit;
+  font: inherit;
+  background: var(--dsw-alias-bg-base, #f7f8f9);
+  border: 1px solid var(--dsw-alias-border-l3, #d3d7dd);
+  border-radius: var(--dsw-radius-sm, 6px);
+}
+.dshdg-root input[type="date"]:focus-visible {
+  outline: var(--dsw-focus-ring-width, 2px) solid var(--dsw-focus-ring-color, #3457d5);
+  outline-offset: 1px;
+}
+.dshdg-root input[type="date"][aria-invalid="true"] { border-color: var(--dsw-alias-label-error, #d92d20); }
+/* The clear control sits on the row's baseline with the inputs, not under them. */
+.dshdg-tree-day-actions { display: flex; align-items: flex-end; flex: 0 1 auto; min-width: 0; }
+.dshdg-tree-day-actions button { padding: 5px 10px; font-size: 12px; }
+.dshdg-record-views { display: flex; flex-wrap: wrap; gap: 4px; }
+.dshdg-record-views button[aria-pressed="true"] { font-weight: 600; background: var(--dsw-alias-interactive-bg-hover, #e9ebee); }
+.dshdg-records-overflow { overflow-x: auto; margin-top: 12px; }
+.dshdg-records-table { width: 100%; border-collapse: collapse; min-width: 36em; }
+.dshdg-records-table th, .dshdg-records-table td {
+  padding: 8px 10px; text-align: start; vertical-align: top; border-bottom: 1px solid var(--dshdg-line);
+}
+.dshdg-records-table th { font-size: 12px; white-space: nowrap; }
+.dshdg-records-table td[data-column="title"] { width: 42%; }
+.dshdg-records-table td[data-column="updatedAt"] { font-variant-numeric: tabular-nums; }
+.dshdg-records-table td[data-column="project"] { overflow-wrap: anywhere; }
+.dshdg-record-name { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.dshdg-records-table .dshdg-record-toggle, .dshdg-records-table .dshdg-record-sort {
+  display: inline-flex; align-items: baseline; gap: 6px; text-align: start;
+  border: 0; background: transparent; padding: 0; color: inherit; font: inherit;
+}
+.dshdg-records-table .dshdg-record-toggle { font-weight: 600; overflow-wrap: anywhere; }
+.dshdg-records-table .dshdg-record-toggle:hover, .dshdg-records-table .dshdg-record-sort:hover { text-decoration: underline; }
+.dshdg-record-detail { display: grid; gap: 8px; justify-items: start; }
+.dshdg-record-detail p { margin: 0; }
+.dshdg-record-detail .dshdg-tree-execution { width: 100%; }
+.dshdg-record-selection { display: grid; gap: 3px; justify-items: start; }
 .dshdg-tree-project { border-top: 1px solid var(--dshdg-line); margin-top: 12px; padding-top: 8px; }
 .dshdg-tree-project h4 { margin: 0; overflow-wrap: anywhere; }
 .dshdg-tree-project h4 small { font-weight: normal; }
@@ -277,6 +321,26 @@ export const CSS_TEXT = `
 .dshdg-tree-round-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
 .dshdg-tree-round-head > span { overflow-wrap: anywhere; min-width: 0; }
 .dshdg-tree-round-head button { padding: 1px 8px; font-size: 12px; }
+/* ---- task-record cleanup ---------------------------------------------------
+   One bar above the tree while selection mode is on, one checkbox line per
+   execution chain, and a confirmation block that wraps instead of squeezing. The
+   warning keeps the error colour because the action is irreversible. */
+.dshdg-cleanup-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-block: 8px;
+  padding: 8px;
+  border: 1px solid var(--dsw-alias-border-l2, #e2e5e9);
+  border-radius: 6px;
+  min-width: 0;
+}
+.dshdg-cleanup-bar p { margin: 0; overflow-wrap: anywhere; }
+.dshdg-cleanup-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; padding: 2px 0; }
+.dshdg-cleanup-check { display: inline-flex; gap: 6px; align-items: center; min-width: 0; }
+.dshdg-cleanup-row span { overflow-wrap: anywhere; min-width: 0; }
+.dshdg-cleanup-bar .dshdg-row { flex-wrap: wrap; }
+
 @media (max-width: 560px) {
   /* Narrow window: halve the indent so the deepest level still leaves room for
      text, and let the round controls wrap under the title instead of squeezing. */
@@ -337,6 +401,193 @@ export const CSS_TEXT = `
 .dshdg-nav-toggle-row { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
 .dshdg-nav-archived { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .dshdg-nav-icon { display: block; }
+/* ---- grouped workspaces browser (sidebar.workspaces) -----------------------
+   This block renders in the shell's workspace cell, which the shell sizes. It
+   therefore assumes NOTHING about width: every row is a wrapping flex line, a
+   title shrinks and ellipsises, and the actions wrap under the title rather than
+   pushing the row wider. Colours, radii and fonts are the shell's own tokens, so
+   the tree follows light/dark and the shared menu blur without a second theme. */
+.dshdg-ws {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  color: var(--dsw-alias-label-primary, #1f2329);
+  font-family: var(--dsw-font-family, system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.dshdg-ws * { box-sizing: border-box; }
+.dshdg-ws p { margin: 0; }
+.dshdg-ws-tree, .dshdg-ws-projects, .dshdg-ws-workspaces, .dshdg-ws-sessions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+.dshdg-ws-tree, .dshdg-ws-projects, .dshdg-ws-workspaces, .dshdg-ws-sessions { display: flex; flex-direction: column; gap: 1px; }
+/* One indent step per level, and the same dashed guide the task tree uses, so the two
+   trees read as one product without sharing a component. */
+.dshdg-ws-projects, .dshdg-ws-workspaces, .dshdg-ws-sessions {
+  margin-inline-start: 0.9em;
+  padding-inline-start: 8px;
+  border-inline-start: 1px dashed var(--dsw-alias-border-l2, #e2e5e9);
+}
+.dshdg-ws-row { display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; min-width: 0; padding: 2px 0; }
+.dshdg-ws-caret {
+  flex: 0 0 auto;
+  width: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.75;
+}
+.dshdg-ws-caret:hover { opacity: 1; }
+.dshdg-ws-title {
+  flex: 1 1 5em;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dshdg-ws-title:hover { text-decoration: underline; }
+.dshdg-ws-root-row .dshdg-ws-title { font-weight: 600; }
+.dshdg-ws-project-row .dshdg-ws-title { font-weight: 500; }
+.dshdg-ws-workspace .dshdg-ws-title { font-weight: 400; }
+.dshdg-ws-count { flex: 0 1 auto; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8a9098); }
+.dshdg-ws-spacer { flex: 1 1 auto; }
+.dshdg-ws-actions { display: inline-flex; flex-wrap: wrap; gap: 2px; min-width: 0; }
+.dshdg-ws button + button { margin: 0; }
+.dshdg-ws-actions button, .dshdg-ws-session-action {
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 18px;
+  border: 1px solid var(--dsw-alias-border-l2, #e2e5e9);
+  border-radius: var(--dsw-radius-sm, 6px);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.dshdg-ws-actions button:hover:not(:disabled), .dshdg-ws-session-action:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover, #e9ebee);
+}
+.dshdg-ws-actions button:disabled, .dshdg-ws-session-action:disabled { opacity: 0.45; cursor: not-allowed; }
+.dshdg-ws-session { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; min-width: 0; }
+.dshdg-ws-open {
+  display: flex;
+  flex: 1 1 5em;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: var(--dsw-radius-sm, 6px);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.dshdg-ws-open:hover:not(:disabled) { background: var(--dsw-alias-interactive-bg-hover, #e9ebee); }
+.dshdg-ws-open:disabled { cursor: not-allowed; opacity: 0.6; }
+.dshdg-ws-session-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dshdg-ws-badge {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border-l3, #d3d7dd);
+  font-size: 10px;
+  color: var(--dsw-alias-label-secondary, #61666d);
+}
+/* ---- the per-session marker inside a NATIVE sidebar row --------------------
+   Rendered through the host's published child slot (sidebar.workspaces.session.row.action),
+   so it sits inside the host's own row. Deliberately tiny and quiet: the operator sees a native
+   row with one extra word, never a restyled or reordered one. Host density is respected — the
+   host's own row actions are icon buttons, so this only adds an inline label. */
+.dshdg-row-marker {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border-radius: var(--dsw-radius-sm, 4px);
+  border: 1px solid var(--dsw-alias-border-l3, #d3d7dd);
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--dsw-alias-label-secondary, #61666d);
+  white-space: nowrap;
+  user-select: none;
+}
+.dshdg-row-marker[data-dshdg-row-marker-isolation="worktree"] {
+  border-color: var(--dsw-alias-state-business-primary, #12b76a);
+  color: var(--dsw-alias-state-business-primary, #12b76a);
+}
+/* ---- the plugin's own grouping surface ------------------------------------
+   This is drawn on the plugin's OWN panel, not inside the shell's workspace cell, so it may use
+   a full title row; it still wraps instead of pushing a control off a narrow sidebar. */
+.dshdg-ws { display: flex; flex-direction: column; min-width: 0; }
+.dshdg-ws-section {
+  padding: 6px 0 2px;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary, #8a9098);
+}
+/* A project's action bar: the Workspace target picker plus its operations. Both wrap under the
+   title so a narrow sidebar never pushes a control off-screen, and the picker is a CONTROL, not
+   a level: it stays on the project's own row block. */
+.dshdg-ws-project-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: center;
+  min-width: 0;
+  margin-inline-start: 1.4em;
+  padding: 1px 0 3px;
+}
+.dshdg-ws-target { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; min-width: 0; }
+.dshdg-ws-target select {
+  max-width: 14em;
+  min-width: 0;
+  padding: 0 4px;
+  font: inherit;
+  font-size: 11px;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--dsw-alias-border-l2, #e2e5e9);
+  border-radius: var(--dsw-radius-sm, 6px);
+}
+/* The conversations of one project: one indent step, and the same dashed guide as the
+   Workspace rows, so the three levels read as one tree. */
+.dshdg-ws-conversations {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  margin-inline-start: 1.4em;
+  padding-inline-start: 8px;
+  border-inline-start: 1px dashed var(--dsw-alias-border-l2, #e2e5e9);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.dshdg-ws-faint { color: var(--dsw-alias-label-tertiary, #8a9098); font-size: 10px; }
+.dshdg-ws-empty { padding: 2px 4px; font-size: 12px; color: var(--dsw-alias-label-tertiary, #8a9098); }
+.dshdg-ws-hint { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8a9098); padding: 0 2px; }
+.dshdg-ws-warn { font-size: 11px; color: var(--dsw-alias-label-error, #d92d20); padding: 0 2px; }
+.dshdg-ws-archived > summary { cursor: pointer; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8a9098); }
+.dshdg-ws:focus-visible, .dshdg-ws button:focus-visible {
+  outline: var(--dsw-focus-ring-width, 2px) solid var(--dsw-focus-ring-color, #3457d5);
+  outline-offset: 1px;
+}
 `;
 
 /**

@@ -1,14 +1,14 @@
 # Runtime compatibility
 
-Build 1.6.0 retains the loading policy introduced in 1.4.2: **no DSH version whitelist**: it omits `engines.dsh`, declares
+Build 1.7.0 retains the loading policy introduced in 1.4.2: **no DSH version whitelist**: it omits `engines.dsh`, declares
 host-provided `@deepseek-ai/dsh-*` peers as `*`, and publishes no DSH engine range
 in the custom plugin index. The plugin uses runtime capability checks rather than
 rejecting a host solely by its version number. Node.js `>=24` is still required.
 
 The historical runtime audits below describe the interfaces already implemented;
 they are not an exclusive admission list or a claim of end-to-end testing on every
-DSH build. See the [1.4.2 release notes](releases/1.4.2.zh.md) for this change,
-the [1.4.1 release notes](releases/1.4.1.zh.md) for review fixes, and the
+DSH build. See the [1.4.2 release notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.4.2.zh.md) for this change,
+the [1.4.1 release notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.4.1.zh.md) for review fixes, and the
 [1.3.1 release report](releases/1.3.1.zh.md) for historical distribution verification.
 
 `1.1.0` added silent waiting: the global `monitoring` thresholds (self-check and attention
@@ -32,7 +32,7 @@ not been installed into it. The 1.4.0 checks use isolated package installations 
 temporary Codex homes; they do not establish that the operator's production Desktop
 profile has been upgraded. The waiting-channel token comparison is measured separately
 and does not represent whole-task or billing savings. See the 1.4.0 Release notes and
-the [measurement report](releases/1.4.0-token-benchmark.zh.md) for their exact boundaries.
+the [measurement report](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.4.0-token-benchmark.zh.md) for their exact boundaries.
 An older production profile must
 be upgraded to this build, and the
 Codex companion refreshed from the settings page (or by the startup check, which now also
@@ -132,13 +132,6 @@ Rules that hold in **both** paths:
   prompt**, not a run under an unstated route. The plugin never reports a route it did
   not read back as "verified", and never claims a concrete reasoning effort for a
   selection that omitted one.
-- The **modern model-selection adapter applies to the optional reviewer as well**: the
-  review agent picks its own provider, model and effort through the same durable
-  selection surface. What is worker-only is the **sandbox policy and the per-call
-  permission bridge** — the reviewer is read-only, gets no bridge, and the worker's
-  `workspace-write` / `never`/`ask` contract is not applied to it.
-  "The policy and the bridge do not apply to review" is a statement about permissions,
-  not about model selection.
 - The approval stance is `ask` **only** for a run whose armed bridge is bound to the
   Agent it drives; every other run keeps `never`. Both stances are read back through
   `ctx.approval.effectivePolicy(session)` on both runtime generations, so an `ask`

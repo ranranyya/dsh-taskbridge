@@ -80,7 +80,8 @@ function fakeClientContext(options = {}) {
       },
       register(registerOptions, component) {
         registered.push({ options: registerOptions, component });
-        return () => {};
+        const entry = registered[registered.length - 1];
+        return () => { entry.disposed = true; };
       },
     },
     get(name) {
@@ -99,7 +100,11 @@ function installDom() {
     url: 'http://127.0.0.1:3210/',
     pretendToBeVisual: true,
   });
-  const keys = ['window', 'document', 'navigator', 'MouseEvent', 'Event', 'Node', 'KeyboardEvent', 'HTMLElement'];
+  const keys = ['window', 'document', 'navigator', 'MouseEvent', 'Event', 'Node', 'KeyboardEvent', 'HTMLElement',
+    // The bundle runs in a vm context over the Node globals, so a test in the SAME
+    // process must hand it the globals it reads, or scheduling (and its cleanup)
+    // would silently miss this realm.
+    'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'];
   const previous = new Map(keys.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
   const define = (key, value) => {
     Object.defineProperty(globalThis, key, { value, configurable: true, writable: true });
@@ -197,10 +202,62 @@ async function renderPanel(bundle, props) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// 1. Registration on the real slot names, and degradation without them
-// ---------------------------------------------------------------------------
+// G10: the TaskBridge view inside the shell's workspace region.
+//
+// The claims pinned here are the ones a reviewer can re-check in a real DSH:
+//   * every recorded task is listed, SHARED ones included, under the project its
+//     record names, and a continuation is one row with its rounds, not a second
+//     task;
+//   * a row opens only a session the host's own snapshot vouches for, through the
+//     same `openSession` call the native rows use;
+//   * a missing / archived session is still listed and says why it cannot open;
+//   * "原视图" hands the region back to the host's own `<slot>` view, and back;
+//   * the view issues no request of its own beyond the one initial list read.
 
+/** Render the workspace view into `#root` with the real bundle. */
+/** A host Workspace service double over a fixed snapshot. */
+function fakeWorkspaces(items, archived = []) {
+  const snapshot = { phase: 'ready', items, archivedSessionIds: archived, pinnedSessionIds: [] };
+  return {
+    list: { getSnapshot: () => snapshot, subscribe: () => () => {} },
+  };
+}
+
+/**
+ * The same double, answering with a FRESH object per read (what a foreign or older
+ * host may do). The view must still verify sessions instead of drifting to "unknown".
+ */
+/**
+ * A host Workspace service double whose published snapshot can CHANGE while the view
+ * is mounted - the case a real DSH produces when a Session starts after the sidebar
+ * has subscribed. `publish()` replaces the whole value (as DSH does) and notifies.
+ */
+/** A `uiWorkspace` double that records every open. */
+/**
+ * Two records in one real task-body shape: an isolated round continued by a second
+ * round, and a later shared task in the user's own project directory.
+ */
+/** Poll a predicate on real time (a background read is not driven by act()). */
+async function untilTrue(predicate, ms = 5000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    try {
+      if (await predicate() === true) return true;
+    } catch { /* re-check */ }
+    if (Date.now() > deadline) return false;
+    await new Promise((resolvePending) => { setTimeout(resolvePending, 100); });
+  }
+}
+
+/**
+
+/**
+ * A chain fixture whose rounds arrive NEWEST FIRST, as DSH's activity order does:
+ * round 1 created the session, round 2 continued it, round 3 failed before it ever
+ * created one (no session, no Workspace). One row must represent all three.
+ */
+/** A `slots` double that really registers, disposes and re-registers entries. */
+/** A per-call preference store, so the controller's memory is observable. */
 test('G08: `main` carries the full content panel and `sidebar.panellist` the small icon, sharing one id', async () => {
   const client = await loadClient();
   assert.deepEqual([...new Set(client.requests)].sort(), ['react', 'react/jsx-runtime'], 'still only platform modules');
@@ -285,14 +342,40 @@ test('G08: selecting the entry renders the icon in the row and the panel in main
   }
 });
 
-test('G08: `sidebar.workspaces` is never touched, so sibling plugins keep their slot', async () => {
+test('the real apply mounts NO task-record sidebar entry: no row, no panel', async () => {
   const client = await loadClient();
   const ctx = fakeClientContext();
+  client.client.apply(ctx);
+
+  const names = ctx.injections.map((entry) => entry.name);
+  // The requirement: the standalone 「TaskBridge 任务」 row is gone. `registerTasksNavigation`
+  // registers `main` (panel) AND `sidebar.panellist` (row) in one call, so BOTH must be absent
+  // from the real apply — keeping either would either restore the row or orphan a panel.
+  assert.equal(names.includes('sidebar.panellist'), false, 'no sidebar row is registered');
+  assert.equal(names.includes('main'), false, 'and no orphan content panel either');
+  // The sidebar keeps only the host's native tree plus this plugin's row marker.
+  assert.deepEqual(names, ['plugins.bundle.config', 'sidebar.workspaces.session.row.action'],
+    'apply injects the settings page and the published per-row child slot, nothing else');
+  // No effect mounts the record navigation.
+  assert.equal(ctx.effects.some((effect) => /sidebar navigation/u.test(effect.label)), false,
+    'the task-navigation effect is not mounted');
+  assert.ok(ctx.effects.some((effect) => /dispatched session marker/u.test(effect.label)),
+    'the native row marker still has its own effect');
+});
+
+test('the task-record entry stays a published, working helper even though apply does not mount it', async () => {
+  const client = await loadClient();
+  // Kept for compatibility (and for `lib/client.d.ts`): a caller that mounts it still gets the
+  // panel and the row, and a host without either slot still degrades to a no-op.
+  assert.equal(typeof client.client.registerTasksNavigation, 'function');
+  const ctx = fakeClientContext();
   client.client.registerTasksNavigation(ctx, {});
-  assert.ok(!ctx.injections.some((entry) => entry.name === 'sidebar.workspaces'),
-    'this bundle must not compete for the slot two public sibling plugins own');
-  const source = readFileSync(join(ROOT, 'lib', 'client.js'), 'utf8');
-  assert.doesNotMatch(source, /['"]sidebar\.workspaces['"]/u);
+  assert.deepEqual(ctx.injections.map((entry) => entry.name), ['main', 'sidebar.panellist']);
+  assert.equal(typeof client.client.TaskbridgeNavPanel, 'function', 'the panel component is still exported');
+
+  const bare = fakeClientContext({ noSlots: true });
+  assert.equal(typeof client.client.registerTasksNavigation(bare, {}), 'function');
+  assert.equal(bare.injections.length, 0);
 });
 
 test('G08: a host with no slots, or with only one of the two, still works and never throws', async () => {
@@ -305,20 +388,21 @@ test('G08: a host with no slots, or with only one of the two, still works and ne
   disposeBare();
   assert.equal(bare.injections.length, 0);
 
-  // (b) The host declares only `main`: the icon registers, the missing slot is skipped.
+  // (b) The host declares only `main`: the panel registers, the missing row slot is skipped.
   const half = fakeClientContext({ refuse: ['sidebar.panellist'] });
   const disposeHalf = client.client.registerTasksNavigation(half, {});
   assert.deepEqual(half.injections.map((entry) => entry.name), ['main']);
   disposeHalf();
 
-  // (c) `apply` keeps the settings page AND adds the navigation effect.
+  // (c) `apply` keeps the settings page and the native row marker, and mounts nothing else.
   const ctx = fakeClientContext();
   client.client.apply(ctx);
   assert.ok(ctx.injections.some((entry) => entry.name === 'plugins.bundle.config'),
     'the plugins-manager page is still registered on the same context');
-  assert.ok(ctx.injections.some((entry) => entry.name === 'main'));
-  assert.ok(ctx.injections.some((entry) => entry.name === 'sidebar.panellist'));
-  assert.ok(ctx.effects.some((effect) => /sidebar navigation/u.test(effect.label)), 'the navigation has its own effect');
+  assert.ok(ctx.injections.some((entry) => entry.name === 'sidebar.workspaces.session.row.action'),
+    'the native session-row marker is still registered');
+  assert.equal(ctx.injections.some((entry) => entry.name === 'main'), false);
+  assert.equal(ctx.injections.some((entry) => entry.name === 'sidebar.panellist'), false);
 });
 
 test('G08: the workspace service is taken from `ctx.get` and a host without it degrades to null', async () => {
@@ -929,7 +1013,7 @@ test('G08 DOM: a refused list read is stated, and the panel survives a slot with
 // 5. The task tree page is unchanged by all of this
 // ---------------------------------------------------------------------------
 
-test('G08: the task tree page still renders from the same bundle, and the navigation added no tree logic to it', async () => {
+test('G08: task records open the recent table and keep the project tree available', async () => {
   const dom = installDom();
   const apiModule = await import('../src/client/api.js');
   // A full-enough user-plane double: this test opens the REAL settings page, whose
@@ -980,7 +1064,10 @@ test('G08: the task tree page still renders from the same bundle, and the naviga
       tab.dispatchEvent(new globalThis.MouseEvent('click', { bubbles: true, cancelable: true }));
     });
     await settle(act);
-    assert.ok(root.querySelector('[data-dshdg-task-tree]') !== null, 'the G09 tree is untouched');
+    assert.ok(root.querySelector('[data-dshdg-records-table]'), 'the default is the recent records table');
+    const treeButton = root.querySelector('[data-dshdg-record-view="tree"]');
+    await act(async () => { treeButton.click(); });
+    assert.ok(root.querySelector('[data-dshdg-task-tree]') !== null, 'the project tree is still available');
     const nodes = [...root.querySelectorAll('[data-dshdg-tree-node]')].map((node) => node.getAttribute('data-dshdg-tree-node'));
     for (const nodeId of ['plan-goal', 'plan-ui', 'plan-orphan', 'task-legacy']) {
       assert.ok(nodes.includes(nodeId), `the tree still shows ${nodeId}`);

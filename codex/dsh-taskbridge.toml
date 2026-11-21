@@ -1,7 +1,7 @@
 # dsh-taskbridge Codex companion — managed by the DSH TaskBridge plugin settings page.
 # Editing this file turns it into an operator-owned file: the plugin then never
 # overwrites or removes it, and reports it as "modified" instead.
-version = "1.6.0"
+version = "1.7.0"
 
 name = "dsh-taskbridge"
 description = "Dispatch an explicitly assigned implementation task to DSH through the dsh-taskbridge MCP tools, then return evidence for Codex review."
@@ -49,7 +49,9 @@ P0: COMMANDER-OWNED PLANNING AND WORK PACKETS (for authorized implementation tas
    into one conversation merely to keep context or avoid another preflight.
 5. Parallel packets require independent work, explicit non-conflicting ownership,
    and permission under the operator's request and the repository's AGENTS.md. Do
-   not enable Agent Teams by default. The operator still selects provider, model
+   not enable Agent Teams on your own initiative: the user controls the TaskBridge
+   default ("新任务默认开启智能体协作") and may state a choice for one dispatch; rule 4a
+   governs it. The operator still selects provider, model
    and reasoning effort; smaller packets never authorize a different execution route.
 6. A blocker or a design question outside the packet goes back to the commander.
    The worker must not expand its scope, execute the remaining roadmap, or become
@@ -74,12 +76,12 @@ DISPATCH (only for an explicitly assigned implementation task)
    `delegate_preflight` with the exact authorized workspace path as
    `workspacePath`. `delegate_status` reports whether delegation is enabled at all;
    `delegate_preflight` reports what the workspace actually looks like and which
-   isolation it implies. If either call fails, the tool is unavailable, the switch
-   is off, or the answer is ambiguous, stop and report the exact bounded refusal.
-   Never open the switch yourself, and never reach for DSH Crew, another endpoint,
-   another provider or local execution as a substitute.
-   A `delegate_status` answer that says the switch is off ends the dispatch here:
-   the preflight may still be read for reporting, but nothing may be submitted.
+   isolation it implies. For a temporary connection failure, apply rule 6c to the
+   failing check. If the switch is off, a required capability is missing, or a refusal
+   is confirmed, report the reason and checkpoint to Codex, then pause until that
+   prerequisite changes. If the answer is ambiguous, establish the facts with a
+   read-only check before submitting. Report the exact bounded evidence to Codex.
+   Never open the switch yourself or fall back to DSH Crew or another execution route.
 2. APPLY THE ISOLATION DECISION. `delegate_preflight` answers with an `isolation`
    of `worktree`, `shared` or `block` and a stable `reason` code.
    2a. PREFLIGHT IS PER CHAIN, NOT PER DISPATCH. Preflight a NEW task as above.
@@ -137,33 +139,62 @@ DISPATCH (only for an explicitly assigned implementation task)
    override apply. For a `shared` decision, pass only
    `overrides = { isolation = "shared" }`; this per-task isolation override is
    required because the plugin may still be configured for `worktree`. Never
-   override the configured provider, model, reasoning effort or timeout, and never
+   override the configured provider, model or reasoning effort, and never
    encode a route in the task prompt. `allowShared` on the preflight records the
    decision but does not change the submitted job's isolation by itself.
-4a. AGENT TEAMS IS YOUR DECISION, NOT THE OPERATOR'S. `delegate_submit` accepts an
-   optional boolean `agentTeams`: it selects DSH's Agent Teams mode
-   ("启用智能体团队协作", the switch in the DSH model menu) for THIS task's own DSH
-   Session. It is NOT Codex's own multi-agent feature and NOT the additional review
-   model. The operator decides ONCE that you choose per task; do not ask them per
-   dispatch.
-   - Simple single-file or strongly sequential work: turn it OFF EXPLICITLY with
-     `agentTeams: false` whenever the loaded schema accepts the field. OMITTING the field
-     is NOT "off": an omitted value makes no new decision, so the run keeps (or, on a
-     continuation, inherits) whatever selection the Session already has. A repository
-     whose AGENTS.md forbids delegating again must send `false` and state which actions
-     the ROOT execution must perform instead (those still need normal approval).
-   - Turn it on only when the work genuinely splits into independent modules that can
-     proceed in parallel AND the gain clearly covers the coordination cost. Say the
-     reason in the dispatch text.
-   - A continuation does not re-decide it: the plugin inherits the chain's choice, so an
-     omitted value on a follow-up keeps the parent's mode. Pass `agentTeams: false`
-     explicitly when you want THIS follow-up off, and an explicit value when the scope
-     changed enough to justify flipping it.
+4z. NO TOTAL EXECUTION DEADLINE. The plugin's settings page no longer offers an
+   execution timeout and a normal delegated run is NOT bounded by one: a long but
+   healthy task keeps running, and only `delegate_cancel` stops it. Silence and
+   duration are reported through the monitoring reminders below, never turned into
+   a failure. `overrides.timeoutSeconds` still exists as an explicit per-job cap; do
+   NOT send it unless the operator asked for one, and never send it just because a
+   task feels long. A run that ends with `JOB_TIMEOUT` therefore had an explicit cap,
+   not the plugin's default.
+4a. FOLLOW THE USER'S CHOICE FOR AGENT TEAMS.
+   `delegate_submit` accepts an optional boolean `agentTeams`: it selects DSH's Agent
+   Teams mode ("启用智能体团队协作", the same switch the DSH model menu exposes) for THIS
+   task's own DSH Session. TaskBridge also has ONE operator setting, "新任务默认开启智能体
+   协作" (off on a fresh install and after an upgrade), which the user controls in the
+   plugin's settings page. You do not control that setting and must never try to.
+   - FIRST, check whether the user stated a choice for THIS dispatch. If they did, send
+     exactly that value (`true` or `false`). An explicit value always wins over the
+     TaskBridge default.
+   - If the user stated no choice, OMIT the field and do not set it in `overrides`.
+     A NEW task follows the user's TaskBridge default, which the plugin records as
+     `agentTeamsOrigin: "settings-default"`. A follow-up
+     (`continueFromTaskId`) inherits the choice the task it continues ran with and
+     records `agentTeamsOrigin: "continuation"`; if that task recorded no choice at all
+     (an older record), the plugin applies nothing, writes nothing, and the Session keeps
+     the mode it already has.
+   - Send an explicit value only for the user's choice for this dispatch. Keep restrictions
+     on submitting additional TaskBridge jobs in force. A repository rule that expressly
+     governs DSH Agent Teams also applies. Surface any conflict with the user's choice
+     before dispatch so it does not become a silent override.
+   - A continuation does not re-decide it. An omitted value keeps the parent's mode; pass
+     an explicit `true`/`false` only when the user asked for a change in THIS follow-up.
+   - A choice that cannot be applied is REFUSED, not downgraded. On a DSH with no
+     agent-teams service, an explicit `true` OR an explicit `false` — and an inherited
+     chain choice — stops BEFORE the prompt and the task records why (`team.reason`).
+     Report that refusal; never retry with a different value, never claim success. The
+     ONE exception is the user's implicit off default: an ordinary dispatch that nobody
+     asked to change still runs on an older DSH, and it reports `applied: false` (NOT
+     "off") because nothing confirmed the Session state. Do not describe that run as
+     "teams turned off".
+   - Prove it from the record, never from assumption: `agentTeams` is the choice that was
+     applied, `agentTeamsOrigin` says where it came from (`request`, `continuation`,
+     `settings-default`) and `team` says what DSH confirmed (`applied`, `enabled`) or why
+     it could not (`reason`). "Requested" and "applied" are different facts; report the
+     applied one.
+   - ONE OUTER TASK = ONE Session and ONE concurrency slot. Enabling teams does not add a
+     slot and does not create a second task; DSH's inner team members are managed inside
+     the same Session and are not counted by TaskBridge's parallelism. Do not submit extra
+     tasks to "give the team more lanes".
    - Execution provider/model/effort remain the operator's configuration. `agentTeams`
      never overrides them, and you never encode a model in it.
    - Express it ONLY through this schema field. If the loaded tool version does not
      accept `agentTeams`, say so and ask for the newer integration — never fake success,
      never route it through another field, the task prompt or a different channel.
+   - Cancellation is unaffected: `delegate_cancel` works the same with teams on or off.
    - Team members run under DSH's native policy (their own approvals default to
      `never`), so they only do what is already permitted. A concrete action that needs
      more permission must be done by the ROOT execution and decided through this
@@ -172,8 +203,10 @@ DISPATCH (only for an explicitly assigned implementation task)
 4b. TASK THREADS. Every submission starts a NEW DSH task conversation by default,
    even in a previously used Workspace. This means a new Session, NOT necessarily a new
    native Workspace. Pass `continueFromTaskId` ONLY when this submission is a follow-up
-   to THAT same task: use the latest prior task id, its immediate predecessor, and keep the
-   same DSH Workspace and Session. Omit `continueFromTaskId` entirely for an unrelated task;
+   to THAT same task: use the latest prior task id that has a resumable Session, and
+   keep the same DSH Workspace and Session. Rule 6c covers attempts that ended before
+   reaching a Session.
+   Omit `continueFromTaskId` entirely for an unrelated task;
    never reuse a task just to keep context. Unknown, running,
    removed, differently-sourced or failed-without-conversation parents are refused.
    Submit the ORIGINAL authorized source `workspacePath`, never `execution.workspacePath`.
@@ -207,17 +240,22 @@ DISPATCH (only for an explicitly assigned implementation task)
    raising it — when a wait ends you simply call it again on the same taskId.
    A shorter explicit `waitSeconds` is legal but is only for a one-off diagnostic the
    operator explicitly asked for; it is never the normal loop.
-5a0. FOUR DIFFERENT THINGS, never conflated.
+5a0. FIVE DIFFERENT THINGS, never conflated.
    - `wait-limit` — THIS call's own wait budget ran out and nothing changed. Wait again
      on the same taskId. Not a result, not a stall, not a task event.
    - An OUTER limit — your client handed the call back on its own tool/exec time limit.
      The MCP observation did not end and the worker did not stop. Continue the SAME exec
      cell and ask for the largest yield it supports (see 5d).
-   - `attention` — genuine inactivity: no real progress for the configured threshold
-     (ten minutes by default) while the task still runs. A question, not a verdict.
-   - The task's TOTAL execution timeout — the worker's own budget, which ends the run and
-     is reported as a terminal state. It is not `wait-limit`, not `attention` and not a
-     client-side event.
+   - `attention` — the run produced NO REAL PROGRESS for the configured interval (40
+     minutes by default) while it is still running. It is NOT reported because the task
+     has been running a long time: a task that keeps making progress never produces one,
+     however long it runs. See 5a1.
+   - A repeated-tool-failure reminder — an `attention` answer carrying a `failure` block.
+     Independent of any clock: a busy run can fail the same call over and over.
+   - There is NO default total execution timeout. The worker's own budget is unlimited
+     unless the operator asked for an explicit per-job cap; if such a cap fires it ends
+     the run and is reported as a terminal state (`JOB_TIMEOUT`). It is not `wait-limit`,
+     not `attention` and not a client-side event.
    A real hard failure is worth ONE de-duplicated reminder to the host. An ordinary
    single failing test inside the worker is the WORKER's job to diagnose and fix: it is
    not a host event, and you must not resubmit, cancel or take over for it.
@@ -237,20 +275,24 @@ DISPATCH (only for an explicitly assigned implementation task)
      never see this, because the tool re-issues internally. If you do see it, call
      `delegate_wait` on the SAME task again. Never treat it as progress, as a stall or
      as an excuse to submit anything.
-   - `attention`: the task has been COMPLETELY SILENT for longer than the configured
-     inactivity threshold (ten minutes by default). It does NOT mean an ordinary wait
-     ended — a wait ending is `wait-limit`, not `attention`. This is a QUESTION, not a
-     verdict. Read the compact diagnostic it returns (phase, last activity, current tool
-     and how long it has run, the self-check verdict, elapsed) and decide whether to keep
-     waiting. DEFAULT: keep waiting — call `delegate_wait` on the SAME task. Never cancel,
-     never mark the task failed, and never submit a replacement merely because a task is
-     quiet or because one tool or test has been running a long time. Only a concrete,
-     stated error justifies anything else, and then you report it instead of silently
-     restarting work.
-     If the same answer instead carries a `failure` block (`kind:
-     "repeated-tool-failure"`, with `eventId`, `toolName`, `failureCode`, `consecutive`), the
-     task is NOT silent: the worker has repeated ONE operation and failed the same way
-     several times in a row. That is a different situation and needs a different decision.
+   - `attention`: the task needs YOU. The answer's `checkpoint` field says which reminder
+     this is; read it before deciding anything. Neither reminder changes the task, and
+     neither is a function of how long the task has been running.
+     (1) `checkpoint: "progress"` — the run progress check. The worker has shown NO REAL
+     PROGRESS for the configured interval (40 minutes by default) while the task is still
+     running. Real progress means model output, a reasoning step, a tool call or a tool
+     result; heartbeats, polls, page refreshes and the plugin's own self-check do NOT
+     count and never reset the clock. A task that keeps working for hours never produces
+     this, so do not read it as "this has taken too long". Read `progress` (phase, the
+     open tool, the silence span, the last self-check verdict) and check that the work
+     done so far still matches the goal. Then KEEP WAITING on the SAME taskId unless you
+     find a concrete error or a real drift from the goal. The same silence is reported
+     ONCE: it will not repeat, and only real progress starts a new silence and a new
+     interval. Nothing was cancelled, restarted, resubmitted or re-queued.
+     (2) `checkpoint: "failure"` (with a `kind: "repeated-tool-failure"` `failure` block,
+     `eventId`, `toolName`, `failureCode`, `consecutive`): the worker has repeated ONE
+     operation and failed the same way several times in a row. That is a different
+     situation and needs a different decision.
      The SAME reminder (same `eventId`) is REDELIVERED on later waits until you acknowledge
      it, so a lost answer is never a lost reminder: do not read the repetition as several
      failures or new events; it is one notification you have not confirmed yet. After you
@@ -267,6 +309,10 @@ DISPATCH (only for an explicitly assigned implementation task)
      cancel, or write a follow-up that gives the worker the missing information. Do not
      repeat the identical instruction and hope for another outcome, and do not take the
      reminder itself as proof the task can never succeed.
+     The plugin is LOCAL: it never wakes an offline Codex. If you are not waiting, the
+     self-check and the reminder are still recorded, and the next `delegate_wait` or
+     `delegate_result` on the same task reads them — a due reminder reaches you when you
+     resume observing, not as a background notification.
    - `permission`: the worker is PAUSED on one native tool call awaiting YOUR
      decision. This is not a stall and not a failure. Do not submit a duplicate and do
      not cancel it merely because it waits.
@@ -403,10 +449,10 @@ DISPATCH (only for an explicitly assigned implementation task)
      Reviewing is done in ONE pass per delivery: do not call `delegate_review` to
      "check in" while the run is still going, and do not review the same result more
      than once.
-   - `failed`, `cancelled`: the run ended without deliverables. Call
-     `delegate_result` ONCE for the same task to read the recorded reason, then report
-     it. Do not resubmit identical work hoping for a different result; if a correction
-     is genuinely needed, see rule 5b.
+   - `failed`, `cancelled`: the run ended and may have left partial edits. Call
+     `delegate_result` ONCE for the same task and report the recorded reason to Codex.
+     Apply rule 6c for a confirmed transient DSH execution failure. An intentional
+     cancellation ends the run. For a correction to a reviewed delivery, use rule 5c.
    - `interrupted`: the wait itself was cut off (transport hiccup, dropped connection,
      tool restart). It does NOT mean the execution stopped, and one call returns it at
      once instead of looping, so read the answer's own fields:
@@ -416,6 +462,8 @@ DISPATCH (only for an explicitly assigned implementation task)
      - `terminal: true` and `state: "interrupted"`: the TASK record itself is interrupted
        (a process restart left it that way). It will not resume, so read
        `delegate_result` once and report; do not keep calling `delegate_wait` on it.
+       Use rule 6c if the evidence supports a transient DSH failure. Keep the original
+       Session if it can be continued.
      - `terminal: false` with no state, an unrecognized state, or a state that
        contradicts the record: do NOT assume it is still running and do NOT assume it
        stopped. Keep the taskId, and FIRST check one fact with `delegate_result` (state,
@@ -457,9 +505,9 @@ DISPATCH (only for an explicitly assigned implementation task)
      delegated run. Do not use it to "unblock" a wait you merely find long.
 5c. CORRECTIONS AND FOLLOW-UPS. A requested change, correction or retry that belongs
    to the SAME task is submitted as a follow-up: `continueFromTaskId` set to the
-   latest task id in that chain, and the SAME authorized source `workspacePath` used
-   for both preflight and submit. Then call `delegate_wait` on the NEW task id and
-   follow the reasons again. Never submit a correction as an unrelated new task to
+   latest resumable task id in that chain. Use the SAME authorized source `workspacePath`
+   for preflight and submit. Then call `delegate_wait` on the NEW task id and follow the
+   reasons again. Never submit a correction as an unrelated new task to
    escape a long wait, and never reuse an id to "keep context".
 5d. OUTER WAIT: WHEN YOUR HOST TAKES THE CALL BACK. Your host, not this plugin,
    decides how long one tool call may occupy your turn. A `delegate_wait` can be
@@ -506,16 +554,39 @@ DISPATCH (only for an explicitly assigned implementation task)
    used, quoting the reason code, and state whether the run started a new
    conversation or continued `continueFromTaskId`. If a result fails because of
    isolation, do not re-submit under a weaker isolation on your own initiative.
-6b. WHEN YOU ARE BLOCKED. If a required tool, interface or capability is missing — or
-   you have made the same failing attempt twice without new information — STOP and
-   deliver the boundary instead of widening the request or retrying blindly. Report,
-   in this order: what you were asked to do; the exact bounded evidence you have
-   (error codes, refusal messages, the commands you ran); what you cannot do and WHY
-   the interface makes it impossible; and the concrete decision or missing permission
-   you need from the operator. Do not invent an interface, do not substitute a
-   different tool silently, do not loop on an attempt that already failed, and do not
-   turn "I could not" into an unstated silent workaround. A short honest blocked
-   report is a successful outcome; a fabricated success is not.
+6b. WHEN YOU ARE BLOCKED. Apply rule 6c to transient DSH unavailability. For other
+   blockers, stop if a required capability is absent or the same attempt has failed
+   twice without new information. Report the requested work, the exact bounded evidence,
+   what is blocked, and what must change for work to resume.
+
+6c. DSH OUTAGE, RETRY, AND RESUME.
+   - For a transient DSH connection or execution failure, such as an upstream 502/503,
+     DNS failure, or transport error, make up to three sequential retries after the
+     initial failure. Allow a short delay between retries. Codex owns one counter per
+     work packet across direct calls and this companion. Use only the remaining
+     allowance and report the result of each attempt. A successful retry continues the
+     work. An enabled delegation switch confirms authorization only.
+   - Retry the failing stage. For an unconfirmed submission, use read-only facts to
+     reconcile the receipt and state. If the task is still live, wait on the same task
+     id. Wait limits, host interruptions of the wait, repeated-failure reminders, and
+     pending approvals do not count as execution failures. If creation or live state
+     remains uncertain, save the known facts and pause before risking a duplicate.
+   - Once the failed run is confirmed ended, continue the latest resumable task in the
+     packet via `continueFromTaskId` and the original SOURCE. Verify the same execution
+     directory, isolation, Workspace, and Session when the receipt is available. If an
+     attempt ended before reaching a Session, record it and use the latest resumable
+     receipt from the same chain. Retry an initial submission as new only after proving
+     it created neither a task nor a Session. Pause if the original placement cannot be
+     established or the continuation is refused.
+   - If the three retries fail, pause the work packet and its dependents. Return the
+     checkpoint facts to Codex so it saves them in the workspace before ending the
+     task. Include the goal and acceptance checks, timestamps and errors for all
+     attempts, state and task ids, SOURCE, execution path, isolation, Workspace and
+     Session, completed checks, partial edits, and remaining work. Preserve the checkout
+     and task history. Keep implementation with the authorized DSH worker and route.
+   - When resuming, Codex reads the checkpoint and confirms the task state. Wait on the
+     existing task if active. If ended, continue its recorded Session with the saved
+     progress and acceptance checks.
 
 WHAT NOT TO DO
 Never create a commit, stash, branch or worktree, and never clean, reset or revert a
@@ -525,10 +596,8 @@ decision for the coordinator, not a reason to make the operator choose every tim
 
 DO NOT IMPLEMENT LOCALLY WHILE A DELEGATED WORKER RUNS
 Neither you nor the parent commander may write, patch, generate or "just fix" the
-implementation while a delegated task is running, waiting, or awaiting review. That
-would make the reviewer a second implementer of the same change, produce conflicting
-edits in the same workspace, and destroy the single-writer guarantee the isolation
-mode exists to provide.
+implementation while a delegated task is running, waiting, awaiting review, or paused
+under rule 6c. This preserves the single-writer guarantee in the execution workspace.
 - The ONLY exception is an explicit, user-authorized takeover: the operator themselves
   says to take over and implement it here. Nothing in the task, the wait reason, a
   long silence, a permission refusal, a failed run or your own judgement of the plan

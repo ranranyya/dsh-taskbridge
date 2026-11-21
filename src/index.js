@@ -29,7 +29,7 @@
 // `cannot set property "…" without provide` in Cordis, and provide/effect is what
 // makes the face disappear again on unload.
 
-import { mkdir } from 'node:fs/promises';
+import { mkdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -55,10 +55,9 @@ import { probeModel } from './model/probe.js';
 import { createExecutionHandler, EXECUTION_PREFIX } from './http/execution-plane.js';
 import { wrapUserPlaneRoutes } from './http/user-plane.js';
 import { diagnostic } from './runtime/agent-runner.js';
-import { SessionStore, liveControllerAccessor } from './runtime/session-placement.js';
+import { ensureWorkspace, SessionStore, liveControllerAccessor } from './runtime/session-placement.js';
 import { publishRuntimeEndpoint, resolveDefaultEndpointDiscoveryPath } from './runtime/endpoint-discovery.js';
 import { resolveCodexActionSeam } from './codex/seam.js';
-import { ReviewPreset } from './review/preset.js';
 import { configureDelegatedSession, policyServicesOf } from './runtime/sandbox.js';
 import { PermissionBridge, PERMISSION_DEFAULT_TIMEOUT_MS } from './runtime/permissions.js';
 import { QuestionBridge } from './runtime/questions.js';
@@ -104,9 +103,7 @@ export const Config = z.object({
  * Mount the delegation service.
  *
  * `config` is the operator's settings document and is validated by {@link Config}
- * before this runs. A test may additionally pass a `reviewPresetImporter`, which
- * replaces the solver used to find the native review tool packages; it is not
- * part of the published schema and a real deployment never provides one.
+ * before this runs.
  * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
  * @param {object} config - plugin config.
  * @returns {Promise<void>} resolves after registration.
@@ -167,32 +164,6 @@ export async function apply(ctx, config = {}) {
   // conversation. Stores identities only, never transcript content.
   const sessionStore = new SessionStore(dataDir, { logger });
 
-  // The independent review composes its own read-only agent preset instead of
-  // joining the deployment default (which mounts `dsh-tool-subagent`, a tool a
-  // scope restriction cannot remove). The composition is registered LAZILY on the
-  // first review request — the registry's own diagnostic may wait for the Host
-  // Loader tree to settle, and must not run inside this row's activation — and is
-  // removed again on unload by the effect below. It never touches the configured
-  // default, the installed profile, or a user preset.
-  const reviewPreset = new ReviewPreset({
-    registry: agentPresets,
-    logger,
-    ...(typeof config?.reviewPresetImporter === 'function' ? { importer: config.reviewPresetImporter } : {}),
-  });
-  const readPresets = () => ctx.get('agentPresets', false) ?? null;
-  const reviewPresets = {
-    /**
-     * A live facade so a registry that appears (or is replaced) after load is
-     * observed on the next review instead of being frozen at startup.
-     */
-    get id() { return reviewPreset.createdId; },
-    owns(id) { return reviewPreset.owns(id); },
-    preparation: (bounds) => {
-      reviewPreset.attach(readPresets());
-      return reviewPreset.preparation(bounds ?? {});
-    },
-  };
-
   /**
    * Report a native controller whose read was refused, on the plugin's logger.
    *
@@ -209,10 +180,49 @@ export async function apply(ctx, config = {}) {
     logger?.warn?.(`dsh-delegate: the DSH ${serviceName} could not be read (${diagnostic(error?.message ?? error, 200)})`);
   };
 
+  // DSH's Workspace Tree computes parents from registered directories. The plugin
+  // already puts isolated checkouts below this root, so no task directory moves.
+  //
+  // The root is the managed worktrees directory the manager itself owns
+  // (`<data>/dsh-delegate/worktrees`), which `WorktreeManager.ensureRoot` creates with
+  // the same 0o700 mode a first isolated run would use — nothing from an earlier
+  // version has to move, and no user Workspace is renamed or reparented. Registering it
+  // is what makes DSH's own "按工作区树" (视图选项 → 分组方式) nest every isolated task
+  // Workspace under one TaskBridge group; the plugin never draws that tree itself.
+  //
+  // Registration is idempotent and reversible: one pending attempt at a time, a success
+  // is remembered (so a later failure cannot loop), and the disposer forgets it. It
+  // never deletes a Workspace, so no user data is touched.
+  let worktreeWorkspaceRegistration = null;
+  let worktreeWorkspaceRegistered = false;
+  function registerWorktreeWorkspace() {
+    if (worktreeWorkspaceRegistered) return Promise.resolve({ registered: true });
+    if (worktreeWorkspaceRegistration !== null) return worktreeWorkspaceRegistration;
+    worktreeWorkspaceRegistration = (async () => {
+      try {
+        const workspaces = deps.workspaces.current;
+        if (typeof workspaces?.create !== 'function') return { registered: false, reason: 'WORKSPACES_UNAVAILABLE' };
+        // Create-if-missing, then resolve: DSH compares real paths when it derives the
+        // tree, and every containment check below already works on real paths.
+        const path = await worktrees.ensureRoot();
+        if (!(await stat(path)).isDirectory()) return { registered: false, reason: 'ROOT_NOT_A_DIRECTORY' };
+        const workspace = await ensureWorkspace(workspaces, path, 'TaskBridge');
+        if (workspace.namingError) logger?.warn?.('dsh-delegate: could not name the TaskBridge workspace', workspace.namingError);
+        worktreeWorkspaceRegistered = true;
+        return { registered: true, workspaceId: workspace.workspaceId, path };
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          logger?.warn?.('dsh-delegate: could not register the TaskBridge workspace', diagnostic(error?.message ?? error, 200));
+        }
+        return { registered: false, reason: typeof error?.code === 'string' ? error.code : 'REGISTRATION_FAILED' };
+      }
+    })().finally(() => { worktreeWorkspaceRegistration = null; });
+    return worktreeWorkspaceRegistration;
+  }
+
   const deps = {
     agents: ctx.agents,
     agentPresets,
-    reviewPresets,
     sessions: ctx.sessions,
     // The native Workspace and Session controllers. Both are read non-strictly
     // and, more importantly, LAZILY: a harness that does not compose them must
@@ -238,6 +248,7 @@ export async function apply(ctx, config = {}) {
     locks,
     runGit,
     worktrees,
+    registerWorktreeWorkspace,
     history,
     plans,
     taskDisplay,
@@ -256,8 +267,6 @@ export async function apply(ctx, config = {}) {
       // always has a place to keep the original bytes.
       backupDir: join(dataDir, 'codex-config-backup'),
     }),
-    // The runner calls this only for worker jobs. Reviews intentionally use their
-    // own read-only tool policy and are not put into a delegated worker sandbox.
     configureDelegatedSession,
     // `ctx.sandboxPolicy` and `ctx.approval` own the two facts the delegated
     // policy writes, so the runner reads them back through these live services
@@ -458,9 +467,6 @@ export async function apply(ctx, config = {}) {
     // a directory-level mode to configure.
     conversation: 'per-task',
     conversationContinuation: 'continueFromTaskId',
-    // Whether the review's own composition was ever registered, i.e. whether a
-    // read-only review has been attempted in this activation. Lazy by design.
-    reviewPreset: reviewPreset.createdId ?? 'not-registered',
   });
 
   // ---- user plane: authenticated DSH settings and task controls --------------
@@ -502,12 +508,15 @@ export async function apply(ctx, config = {}) {
     );
   }
 
+  // Register the managed root at every activation, so a fresh install (no worktree yet)
+  // gets the TaskBridge group too, and an upgrade groups the child Workspaces that
+  // already exist under it. An isolate that has not created its tree is what this makes
+  // possible: the directory is created inside the plugin's own managed data directory.
+  void registerWorktreeWorkspace();
+
   // ---- stop everything on unload ------------------------------------------
   ctx.effect(() => async () => {
     await engine.dispose();
-    // Jobs are gone before the review composition is: a disposed engine holds no
-    // runner that could mount a preset this disposer is about to remove.
-    await reviewPreset.dispose();
     // History is flushed before the store is closed so a task that finished during
     // teardown is still durable. The session map is flushed on the same terms.
     await history.dispose();
@@ -535,7 +544,6 @@ export async function apply(ctx, config = {}) {
     providerRegistry,
     credentials,
     deps,
-    reviewPreset,
   });
 }
 

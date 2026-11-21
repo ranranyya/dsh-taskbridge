@@ -346,12 +346,18 @@ export const TOOLS = Object.freeze([
           type: 'boolean',
           description: 'OPTIONAL. Your Agent Teams decision for THIS task\u2019s own DSH Session: the same switch the '
             + 'DSH model menu exposes as \u300cUse Agent Teams\u300d/\u300c\u542f\u7528\u667a\u80fd\u4f53\u56e2\u961f\u534f\u4f5c\u300d. '
-            + 'The plugin applies it to this run only and never opens a global default. Use `true` only when independent '
-            + 'modules can proceed in parallel and the gain covers the coordination cost; single-file work and '
-            + 'strongly ordered changes should stay `false`. Omit it to make no choice: the run then keeps whatever '
-            + 'selection the Session already has. Teams never replaces your approval or your final review, and this '
-            + 'flag never selects a model or an effort \u2014 those come from the task\u2019s frozen configuration. The task '
-            + 'record reports `agentTeams` (your request) and `team` (what DSH confirmed, or why it could not).',
+            + 'Send `true` or `false` only when the operator chooses a mode for this task. An explicit value wins over the operator\u2019s '
+            + 'TaskBridge default. Leave it absent, including inside overrides, when the operator leaves it unspecified. A new task follows the operator\u2019s '
+            + '\u300c\u65b0\u4efb\u52a1\u9ed8\u8ba4\u5f00\u542f\u667a\u80fd\u4f53\u534f\u4f5c\u300d setting (off on a fresh install and after an '
+            + 'upgrade), and a follow-up (`continueFromTaskId`) keeps the mode the task it continues ran with \u2014 if that '
+            + 'task recorded none, its Session keeps the existing mode. '
+            + 'The plugin applies it to this run only and never opens a global default. Teams never replaces your '
+            + 'approval or your final review, and this flag never selects a model or an effort \u2014 those come from the '
+            + 'task\u2019s frozen configuration. On a DSH without agent-teams support, an explicit `true` or `false` is '
+            + 'REFUSED (the worker is not prompted and the task records why); only the operator\u2019s implicit off default '
+            + 'still runs, reported as not applied. The task record reports `agentTeams` (the choice that was '
+            + 'applied), `agentTeamsOrigin` (`request`, `continuation` or `settings-default`) and `team` (what DSH '
+            + 'confirmed, or why it could not).',
         },
         continueFromTaskId: {
           type: 'string',
@@ -1843,8 +1849,10 @@ function skeletonize(task, path, cap, collect, stage = {}) {
   for (const key of ['taskId', 'state', 'phase', 'route', 'reviewRoute', 'reviewRouteError', 'execution', 'error',
     'hostAcceptance', 'selfApproved', 'cancelledBy', 'createdAt', 'endedAt',
     // The Agent Teams verdict is four booleans and a short reason: it survives every
-    // bound so a compressed answer still says whether teams are on for this run.
-    'agentTeams', 'team']) {
+    // bound so a compressed answer still says whether teams are on for this run. The
+    // origin is one closed word, and it is what separates "you asked for this" from
+    // "the operator's new-task default decided it".
+    'agentTeams', 'agentTeamsOrigin', 'team']) {
     if (key === 'hostAcceptance') {
       // Projected directly from the uncut review block so the generic per-string cap never
       // shortens `completionSummary` or `note` before their field-specific rules run.

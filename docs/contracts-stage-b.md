@@ -414,10 +414,10 @@ route that does not exist.
 2. **执行设置** — `settings.worker` inside the same document, bounded by
    `catalog[].models[].efforts` for effort and by the validator for
    timeout/parallelism/isolation. `catalog.effective` previews the composed result.
-3. **附加审查** — `settings.review`, independent of authorization and off by
-   default.
-4. **任务记录** — `GET /api/dsh-delegate/tasks`, `POST …/tasks/get`,
-   `POST …/tasks/cancel`.
+3. **任务记录** — `GET /api/dsh-delegate/tasks`, `POST …/tasks/get`,
+   `POST …/tasks/cancel`. The host records its conclusion with `delegate_review`.
+4. **Codex 集成** — use the [Codex integration controls](codex-integration.md) to
+   set up the host connection.
 
 Authorization controls sit **above** those four areas and use only
 `/connections*`, `/grants*`, `/authorization/revoke-all` and `/status`. A UI that

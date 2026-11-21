@@ -577,7 +577,7 @@ test('DOM: a refused detail read is visible instead of a silent no-op', async ()
   }
 });
 
-test('DOM: a switch saves immediately, a text field debounces, and no manual save button exists', async () => {
+test('DOM: an execution select saves immediately and a text field debounces without a manual save button', async () => {
   const dom = installDom();
   try {
     const { store, puts } = await makeStore();
@@ -593,35 +593,42 @@ test('DOM: a switch saves immediately, a text field debounces, and no manual sav
     assert.ok(status !== null, 'the auto-save status line is rendered');
     assert.match(status.textContent, /已保存|所有修改已保存/u);
 
-    await page.openTab('附加审查');
-    // A switch (a discrete decision) autosaves with no debounce window.
-    const switchInput = [...page.root.querySelectorAll('input[type="checkbox"]')]
-      .find((input) => input.closest('label')?.textContent?.includes('启用附加模型审查'));
-    assert.ok(switchInput !== undefined, 'the review switch is rendered');
+    assert.equal(page.root.querySelector('#dshdg-tab-review'), null);
+    await page.openTab('执行设置');
+    const isolation = page.root.querySelector('#dshdg-worker-isolation');
+    assert.ok(isolation);
     await page.act(async () => {
-      switchInput.click();
+      isolation.value = isolation.value === 'shared' ? 'worktree' : 'shared';
+      isolation.dispatchEvent(new globalThis.Event('change', { bubbles: true }));
       await page.settle();
     });
     await page.settle();
-    assert.equal(puts.length, 1, 'the switch triggered exactly one whole-document PUT');
-    assert.equal(puts[0].review.enabled, true, 'and the PUT carries the switch value');
+    assert.equal(puts.length, 1, 'the select triggered exactly one whole-document PUT');
+    assert.equal(puts[0].worker.isolation, isolation.value);
+    assert.equal(Object.hasOwn(puts[0], 'review'), false);
     assert.match(page.root.querySelector('[data-dshdg-autosave]').textContent, /已保存/u);
 
-    await page.openTab('执行设置');
-    // A text field debounces: two keystrokes inside the window become one PUT.
-    const timeout = page.root.querySelector('#dshdg-worker-timeout');
-    assert.ok(timeout !== null);
+    // The retired execution timeout is NOT offered any more: an ordinary run has no
+    // total deadline, so a control for one would be a setting nobody should tune.
+    assert.equal(page.root.querySelector('#dshdg-worker-timeout'), null,
+      'the execution timeout control is gone');
+    assert.doesNotMatch(page.root.textContent, /超时（秒）/u);
+    // A text field debounces: two keystrokes inside the window become one PUT. The
+    // selection inputs are selects (immediate), so the debounced control is a numeric
+    // one — the parallelism field.
+    const parallelism = page.root.querySelector('#dshdg-worker-parallelism');
+    assert.ok(parallelism !== null);
     const setValue = globalThis.Object.getOwnPropertyDescriptor(globalThis.window.HTMLInputElement.prototype, 'value').set;
     await page.act(async () => {
-      setValue.call(timeout, '900');
-      timeout.dispatchEvent(new globalThis.Event('input', { bubbles: true }));
-      setValue.call(timeout, '1000');
-      timeout.dispatchEvent(new globalThis.Event('input', { bubbles: true }));
+      setValue.call(parallelism, '2');
+      parallelism.dispatchEvent(new globalThis.Event('input', { bubbles: true }));
+      setValue.call(parallelism, '3');
+      parallelism.dispatchEvent(new globalThis.Event('input', { bubbles: true }));
       await page.settle();
     });
     await page.settle();
     assert.equal(puts.length, 2, 'the debounced pair produced one additional PUT');
-    assert.equal(puts[1].worker.timeoutSeconds, 1000, 'the PUT body is the latest value');
+    assert.equal(puts[1].worker.maxParallelism, 3, 'the PUT body is the latest value');
 
     await page.unmount();
     store.dispose();
@@ -636,18 +643,20 @@ test('DOM: an invalid edit is reported in the status line and never sent', async
     const { store, puts } = await makeStore();
     const page = await renderPage(store);
     await page.openTab('执行设置');
-    const timeout = page.root.querySelector('#dshdg-worker-timeout');
+    // The parallelism field refuses an out-of-range value locally, so nothing is sent
+    // and the status line states the refusal with the last valid configuration.
+    const parallelism = page.root.querySelector('#dshdg-worker-parallelism');
     const setValue = globalThis.Object.getOwnPropertyDescriptor(globalThis.window.HTMLInputElement.prototype, 'value').set;
     await page.act(async () => {
-      setValue.call(timeout, '1');
-      timeout.dispatchEvent(new globalThis.Event('input', { bubbles: true }));
+      setValue.call(parallelism, '99');
+      parallelism.dispatchEvent(new globalThis.Event('input', { bubbles: true }));
       await page.settle();
     });
     await page.settle();
     assert.equal(puts.length, 0, 'an invalid draft is never sent');
     const status = page.root.querySelector('[data-dshdg-autosave]').textContent;
     assert.match(status, /未保存/u, 'the status line says it was not saved');
-    assert.match(page.root.textContent, /上次有效配置仍然生效|超时/u, 'and it names the reason / last valid config');
+    assert.match(page.root.textContent, /上次有效配置仍然生效|最大并发/u, 'and it names the reason / last valid config');
 
     await page.unmount();
     store.dispose();

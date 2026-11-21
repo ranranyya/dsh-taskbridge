@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { buildMarketSite } from '../scripts/build-plugin-market.mjs';
-import { isOwnedEntryScript, KNOWN_AGENT_TEMPLATES } from '../src/codex/installer.js';
+import { isOwnedEntryScript, KNOWN_AGENT_TEMPLATES, useDirectoryClassifier } from '../src/codex/installer.js';
 import { installationRecordPath } from '../src/codex/seam.js';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -14,7 +14,7 @@ const manifest = JSON.parse(await readFile(join(ROOT, 'package.json'), 'utf8'));
 
 test('public identity changes while the actual managed data and MCP identifiers remain compatible', async () => {
   assert.equal(manifest.name, 'dsh-taskbridge');
-  assert.equal(manifest.version, '1.6.0');
+  assert.equal(manifest.version, '1.7.0');
   const home = join(tmpdir(), 'taskdispatch-home-fixture');
   assert.equal(installationRecordPath({ DSH_HOME: home }), join(home, 'data', 'dsh-delegate', 'codex-installation.json'));
   assert.equal(manifest.bin['dsh-delegate-mcp'], 'bin/dsh-delegate-mcp.js');
@@ -54,6 +54,12 @@ test('the byte-exact installed 1.5.3-test.1 sample remains recognized in its ins
 
 test('explicit moved-install proof accepts own old/new packages and rejects foreign same-name roots', async () => {
   const root = await mkdtemp(join(tmpdir(), 'taskdispatch-proof-'));
+  // The proof also requires `<root>` and `<root>/bin` to be REAL directories. On Windows
+  // the installer asks for `ReparsePoint` through one PowerShell child, and a carrier
+  // that cannot spawn children at all would answer `unknown` — which is "cannot be
+  // proved", never "fine". The seam answers that one question from Node so the proof's
+  // own rules (provenance, exact bin mapping, the same-file check) are what is tested.
+  const restoreClassifier = useDirectoryClassifier(async (paths) => new Map(paths.map((path) => [path, 'directory'])));
   try {
     await mkdir(join(root, 'bin'));
     const entry = join(root, 'bin/dsh-delegate-mcp.js');
@@ -76,7 +82,10 @@ test('explicit moved-install proof accepts own old/new packages and rejects fore
     }
     await writeFile(join(root, 'package.json'), JSON.stringify({ name: 'dsh-taskbridge', repository: manifest.repository, bin: { 'dsh-delegate-mcp': 'bin/wrapper.js' } }));
     assert.equal(await isOwnedEntryScript(entry, desired), false, 'repository identity cannot replace the existing bin proof');
-  } finally { await rm(root, { recursive: true, force: true }); }
+  } finally {
+    restoreClassifier();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('generated public index pins the real Git source and carries the exact version and Chinese intro', async () => {

@@ -209,7 +209,7 @@ async function makeStore(options = {}) {
 }
 
 /** Render the real page and return its query helpers. */
-async function renderPage(store) {
+async function renderPage(store, navigation = {}) {
   const { react, reactDomClient, client } = await loadClient();
   await store.init();
   const root = globalThis.document.getElementById('root');
@@ -218,7 +218,7 @@ async function renderPage(store) {
   const testUtils = await import('react-dom/test-utils');
   const act = typeof react.act === 'function' ? react.act : testUtils.act;
   await act(async () => {
-    container.render(react.createElement(client.DelegateConfigPage, { store }));
+    container.render(react.createElement(client.DelegateConfigPage, { store, ...navigation }));
     await settle();
   });
   await act(() => settle(undefined, store));
@@ -230,7 +230,7 @@ async function renderPage(store) {
     async unmount() {
       await act(async () => { container.unmount(); });
     },
-    async openTasksTab() {
+    async openTasksTab(view = 'tree') {
       const tab = [...root.querySelectorAll('[role="tablist"] button')]
         .find((button) => (button.textContent ?? '').includes('任务记录'));
       assert.ok(tab !== undefined, 'the 任务记录 tab is rendered');
@@ -238,6 +238,10 @@ async function renderPage(store) {
         tab.dispatchEvent(new globalThis.MouseEvent('click', { bubbles: true, cancelable: true }));
         await settle();
       });
+      if (view === 'tree') {
+        const switchToTree = root.querySelector('[data-dshdg-record-view="tree"]');
+        if (switchToTree) await page.click(switchToTree);
+      }
     },
     /** The rendered tree node for one node id, or null. */
     node(nodeId) {
@@ -287,12 +291,59 @@ const BODY = tasksBody();
 
 test('DOM G09: a three-level plan renders three levels, and a three-round chain stays rounds of ONE node', async () => {
   const dom = installDom();
-  const { store } = await makeStore();
+  const body = tasksBody();
+  const listed = body.tasks.find((row) => row.taskId === 'task-ui-1');
+  listed.sessionId = 'session-ui-in-workspace';
+  const opened = [];
+  const { store } = await makeStore({ listTasks: async () => body });
   try {
-    const page = await renderPage(store);
-    await page.openTasksTab();
+    const page = await renderPage(store, {
+      uiWorkspace: () => ({ openSession: (id) => opened.push(id) }),
+      workspaces: () => ({ list: { getSnapshot: () => ({
+        phase: 'ready', items: [{ workspaceId: 'workspace-ui', sessionIds: ['session-ui-in-workspace'] }],
+        archivedSessionIds: [],
+      }) } }),
+    });
+    await page.openTasksTab('recent');
+
+    const table = page.root.querySelector('[data-dshdg-records-table]');
+    const visibleIds = () => [...table.querySelectorAll('[data-dshdg-record]')].map((el) => el.dataset.dshdgRecord);
+    const recent = visibleIds();
+    assert.equal(recent.length, 5, 'one row per execution chain');
+    assert.equal(table.querySelector('[data-column="updatedAt"]').getAttribute('aria-sort'), 'descending');
+    await page.click(table.querySelector('th[data-column="updatedAt"] button'));
+    const ascending = [...recent].reverse();
+    assert.deepEqual(visibleIds(), ascending);
+    await page.act(async () => { await store.refreshTasks('manual'); });
+    assert.deepEqual(visibleIds(), ascending, 'a refresh preserves ordering for equal activity times');
+    const title = table.querySelector('[data-dshdg-record-toggle="task-ui-1"]');
+    assert.match(title.textContent, /界面保存状态条/u);
+    assert.doesNotMatch(title.textContent, /修正窄窗口/u);
+    await page.click(title);
+    // The row's detail lists the chain's rounds NEWEST FIRST, so the round that can
+    // still own a live session is the one nearest the top; the round numbers and the
+    // first/rectification labels stay the chain's own.
+    assert.deepEqual([...table.querySelectorAll('[data-dshdg-round]')].map((el) => el.dataset.dshdgRound),
+      ['task-ui-3', 'task-ui-2', 'task-ui-1']);
+    assert.match(table.querySelector('[data-dshdg-round="task-ui-3"]').textContent, /第 3 轮/u);
+    assert.match(table.querySelector('[data-dshdg-round="task-ui-1"]').textContent, /首轮/u);
+    assert.match(table.querySelector('[data-dshdg-round="task-ui-2"]').textContent, /还需补 aria-live/u);
+    await page.click(table.querySelector('[data-dshdg-round-detail="task-ui-1"]'));
+    await page.click(table.querySelector('[data-dshdg-open-session="task-ui-1"]'));
+    assert.deepEqual(opened, ['session-ui-in-workspace']);
+    await page.click(table.querySelector('[data-dshdg-round-detail="task-ui-2"]'));
+    assert.equal(table.querySelector('[data-dshdg-open-session="task-ui-2"]').disabled, true);
+    assert.deepEqual(opened, ['session-ui-in-workspace']);
+    // A round with no recorded session offers no navigation and says so; the detail
+    // itself is still fully readable.
+    assert.match(table.querySelector('[data-dshdg-round="task-ui-2"]').textContent, /没有可定位的会话/u);
+    await page.click(page.root.querySelector('[data-dshdg-record-view="tree"]'));
 
     assert.ok(page.root.querySelector('[data-dshdg-task-tree]') !== null, 'the tree panel is rendered');
+    // The PROJECT TREE keeps the chain's recorded order: first round, then the
+    // rectification rounds.
+    assert.deepEqual([...page.node('plan-ui').querySelectorAll('[data-dshdg-round]')].map((el) => el.dataset.dshdgRound),
+      ['task-ui-1', 'task-ui-2', 'task-ui-3']);
     // Level 1 -> level 2 -> level 3, read from the DOM structure rather than from a
     // flag the page might set for itself.
     const goal = page.node('plan-goal');
@@ -589,6 +640,227 @@ test('DOM G09: an older host without a tree falls back to the flat list; a refus
     await page.unmount();
     flatTree.store.dispose();
   } finally {
+    dom.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 4b. The creation-date range, operated through the real controls
+// ---------------------------------------------------------------------------
+
+/** Local `YYYY-MM-DD` of one timestamp, the way the browser reports a date input. */
+function localDayOf(at) {
+  const date = new Date(at);
+  const pad = (part) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/** Local midnight (epoch ms) of one `YYYY-MM-DD`, through the browser calendar. */
+function localMidnightOf(day) {
+  const [year, month, date] = day.split('-').map(Number);
+  const at = new Date(0);
+  at.setFullYear(year, month - 1, date);
+  at.setHours(0, 0, 0, 0);
+  return at.getTime();
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+test('DOM dates: the panel offers a native start/end date per filter row, states that it filters creation dates, and clears', async () => {
+  const dom = installDom();
+  const { store } = await makeStore();
+  try {
+    const page = await renderPage(store);
+    await page.openTasksTab();
+
+    const from = page.root.querySelector('[data-dshdg-tree-day-from]');
+    const to = page.root.querySelector('[data-dshdg-tree-day-to]');
+    assert.ok(from !== null && to !== null, 'both native date inputs are rendered');
+    assert.equal(from.getAttribute('type'), 'date', 'the control is the browser calendar, not a custom widget');
+    assert.equal(to.getAttribute('type'), 'date');
+
+    const hint = page.root.querySelector('[data-dshdg-tree-day-hint]');
+    assert.ok(hint !== null);
+    assert.match(hint.textContent, /按创建日期筛选/u, 'the page says WHICH date it filters');
+
+    const clear = page.root.querySelector('[data-dshdg-tree-day-clear]');
+    assert.ok(clear !== null);
+    assert.equal(clear.disabled, true, 'nothing to clear while the range is empty');
+
+    const allNodes = () => page.root.querySelectorAll('[data-dshdg-tree-node]').length;
+    const before = allNodes();
+    assert.ok(before > 0);
+
+    // Filter to a day every fixture node matches: the tree is unchanged, and the
+    // hint now states the applied range instead of how to use it.
+    const today = localDayOf(BODY.tasks[0].createdAt);
+    await page.fill(from, today);
+    assert.equal(page.root.querySelector('[data-dshdg-tree-day-from]').value, today);
+    assert.equal(allNodes(), before, 'a range that contains everything removes nothing');
+    assert.match(page.root.querySelector('[data-dshdg-tree-day-hint]').textContent, new RegExp(`${today} 至 不限`, 'u'));
+
+    // A range that ends before the fixtures begin is reversed against the start
+    // date set above: it is STATED, and the tree stays what it already showed.
+    const noneDay = localDayOf(BODY.tasks[0].createdAt - 10 * DAY_MS);
+    await page.fill(to, noneDay);
+    // `from` is after `to` now: stated, and the tree stays as it was.
+    const error = page.root.querySelector('[data-dshdg-tree-day-error]');
+    assert.ok(error !== null, 'a reversed range is stated');
+    assert.match(error.textContent, /开始日期晚于结束日期/u);
+    assert.equal(from.getAttribute('aria-invalid'), 'true');
+    assert.equal(page.root.querySelector('[data-dshdg-task-tree]') !== null, true, 'the panel still renders');
+
+    // The clear control undoes the range: both fields empty, message gone, tree back.
+    await page.click(page.root.querySelector('[data-dshdg-tree-day-clear]'));
+    assert.equal(page.root.querySelector('[data-dshdg-tree-day-from]').value, '');
+    assert.equal(page.root.querySelector('[data-dshdg-tree-day-to]').value, '');
+    assert.equal(page.root.querySelector('[data-dshdg-tree-day-error]'), null);
+    assert.equal(allNodes(), before);
+    assert.equal(page.root.querySelector('[data-dshdg-tree-day-clear]').disabled, true, 'and it disables itself again');
+
+    await page.unmount();
+  } finally {
+    store.dispose();
+    dom.restore();
+  }
+});
+
+test('DOM dates: a one-day range keeps a round of that day inside its whole chain, and the next midnight is excluded', async () => {
+  const dom = installDom();
+  // A three-round chain: the first round is yesterday, the second TODAY, the third
+  // tomorrow. A standalone task sits exactly at local midnight of tomorrow.
+  const HOUR = 60 * 60 * 1000;
+  const anchor = BODY.tasks[0].createdAt;
+  const today = localDayOf(anchor);
+  const midnight = localMidnightOf(today);
+  const repo = process.platform === 'win32' ? 'C:\\org-one\\portal' : '/org-one/portal';
+  const { buildTaskTree } = await import('../src/jobs/task-tree.js');
+  const ACC = { accepted: true, state: 'accepted', decision: 'accepted', acceptedAt: 1, by: 'commander' };
+  const row = (taskId, extra) => ({
+    taskId,
+    state: 'awaiting-host-review', phase: 'awaiting-host-review',
+    sourcePath: repo, archived: false, live: true, ...extra,
+  });
+  const tasks = [
+    row('task-day-1', { title: '昨天的首轮', planNodeId: 'plan-day', createdAt: midnight - HOUR * 3 }),
+    row('task-day-2', { title: '今天的整改', continueFromTaskId: 'task-day-1', createdAt: midnight + HOUR * 2 }),
+    row('task-day-3', { title: '明天的第三轮', continueFromTaskId: 'task-day-2', createdAt: midnight + DAY_MS + HOUR, hostAcceptance: ACC }),
+    row('task-midnight-next', { title: '次日零点', createdAt: midnight + DAY_MS }),
+    row('task-yesterday', { title: '昨天独立任务', createdAt: midnight - HOUR }),
+  ];
+  const tree = buildTaskTree({
+    tasks,
+    planNodes: [
+      { nodeId: 'plan-day', parentNodeId: null, title: '当日目标', sequence: 1, sourcePath: repo, createdAt: midnight - DAY_MS, updatedAt: midnight - DAY_MS },
+    ],
+  });
+  assert.ok(tree.roots.length > 0);
+  const body = { ok: true, tasks, plans: { available: true, count: 1, unreadable: false }, tree };
+  const { store, calls } = await makeStore({
+    listTasks: async () => body,
+    // The host answers for the task that was asked for: a detail double that always
+    // returns one fixed row would hide which round the button targeted.
+    getTask: async (taskId) => ({ ok: true, task: tasks.find((task) => task.taskId === taskId) ?? null }),
+  });
+  try {
+    const page = await renderPage(store);
+    await page.openTasksTab();
+    assert.match(page.root.textContent, /当日目标/u);
+
+    // One day, both ends the same: only that calendar day.
+    await page.fill(page.root.querySelector('[data-dshdg-tree-day-from]'), today);
+    await page.fill(page.root.querySelector('[data-dshdg-tree-day-to]'), today);
+
+    const goal = page.node('plan-day');
+    assert.ok(goal !== null, 'the plan node created yesterday is kept as the ancestor of a round that is today');
+    const rounds = [...goal.querySelectorAll('[data-dshdg-round]')].map((node) => node.getAttribute('data-dshdg-round'));
+    assert.deepEqual(rounds, ['task-day-1', 'task-day-2', 'task-day-3'], 'the whole chain is shown, not only the round of that day');
+    assert.match(goal.textContent, /今天/u);
+
+    assert.equal(page.node('task-midnight-next'), null, 'the next local midnight is NOT today');
+    assert.equal(page.node('task-yesterday'), null, 'a task created yesterday is excluded');
+
+    // The round of the day is selectable: its detail opens as before.
+    await page.click(page.root.querySelector('[data-dshdg-round-detail="task-day-2"]'));
+    const callsAfterClick = calls.getTask.at(-1);
+    const detail = page.root.querySelector('[data-dshdg-task-detail]');
+    assert.ok(detail !== null, 'the existing inline detail opens for the round under a date filter');
+    assert.equal(callsAfterClick, 'task-day-2', 'the round control asked the host for THAT task');
+    assert.equal(detail.closest('[data-dshdg-round]')?.dataset.dshdgRound, 'task-day-2');
+
+    // Changing the filter closes the detail, the same way the other filters do.
+    await page.fill(page.root.querySelector('[data-dshdg-tree-day-from]'), '');
+    assert.equal(page.root.querySelector('[data-dshdg-task-detail]'), null, 'a filter change closes the open detail');
+
+    await page.unmount();
+  } finally {
+    store.dispose();
+    dom.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 4c. An END-ONLY range against a real task tree that holds tasks with no date
+// ---------------------------------------------------------------------------
+
+test('DOM dates: an end-only range does not pull in tasks whose creation time was never recorded', async () => {
+  const dom = installDom();
+  const HOUR = 60 * 60 * 1000;
+  const anchor = BODY.tasks[0].createdAt;
+  const anchorDay = localDayOf(anchor);
+  const repo = process.platform === 'win32' ? 'C:\\org-one\\portal' : '/org-one/portal';
+  const { buildTaskTree } = await import('../src/jobs/task-tree.js');
+  const row = (taskId, extra) => ({
+    taskId,
+    state: 'awaiting-host-review', phase: 'awaiting-host-review',
+    sourcePath: repo, archived: false, live: true, ...extra,
+  });
+  // Exactly the shape the host really serves: two tasks with NO creation time, one
+  // dated task, and one dated before the end bound.
+  const tasks = [
+    row('task-live-null', { title: '创建时间为 null', createdAt: null }),
+    row('task-live-missing', { title: '没有创建时间字段' }),
+    row('task-live-dated', { title: '有真实创建时间', createdAt: anchor + HOUR }),
+    row('task-live-earlier', { title: '早于结束日', createdAt: anchor - 5 * 24 * HOUR }),
+  ];
+  const tree = buildTaskTree({ tasks });
+  // The projection's own fallback is what makes this a real regression test.
+  assert.equal(tree.roots.find((node) => node.nodeId === 'task-live-null').createdAt, 0);
+  assert.equal(tree.roots.find((node) => node.nodeId === 'task-live-missing').createdAt, 0);
+
+  const body = { ok: true, tasks, plans: { available: true, count: 0, unreadable: false }, tree };
+  const { store } = await makeStore({
+    listTasks: async () => body,
+    getTask: async (taskId) => ({ ok: true, task: tasks.find((task) => task.taskId === taskId) ?? null }),
+  });
+  try {
+    const page = await renderPage(store);
+    await page.openTasksTab();
+    for (const id of ['task-live-null', 'task-live-missing', 'task-live-dated', 'task-live-earlier']) {
+      assert.ok(page.node(id) !== null, `${id} is shown with no date filter`);
+    }
+
+    // END ONLY: one upper bound, start left empty.
+    await page.fill(page.root.querySelector('[data-dshdg-tree-day-to]'), anchorDay);
+    // `page.fill` waits for the browser to accept the value; the hint proves the
+    // range really engaged rather than being ignored.
+    assert.match(page.root.querySelector('[data-dshdg-tree-day-hint]').textContent, new RegExp(`不限 至 ${anchorDay}`, 'u'));
+
+    assert.ok(page.node('task-live-dated') !== null, 'the task created on that day is shown');
+    assert.ok(page.node('task-live-earlier') !== null, 'an end bound is an upper bound, not a lower one');
+    assert.equal(page.node('task-live-null'), null, 'a null creation time is NOT inside an end-only range');
+    assert.equal(page.node('task-live-missing'), null, 'a missing creation time is NOT inside an end-only range');
+    assert.doesNotMatch(page.root.textContent, /1970/u, 'the epoch never appears as a creation date on screen');
+
+    // Clearing restores every row, including the undated ones.
+    await page.click(page.root.querySelector('[data-dshdg-tree-day-clear]'));
+    for (const id of ['task-live-null', 'task-live-missing', 'task-live-dated', 'task-live-earlier']) {
+      assert.ok(page.node(id) !== null, `${id} comes back when the range is cleared`);
+    }
+
+    await page.unmount();
+  } finally {
+    store.dispose();
     dom.restore();
   }
 });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CODEX_ACTIONS, ROUTES, createStore, defaultDraft, documentFromDraft, draftFromSettings, exportDocument, formatDuration, hasLiveTasks, isLiveTask, minutesToSeconds, monitoringDraftOf, monitoringOf, precheckDraft, precheckMonitoring, previewEffective, secondsToMinutes, taskActivity, taskProgress } from '../src/client/api.js';
+import { CODEX_ACTIONS, ROUTES, createStore, defaultDraft, documentFromDraft, draftFromSettings, exportDocument, formatDuration, hasLiveTasks, isLiveTask, minutesToSeconds, monitoringDraftOf, monitoringOf, monitoringText, precheckDraft, precheckMonitoring, previewEffective, secondsToMinutes, taskActivity, taskProgress } from '../src/client/api.js';
 import {
   CONVERSATION_LABELS,
   CONVERSATION_MODES,
@@ -135,12 +135,16 @@ test('the built page no longer offers a conversation-mode control, and states th
 // Monitoring thresholds in the client document layer
 // ---------------------------------------------------------------------------
 
-test('a document without monitoring opens with the 5/10-minute defaults', () => {
+test('a document without monitoring opens with the 10/40-minute defaults', () => {
   // An old stored file (and an old host) has no `monitoring` key at all.
   const draft = draftFromSettings({ schemaVersion: 1, providers: [] });
-  assert.deepEqual(draft.monitoring, { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: 3 });
-  assert.equal(defaultDraft().monitoring.selfCheckSeconds, 300);
-  assert.equal(defaultDraft().monitoring.attentionSeconds, 600);
+  assert.deepEqual(draft.monitoring, {
+    selfCheckSeconds: 600,
+    attentionSeconds: 2400,
+    repeatFailureThreshold: 3,
+  });
+  assert.equal(defaultDraft().monitoring.selfCheckSeconds, 600);
+  assert.equal(defaultDraft().monitoring.attentionSeconds, 2400);
   // The failure reminder defaults too, so an old draft opens with a usable value.
   assert.equal(defaultDraft().monitoring.repeatFailureThreshold, 3);
 });
@@ -151,43 +155,67 @@ test('monitoring survives draft, document and preview round trips as whole secon
     providers: [],
     monitoring: { selfCheckSeconds: 90, attentionSeconds: 240 },
   });
+  // A deliberately configured pair is preserved verbatim on an upgrade.
   assert.deepEqual(draft.monitoring, { selfCheckSeconds: 90, attentionSeconds: 240, repeatFailureThreshold: 3 });
-  assert.deepEqual(documentFromDraft(draft).monitoring, { selfCheckSeconds: 90, attentionSeconds: 240, repeatFailureThreshold: 3 });
-  assert.deepEqual(previewEffective(draft, null).monitoring, { selfCheckSeconds: 90, attentionSeconds: 240, repeatFailureThreshold: 3 });
+  assert.deepEqual(documentFromDraft(draft).monitoring, {
+    selfCheckSeconds: 90,
+    attentionSeconds: 240,
+    repeatFailureThreshold: 3,
+  });
+  assert.deepEqual(previewEffective(draft, null).monitoring, {
+    selfCheckSeconds: 90,
+    attentionSeconds: 240,
+    repeatFailureThreshold: 3,
+  });
   // The export text is the same non-secret document, so it carries the block too.
   assert.match(exportDocument(draft), /"selfCheckSeconds": 90/u);
   assert.match(exportDocument(draft), /"repeatFailureThreshold": 3/u);
 });
 
-test('the repeated-failure count round-trips, and 0 stays 0 rather than becoming a default', () => {
-  const off = draftFromSettings({ schemaVersion: 1, providers: [], monitoring: { repeatFailureThreshold: 0 } });
+test('each reminder can be switched off with 0, and 0 stays 0 rather than becoming a default', () => {
+  const off = draftFromSettings({
+    schemaVersion: 1,
+    providers: [],
+    monitoring: { selfCheckSeconds: 0, attentionSeconds: 0, repeatFailureThreshold: 0 },
+  });
   assert.equal(off.monitoring.repeatFailureThreshold, 0, 'off is a real stored value');
+  assert.equal(off.monitoring.selfCheckSeconds, 0, 'a disabled self-check survives the read');
   assert.deepEqual(precheckMonitoring(off.monitoring), [], '0 is legal, not a problem');
   assert.equal(documentFromDraft(off).monitoring.repeatFailureThreshold, 0);
+  assert.equal(documentFromDraft(off).monitoring.attentionSeconds, 0);
   // A missing value keeps the documented default, for an older served document.
   assert.equal(draftFromSettings({ monitoring: {} }).monitoring.repeatFailureThreshold, 3);
-  assert.equal(precheckMonitoring({ selfCheckSeconds: 300, attentionSeconds: 600 }).length, 0);
+  assert.equal(precheckMonitoring({ selfCheckSeconds: 600, attentionSeconds: 2400 }).length, 0);
   for (const bad of [-1, 21, 2.5]) {
-    assert.equal(precheckMonitoring({ selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: bad }).length, 1);
+    assert.equal(precheckMonitoring({ selfCheckSeconds: 600, attentionSeconds: 2400, repeatFailureThreshold: bad }).length, 1);
   }
+  // A disabled reminder can never break the ordering rule.
+  assert.deepEqual(precheckMonitoring({ selfCheckSeconds: 0, attentionSeconds: 0 }), []);
+  assert.deepEqual(precheckMonitoring({ selfCheckSeconds: 2400, attentionSeconds: 0 }), []);
 });
 
 test('a cleared field is refused by the raw-block precheck instead of becoming the default', () => {
   // This is the defect the raw helper exists for: `monitoringOf` turns `''` into the
   // documented default so the input still renders, which would make a CLEARED field look
   // valid and leave the save button enabled.
-  const typed = { monitoring: { selfCheckSeconds: '', attentionSeconds: 600, repeatFailureThreshold: 3 } };
-  assert.equal(monitoringOf(typed).selfCheckSeconds, 300, 'the display normalizer falls back');
+  const typed = { monitoring: { selfCheckSeconds: '', attentionSeconds: 2400, repeatFailureThreshold: 3 } };
+  assert.equal(monitoringOf(typed).selfCheckSeconds, 600, 'the display normalizer falls back');
   assert.equal(monitoringDraftOf(typed).selfCheckSeconds, '', 'the raw block keeps what was typed');
   assert.equal(precheckMonitoring(monitoringDraftOf(typed)).length, 1, 'and the precheck refuses it');
 
-  const blankCount = { monitoring: { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: '' } };
+  const blankCount = { monitoring: { selfCheckSeconds: 600, attentionSeconds: 2400, repeatFailureThreshold: '' } };
   assert.equal(monitoringOf(blankCount).repeatFailureThreshold, 3);
   assert.equal(monitoringDraftOf(blankCount).repeatFailureThreshold, '');
   assert.equal(precheckMonitoring(monitoringDraftOf(blankCount)).length, 1, 'a blank count is a real error');
 
+  // The same rule for the progress-check interval.
+  const blankAttention = { monitoring: { selfCheckSeconds: 600, attentionSeconds: '', repeatFailureThreshold: 3 } };
+  assert.equal(monitoringOf(blankAttention).attentionSeconds, 2400, 'the display normalizer falls back');
+  assert.equal(monitoringDraftOf(blankAttention).attentionSeconds, '', 'the raw block keeps what was typed');
+  assert.equal(precheckMonitoring(monitoringDraftOf(blankAttention)).length, 1, 'and the precheck refuses it');
+
   // The whole-draft precheck (the panel's save gate) must refuse it too.
-  const draft = { ...defaultDraft(), monitoring: { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: '' } };
+  const draft = { ...defaultDraft(), monitoring: { selfCheckSeconds: 600, attentionSeconds: 2400, repeatFailureThreshold: '' } };
   assert.ok(precheckDraft(draft).some((problem) => problem.includes('重复失败')));
 });
 
@@ -195,31 +223,34 @@ test('a fractional or non-numeric stored value is coerced to whole seconds', () 
   const draft = draftFromSettings({ monitoring: { selfCheckSeconds: 90.7, attentionSeconds: '600' } });
   assert.equal(draft.monitoring.selfCheckSeconds, 90);
   // A non-finite value falls back to the documented default rather than NaN.
-  assert.equal(draft.monitoring.attentionSeconds, 600);
+  assert.equal(draft.monitoring.attentionSeconds, 2400);
 });
 
 test('minutes and seconds convert without inventing a value', () => {
-  assert.equal(secondsToMinutes(300), 5);
+  assert.equal(secondsToMinutes(600), 10);
   assert.equal(secondsToMinutes(90), 1.5);
-  assert.equal(minutesToSeconds(5), 300);
+  assert.equal(minutesToSeconds(10), 600);
+  assert.equal(minutesToSeconds(40), 2400);
   assert.equal(minutesToSeconds(1.5), 90);
   assert.equal(minutesToSeconds(''), Number.NaN);
   assert.equal(minutesToSeconds('abc'), Number.NaN);
 });
 
 test('the local precheck mirrors the host bounds and ordering rule', () => {
-  assert.deepEqual(precheckMonitoring({ selfCheckSeconds: 300, attentionSeconds: 600 }), []);
-  assert.equal(precheckMonitoring({ selfCheckSeconds: 29, attentionSeconds: 600 }).length, 1);
+  assert.deepEqual(precheckMonitoring({ selfCheckSeconds: 600, attentionSeconds: 2400 }), []);
+  // 0 is "off" for either duration, so it is inside the range rather than below it.
+  assert.deepEqual(precheckMonitoring({ selfCheckSeconds: 0, attentionSeconds: 0 }), []);
   assert.equal(precheckMonitoring({ selfCheckSeconds: 3601, attentionSeconds: 7200 }).length, 1);
-  assert.equal(precheckMonitoring({ selfCheckSeconds: 300, attentionSeconds: 7201 }).length, 1);
-  // Attention must be strictly greater than the self-check.
+  assert.equal(precheckMonitoring({ selfCheckSeconds: 600, attentionSeconds: 7201 }).length, 1);
+  // The progress-check interval must be strictly greater than the self-check WHILE BOTH
+  // ARE ENABLED.
   assert.equal(precheckMonitoring({ selfCheckSeconds: 600, attentionSeconds: 600 }).length, 1);
   assert.match(precheckMonitoring({ selfCheckSeconds: 600, attentionSeconds: 300 })[0], /必须大于程序自检间隔/u);
   // A non-integer is refused, not rounded into a different setting.
-  assert.equal(precheckMonitoring({ selfCheckSeconds: 300.5, attentionSeconds: 600 }).length >= 1, true);
+  assert.equal(precheckMonitoring({ selfCheckSeconds: 300.5, attentionSeconds: 2400 }).length >= 1, true);
   // And the combined precheck reports it too, so the save button blocks.
   assert.ok(precheckDraft({ ...defaultDraft(), monitoring: { selfCheckSeconds: 600, attentionSeconds: 300 } })
-    .some((problem) => problem.includes('提醒')));
+    .some((problem) => problem.includes('运行进度检查')));
 });
 
 test('saving monitoring does not disturb an unsaved provider edit and keeps the draft dirty', async () => {
@@ -287,8 +318,8 @@ test('a bad repeated-failure count is refused by saveMonitoring before it is nor
     });
     await store.loadSettings();
     const result = await store.saveMonitoring({
-      selfCheckSeconds: 300,
-      attentionSeconds: 600,
+      selfCheckSeconds: 600,
+      attentionSeconds: 2400,
       repeatFailureThreshold: bad,
     });
     assert.equal(result.ok, false, `${JSON.stringify(bad)} must be refused`);
@@ -375,8 +406,9 @@ function liveTaskView(overrides = {}) {
       activityEvents: 12,
       toolCallsStarted: 2,
       toolCallsFinished: 1,
-      selfCheckSeconds: 300,
-      attentionSeconds: 600,
+      selfCheckSeconds: 600,
+      attentionSeconds: 2400,
+      progressCheck: { thresholdSeconds: 2400, idleForMs: 42_000, reportedThisEpisode: false, nextDueAt: 2_440_000 },
       selfCheck: { episode: 1, checkedAt: 1_300_000, verdict: 'tool-running' },
       finalizedAt: null,
     },
@@ -395,6 +427,25 @@ test('a task with an activity block describes its phase, silence and running too
   // No completion percentage is ever invented.
   assert.doesNotMatch(progress.headline, /%/u);
   assert.doesNotMatch(progress.detail, /%/u);
+  // The progress check is stated as the ONE notification interval, measured from the last real
+  // result returned to the dispatcher — and reading a self-check is explicitly NOT a result.
+  assert.match(progress.detail, /连续 40 分 0 秒 没有新成果回传给派工方时会提醒一次运行进度检查/u);
+  assert.match(progress.detail, /读到自检结论不算新成果/u);
+  assert.match(progress.detail, /提醒只是提示，不会自动判失败/u);
+  // Internal output and tool activity are named as NOT being a result for the dispatcher.
+  assert.match(progress.detail, /它们不算回传给派工方的成果/u);
+});
+
+test('a disabled reminder is stated as disabled, never as an instant alarm', () => {
+  const silent = liveTaskView();
+  silent.activity = { ...silent.activity, attentionSeconds: 0 };
+  const progress = taskProgress(silent);
+  assert.match(progress.detail, /运行进度检查提醒已关闭/u);
+  // `0` thresholds are surfaced as `0`, not as a fabricated duration.
+  assert.equal(taskActivity(silent).attentionSeconds, 0);
+  assert.equal(monitoringText(0), '已关闭');
+  assert.equal(monitoringText(600), '10 分 0 秒');
+  assert.equal(monitoringText(2400), '40 分 0 秒');
 });
 
 test('a record with no activity block is reported honestly, never as idle', () => {

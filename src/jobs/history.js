@@ -20,6 +20,10 @@
 // `hostAcceptance.completionSummary` enforce <= 2000 code points on writes (never cut by fitting)
 // and truncate with markers on loads of older/external documents.
 //
+// Removal is `deleteMany` only: one atomic, bounded, all-or-nothing write that the
+// execution record view drives. A live record is never removed, a refused batch
+// writes nothing, and a failed write leaves the stored copy visible.
+//
 // On load, `pending`/`running` records become `interrupted` with
 // `error.code = JOB_INTERRUPTED_RESTART`. They are never resubmitted, and the
 // authorization that once covered them is not restored.
@@ -91,7 +95,18 @@ export const HISTORY_CODES = Object.freeze({
   limitExceeded: 'HISTORY_LIMIT_EXCEEDED',
   writeFailed: 'HISTORY_WRITE_FAILED',
   disposed: 'HISTORY_DISPOSED',
+  // A batch delete that cannot be honoured as one unit. Nothing is written.
+  deleteInvalid: 'HISTORY_DELETE_INVALID',
 });
+
+/**
+ * Upper bound on how many records one batch delete may remove.
+ *
+ * It matches the per-entry list bound of the projection, so a batch can never be
+ * larger than a document's own record list; the API also caps the number of CHAINS
+ * per request, so the composition cannot grow with a caller's list.
+ */
+export const HISTORY_DELETE_MAX_TASKS = 500;
 
 /** Windows rename races are transient: retry them briefly before refusing. */
 const WINDOWS_TRANSIENT_RENAME = new Set(['EACCES', 'EBUSY', 'EPERM']);
@@ -407,6 +422,74 @@ export class HistoryStore {
       await this.writeDocument(draft, now);
       this.jobs = draft;
       return structuredClone(entry);
+    });
+    return await run;
+  }
+
+  /**
+   * Atomically delete ONE batch of TERMINAL stored records.
+   *
+   * This is the only removal path a caller may use, and it is deliberately narrow:
+   *
+   *  * **All or nothing.** Every id must name a stored record that is terminal in
+   *    the document as read INSIDE the write queue. A missing id, an id whose stored
+   *    state is still `pending`/`running`, and a duplicate id refuse the WHOLE batch
+   *    with `HISTORY_DELETE_INVALID` and write nothing. There is no partial success
+   *    to report as a success.
+   * The write is serialized with saves and updates. The optional check runs on
+   * the latest rows in the queue. The store only publishes the new list after
+   * the temporary file replaces the old document.
+   *
+   * Deleting a history record removes the stored evidence only. It does not touch a
+   * DSH Workspace, a Session, a worktree, a source file or any other document.
+   * @param {string[]} taskIds - exact stored ids to remove.
+   * @param {object} [options] - synchronous `beforeWrite(rows)` and `afterWrite(ids)` hooks.
+   * @returns {Promise<{ deletedTaskIds: string[], remaining: number }>} outcome.
+   * @throws {HistoryError} `HISTORY_DELETE_INVALID` for a refused batch (nothing written),
+   *   `HISTORY_WRITE_FAILED` when the document could not be written (nothing removed),
+   *   or the error `beforeWrite` threw.
+   */
+  async deleteMany(taskIds, options = {}) {
+    if (this.disposed) throw this.disposedError();
+    if (this.refusal !== null) this.throwIfRefused();
+    const ids = requireDeleteIds(taskIds);
+    const beforeWrite = typeof options.beforeWrite === 'function' ? options.beforeWrite : null;
+    const run = this.enqueue(async () => {
+      this.throwIfRefused();
+      const base = await this.ensureLoaded();
+      // The re-check sees the freshest rows and the caller's own in-flight facts, so a
+      // batch that became unsafe while it waited is refused before anything is written.
+      if (beforeWrite !== null) beforeWrite(base.slice());
+      const byId = new Map();
+      for (const job of base) byId.set(job.taskId, job);
+      const missing = [];
+      const live = [];
+      for (const taskId of ids) {
+        const row = byId.get(taskId);
+        if (row === undefined) missing.push(taskId);
+        else if (!isTerminal(row.state) || row.state === 'interrupted') live.push(taskId);
+      }
+      if (missing.length > 0 || live.length > 0) {
+        // The ids are echoed back because the caller sent them; nothing else is.
+        // A refusal never rewrites the document, so the caller can re-read and retry.
+        throw new HistoryError(
+          HISTORY_CODES.deleteInvalid,
+          'a history batch can only remove stored finished records that still exist',
+          {
+            missing,
+            live,
+            requested: ids.length,
+            limit: HISTORY_DELETE_MAX_TASKS,
+          },
+        );
+      }
+      const wanted = new Set(ids);
+      const draft = base.filter((job) => !wanted.has(job.taskId)).map((job) => structuredClone(job));
+      const now = Date.now();
+      await this.writeDocument(draft, now);
+      this.jobs = draft;
+      options.afterWrite?.(ids);
+      return { deletedTaskIds: [...ids], remaining: draft.length };
     });
     return await run;
   }
@@ -732,6 +815,15 @@ function projectView(view, maxEntryBytes, options = {}) {
     // dispatcher made no choice, so a restored record can tell "not asked" from "asked",
     // and "applied" from "asked but unapplied".
     agentTeams: typeof view.agentTeams === 'boolean' ? view.agentTeams : null,
+    // WHERE that decision came from (`request` / `continuation` / `settings-default`), or
+    // ABSENT when there is nothing to say. Closed vocabulary, so a restored record can
+    // never present the operator's default as something the dispatcher asked for.
+    //
+    // Omitted rather than written as `null`, for the same reason `title` is: a stored
+    // record that predates the field (or never recorded a decision) must reload byte for
+    // byte. Writing `null` would make every such load look like a change and rewrite the
+    // document just to add a key that means "unknown" anyway.
+    ...(teamOriginView(view.agentTeamsOrigin) === null ? {} : { agentTeamsOrigin: teamOriginView(view.agentTeamsOrigin) }),
     team: teamView(view.team, ctx),
     // A completed job is not an accepted one. This is fixed, never copied.
     selfApproved: false,
@@ -796,33 +888,46 @@ function markInterrupted(entry, now) {
 function effectiveView(value) {
   if (!isPlainObject(value)) return null;
   const worker = isPlainObject(value.worker) ? value.worker : {};
-  const review = isPlainObject(value.review) ? value.review : {};
+  const review = isPlainObject(value.review) ? value.review : null;
   const provenance = isPlainObject(value.provenance) ? value.provenance : {};
   return {
     worker: {
       providerId: label(worker.providerId),
       model: label(worker.model),
       reasoningEffort: label(worker.reasoningEffort),
+      // The legacy stored value, kept verbatim so a stored record still says what the
+      // document it ran under contained. It is NOT what bounded the run.
       timeoutSeconds: count(worker.timeoutSeconds),
+      // What the run's budget actually was: `null` means "no total execution
+      // deadline" (the default), a number means an explicit per-job cap. Stored as
+      // its own field, because reading the legacy value as the budget would state a
+      // limit the engine did not apply.
+      executionTimeoutSeconds: Number.isFinite(worker.executionTimeoutSeconds)
+        ? count(worker.executionTimeoutSeconds)
+        : null,
       maxParallelism: count(worker.maxParallelism),
       isolation: knownValue(worker.isolation, ['worktree', 'shared']),
     },
-    review: {
-      enabled: review.enabled === true,
-      providerId: label(review.providerId),
-      model: label(review.model),
-      reasoningEffort: label(review.reasoningEffort),
-    },
+    ...(review === null ? {} : {
+      review: {
+        enabled: review.enabled === true,
+        providerId: label(review.providerId),
+        model: label(review.model),
+        reasoningEffort: label(review.reasoningEffort),
+      },
+    }),
     // The conversation policy the task was frozen with (a rule, not a stored
     // setting) plus, in `value.conversation` below, what the run actually did. No
     // session id is stored here, so history is not a way back into a conversation.
     conversation: isPlainObject(value.conversation)
       ? { policy: label(value.conversation.policy) }
       : null,
-    // The silence thresholds this task froze at admission. Stored because they are
-    // the only way a stored activity block can be interpreted: "idle for 12 minutes"
-    // means something different under a 10-minute attention threshold than under a
-    // two-hour one, and the live settings may have changed since.
+    // The no-progress thresholds this task froze at admission. Stored because they are
+    // the only way a stored activity block can be interpreted: "no progress for 12
+    // minutes" means something different under a 10-minute self-check threshold than
+    // under a two-hour one, and the live settings may have changed since. `0` is a
+    // stored decision ("this reminder is off") and is preserved as such, never
+    // re-defaulted.
     monitoring: isPlainObject(value.monitoring)
       ? {
         selfCheckSeconds: count(value.monitoring.selfCheckSeconds),
@@ -992,7 +1097,7 @@ function usageView(value) {
   return Object.keys(out).length === 0 ? null : out;
 }
 
-/** @returns {object | null} bounded additional-review outcome. */
+/** @returns {object | null} bounded result from a legacy model review. */
 function reviewView(value, ctx) {
   if (!isPlainObject(value)) return null;
   return {
@@ -1214,6 +1319,21 @@ function teamView(value, ctx) {
     enabled: typeof value.enabled === 'boolean' ? value.enabled : null,
     reason: boundedReason(value.reason, ctx, 'team.reason'),
   };
+}
+
+/**
+ * Project the ORIGIN of a task's frozen Agent Teams decision for storage.
+ *
+ * A closed vocabulary of three words, or `null`. Anything else stored in a document
+ * (a hand edit, a field written by a later build) reads back as `null` instead of
+ * being echoed, so no reader can be shown a fourth "origin" this build does not
+ * understand. `null` is also what a record written before this field existed
+ * restores as, which is the honest answer.
+ * @param {unknown} value - task `agentTeamsOrigin`.
+ * @returns {'request' | 'continuation' | 'settings-default' | null} the stored origin.
+ */
+function teamOriginView(value) {
+  return value === 'request' || value === 'continuation' || value === 'settings-default' ? value : null;
 }
 
 /** @param {object} value - activity summary view. @returns {object|null} bounded activity view. */
@@ -1841,6 +1961,62 @@ function knownValue(value, allowed) {
 /** @returns {boolean} true when this state must never be evicted by a save. */
 function isTerminal(state) {
   return KNOWN_STATES.has(state) && !LIVE_STATES.has(state);
+}
+
+/**
+ * Validate the id list of one batch delete, without touching any document.
+ *
+ * The list is a SET of exact ids: a duplicate, a blank id, a non-string, an empty
+ * list or one above the bound is the caller's mistake and is refused whole. Each id
+ * is TRIMMED exactly like `projectView` trims a stored `taskId`, so the comparison in
+ * `deleteMany` is against the same canonical form that was written — nothing else is
+ * coerced, so an id this store could not have minted can never match by accident.
+ * @param {unknown} taskIds - caller-supplied ids.
+ * @returns {string[]} the trimmed ids, in the caller's order.
+ * @throws {HistoryError} `HISTORY_DELETE_INVALID`.
+ */
+function requireDeleteIds(taskIds) {
+  if (!Array.isArray(taskIds)) {
+    throw new HistoryError(HISTORY_CODES.deleteInvalid, 'a history batch delete needs a list of task ids', {
+      field: 'taskIds',
+      limit: HISTORY_DELETE_MAX_TASKS,
+    });
+  }
+  if (taskIds.length === 0) {
+    throw new HistoryError(HISTORY_CODES.deleteInvalid, 'a history batch delete needs at least one task id', {
+      field: 'taskIds',
+      count: 0,
+    });
+  }
+  if (taskIds.length > HISTORY_DELETE_MAX_TASKS) {
+    throw new HistoryError(HISTORY_CODES.deleteInvalid, 'a history batch delete exceeds the accepted bound', {
+      field: 'taskIds',
+      count: taskIds.length,
+      limit: HISTORY_DELETE_MAX_TASKS,
+    });
+  }
+  const seen = new Set();
+  for (const value of taskIds) {
+    if (typeof value !== 'string') {
+      throw new HistoryError(HISTORY_CODES.deleteInvalid, 'every task id in a batch delete must be a bounded task id', {
+        field: 'taskIds',
+      });
+    }
+    const id = value.trim();
+    if (id === '' || id.length > MAX_LABEL_CHARS) {
+      throw new HistoryError(HISTORY_CODES.deleteInvalid, 'every task id in a batch delete must be a bounded task id', {
+        field: 'taskIds',
+      });
+    }
+    if (seen.has(id)) {
+      throw new HistoryError(HISTORY_CODES.deleteInvalid, 'a batch delete may not repeat a task id', {
+        field: 'taskIds',
+        taskId: id,
+      });
+    }
+    seen.add(id);
+  }
+  return [...seen];
 }
 
 /**

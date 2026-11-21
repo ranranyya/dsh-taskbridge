@@ -83,11 +83,9 @@ credentials, registry, startup entries or live host registrations.
    Support global settings plus project overrides and bounded per-job overrides,
    with the effective snapshot visible in job details. No automatic fallback by
    default, and no hidden use of Harness Default.
-6. Optional additional model review: OFF by default, separate from authorization.
-   It has its own provider, model and effort. When ON, an independent read-only
-   review examines the delivered diff/evidence. It cannot approve on behalf of
-   Codex, execute mutating tools or trigger an infinite repair loop. Return the
-   review findings to the host; the host decides any follow-up task.
+6. The host plans each task and reviews the delivered diff and evidence. It records
+   its own conclusion and decides whether to accept the work or request a follow-up.
+   The plugin retains findings from historical model reviews for reference.
 7. Real execution through native DSH agents/tools: create a bounded native agent,
    set its explicit provider/model/reasoning, execute in the requested approved
    workspace, collect output/tool events/result, and dispose on completion,
@@ -96,7 +94,7 @@ credentials, registry, startup entries or live host registrations.
    isolation requires a committed git repository. Do not let two jobs mutate the
    same workspace concurrently.
 8. Task history: pending/running/awaiting-host-review/failed/cancelled and separate
-   extra-review outcome. Show actual provider/model/effort, changed file summary,
+   host acceptance. Show actual provider/model/effort, changed file summary,
    diff and validation evidence, time and available usage. Execution completion
    must NOT mean host acceptance; host acceptance is a distinct explicit action
    or is left to Codex and labeled honestly. Cancel and explicit retry supported;
@@ -116,7 +114,7 @@ credentials, registry, startup entries or live host registrations.
    response. Allow a practical token budget, recognize reasoning-only responses,
    return bounded redacted diagnostics; do not repeat the maxTokens=1 false timeout.
 10. DSH settings UI: one local-call switch above four areas: DSH API selection,
-    execution settings, additional review and task records. Plain Chinese labels,
+    execution settings and task records. Plain Chinese labels,
     usable form controls, explicit save/errors/loading and actual effective
     values. Do not ask users to re-enter DSH provider credentials.
 11. Shipping: installable npm .tgz with DSH bundle patch, native backend entry,
@@ -124,7 +122,7 @@ credentials, registry, startup entries or live host registrations.
     supported runtime versions, configuration/secret handling, upgrade/export
     behavior, uninstall/rollback and limits. No credentials, node_modules or
     local-only absolute paths in the package. Include meaningful automated tests
-    for auth enforcement, routing/effort, read-only review, lifecycle/cancellation,
+    for auth enforcement, routing/effort, host acceptance, lifecycle/cancellation,
     redaction, isolation, MCP/control-plane separation and package contents.
 12. Configuration presets/export: export nonsecret settings; allow saving reusable
     execution/review combinations. Credentials remain separate. Existing jobs use

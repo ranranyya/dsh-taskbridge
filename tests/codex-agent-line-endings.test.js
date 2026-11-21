@@ -177,7 +177,7 @@ function temporaryCodexHome() {
 
 /** Environment naming only this Codex home, so no operator override leaks in. */
 function isolatedEnv(codexHome) {
-  return { CODEX_HOME: codexHome, DSH_HOME: '', DSH_DELEGATE_DISCOVERY_FILE: '' };
+  return { CODEX_HOME: codexHome, DSH_HOME: join(codexHome, '.dsh-test-home'), DSH_DELEGATE_DISCOVERY_FILE: '' };
 }
 
 /** The agent file path inside a Codex home. */
@@ -633,6 +633,7 @@ function productLayout() {
   for (const relative of [
     'src/codex/installer.js',
     'src/codex/toml.js',
+    'src/codex/agent-ownership.js',
     'src/config/store.js',
     'codex/dsh-taskbridge.toml',
     'package.json',
@@ -689,8 +690,9 @@ test('the mixed-line-ending fix holds in a package layout that ships no tests di
   assert.deepEqual(refreshed.changed, ['agent'], 'the shipped layout upgrades it');
   const written = readFileSync(join(home, 'agents', 'dsh-taskbridge.toml'), 'utf8');
   assert.equal(measure(written).crlf, 0, 'written LF');
-  assert.equal(await shipped.isKnownPriorTemplate(written), false);
-  const after = await shipped.readCodexStatus({ codexHome: home, env: isolatedEnv(home) });
+  // The written file is the release template itself here, so it reads back `installed`; what
+  // matters is that an EDITED file above was never claimed, which the assertions above prove.
+  const after = await shipped.readCodexStatus({ codexHome: home, env: isolatedEnv(home), version: status.packageVersion });
   assert.equal(after.agent.state, 'installed', 'and reads back installed in the shipped layout');
 });
 

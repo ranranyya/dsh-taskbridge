@@ -8,7 +8,7 @@
 //   3. the concurrency slot is checked, then the source workspace is locked;
 //   4. isolation is honoured (a real worktree) or refused — never downgraded;
 //   5. the execution workspace is locked, audited and baselined;
-//   6. worker and review routes are confirmed and frozen against one provider
+//   6. the worker route is confirmed and frozen against one provider
 //      registry snapshot;
 //   7. only then does an agent exist.
 //
@@ -66,11 +66,11 @@
 // recorded), not merely that the state was written.
 
 import { randomUUID } from 'node:crypto';
-import { defaultSettings, LIMITS, MONITORING_DEFAULTS } from '../config/defaults.js';
+import { DEFAULT_AGENT_TEAMS_FOR_NEW_TASKS, defaultSettings, LIMITS, MONITORING_DEFAULTS } from '../config/defaults.js';
 import { redactDeep, redactText } from '../config/redact.js';
 import { resolveEffectiveConfig } from '../config/settings.js';
 import { AUTH_CODES, AuthError } from '../auth/grants.js';
-import { TaskMonitor, isPublicReason, terminalReason } from './activity.js';
+import { CHECKPOINTS, TaskMonitor, isPublicReason, terminalReason } from './activity.js';
 import { resolveRoute } from '../model/routing.js';
 import { PROVIDER_SET_CODES, managedProvidersOf } from '../model/providers.js';
 import { RUN_OUTCOMES, RunError, SessionPlacementRefusal, diagnostic, runAgent } from '../runtime/agent-runner.js';
@@ -88,10 +88,9 @@ import {
 } from './continuation-identity.js';
 import { taskTitle } from './title.js';
 import { MAX_PLAN_DEPTH } from './plan-store.js';
-import { REVIEW_STATES, reviewWork } from '../review/reviewer.js';
-import { buildReviewPrompt, buildWorkerPrompt } from '../review/prompts.js';
+import { buildWorkerPrompt } from '../runtime/worker-prompt.js';
 import { captureBaseline, captureDiff } from '../workspace/audit.js';
-import { LOCK_CODES, WorkspaceError, resolveWorkspacePath } from '../workspace/locks.js';
+import { LOCK_CODES, LOCK_MODES, WorkspaceError, resolveWorkspacePath } from '../workspace/locks.js';
 import {
   REVIEW_NOTE_MAX_CHARS,
   normalizeReviewNote,
@@ -128,6 +127,13 @@ export const JOB_CODES = Object.freeze({
   isolationRefused: 'JOB_ISOLATION_REFUSED',
   auditUnavailable: 'JOB_AUDIT_UNAVAILABLE',
   routingRefused: 'JOB_ROUTING_REFUSED',
+  // The directory a job needs is already held by another job. Reported in exactly
+  // two situations, both of which mean "this submission would have changed bytes the
+  // other job owns": another job is running in the SAME directory (shared
+  // isolation, or the same managed tree for a continuation), or another job is
+  // writing to the source checkout this submission wanted to write to as well.
+  // Two ISOLATED runs of one source are NOT one of them: they prepare their trees
+  // one at a time and then run in separate checkouts (see {@link JobEngine#admit}).
   busy: 'JOB_WORKSPACE_BUSY',
   concurrency: 'JOB_CONCURRENCY_LIMIT',
   cancelled: 'JOB_CANCELLED',
@@ -183,21 +189,33 @@ export const JOB_CODES = Object.freeze({
 const DEFAULT_SWEEP_INTERVAL_MS = 1000;
 
 /**
- * Bound on preflight before the operator's own timeout is known.
+ * Bound on preflight before a task's own execution budget is known.
  *
- * The worker timeout lives in the settings document, which is read *during*
- * preflight, so the first steps need a bound of their own or a hung native
- * service could hold a slot forever. Once the effective snapshot is resolved the
- * deadline is re-armed from `worker.timeoutSeconds`, measured from task creation,
- * so preflight time is charged to the same budget as the run itself.
+ * Preflight is admission work — path resolution, routing, the source lock, a
+ * worktree, provider leases — and it must be bounded by SOMETHING, or a hung native
+ * service would hold a concurrency slot and a workspace lease forever. This is a
+ * FIXED internal bound and deliberately not the operator's old `worker.timeoutSeconds`:
+ * that field no longer limits a run, so it must not quietly limit admission either.
+ *
+ * Once the effective snapshot is resolved, {@link JobEngine#start} re-arms the
+ * deadline from `executionTimeoutSeconds` — `null` by default, in which case there is
+ * NO deadline at all for the run itself. An admission that never reaches that point
+ * keeps this bound.
  */
-const DEFAULT_PREFLIGHT_TIMEOUT_MS = defaultSettings().worker.timeoutSeconds * 1000;
-
-/** Ceiling on the additional review's own time budget. */
-const REVIEW_TIMEOUT_CAP_MS = 1800 * 1000;
+const DEFAULT_PREFLIGHT_TIMEOUT_MS = 30 * 60 * 1000;
 
 /** How long cancel/dispose wait for a task to observe its cancellation. */
 const SETTLE_TIMEOUT_MS = 5000;
+
+/**
+ * How far a task's recorded start may be from the engine's own clock and still be used.
+ *
+ * A task record can come from a different time base than the engine's `now` seam (a
+ * restored record, or a test with an injected clock). Beyond this distance the recorded
+ * start is not an elapsed time but two clocks that disagree, so the engine stamps its
+ * OWN instant when the run really starts — the same rule the monitor applies to silence.
+ */
+const MAX_PLAUSIBLE_START_SKEW_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Bound on waiting for a native executor to confirm that it stopped.
@@ -210,6 +228,18 @@ const SETTLE_TIMEOUT_MS = 5000;
  * either of those already waited at least as long as this gate can take.
  */
 const NATIVE_SETTLE_TIMEOUT_MS = SETTLE_TIMEOUT_MS;
+
+/**
+ * How long an ISOLATED submission waits for its turn to prepare a Git worktree.
+ *
+ * Two isolated runs of one source repository share only Git's administrative area,
+ * so the creation step is serialised while the runs themselves are not. That wait
+ * is charged to the same preflight budget every admission step already has
+ * (`preflightTimeoutMs`, and the task's own execution budget once known), so this
+ * value only bounds a queue entry whose wait has no other bound: a caller that
+ * abandons its start must not leave its place in the queue held forever.
+ */
+const PREPARATION_QUEUE_LIMIT_MS = DEFAULT_PREFLIGHT_TIMEOUT_MS;
 
 /**
  * Bound on one durable history write.
@@ -399,6 +429,7 @@ export class JobEngine {
     this.history = deps?.history ?? null;
     this.plans = deps?.plans ?? null;
     this.tasks = new Map();
+    this.cleanupIds = new Set();
     this.aborted = false;
     this.sweepTimer = null;
     this.unsubscribe = null;
@@ -418,6 +449,21 @@ export class JobEngine {
     // must read the same time source.
     this.clock = typeof deps?.now === 'function' ? deps.now : Date.now;
     this.observationWait = typeof deps?.wait === 'function' ? deps.wait : undefined;
+    // The scheduler seam for the monitors' own self-check timer. Absent in production
+    // (the monitor uses the real, unref'd `setTimeout`); a test injects one so the
+    // scheduled inspection can be fired deterministically.
+    const timers = deps?.timers;
+    this.timerSeam = timers !== null && typeof timers === 'object'
+      && (typeof timers.setTimeout === 'function' || typeof timers.clearTimeout === 'function')
+      ? {
+        // EACH seam is passed only when it is a function. A host that injects the scheduler
+        // for its own bookkeeping (a recording `setTimeout` with the platform's own
+        // `clearTimeout`, or the reverse) must never make one of the two `undefined`: the
+        // monitor would then call `undefined` and silently lose the inspection.
+        ...(typeof timers.setTimeout === 'function' ? { setTimeout: timers.setTimeout } : {}),
+        ...(typeof timers.clearTimeout === 'function' ? { clearTimeout: timers.clearTimeout } : {}),
+      }
+      : undefined;
     const slice = Number(deps?.observeSliceMs);
     this.observeSliceMs = Number.isFinite(slice) && slice > 0 ? Math.trunc(slice) : OBSERVE_SLICE_MS;
     // Observers currently waiting, so disposal can release them without touching
@@ -432,6 +478,11 @@ export class JobEngine {
     // entry it belongs to, so a global counter is enough and cannot wrap into confusion
     // with a task's own numbering.
     this.reviewSeq = 0;
+    // Git preparation turns, keyed by source repository. Isolated runs of one source
+    // share Git's administrative area, so their creation step is serialised while the
+    // runs are not; see {@link withPreparationTurn}. Live entries only: an abandoned
+    // waiter is removed from the queue when it gives up.
+    this.preparationTurns = new Map();
     this.listen();
   }
 
@@ -577,6 +628,8 @@ export class JobEngine {
       });
     }
     const parentNodeId = typeof rawParentNodeId === 'string' ? rawParentNodeId.trim() : '';
+    this.assertRecordNotBeingRemoved(continueFromTaskId);
+    this.assertRecordNotBeingRemoved(parentNodeId);
     const goal = canonicalTaskDescription(request?.goalDescription, TASK_DESCRIPTION_FIELDS.goal, redactText);
     if (goal.ok === false) {
       throw new JobError(JOB_CODES.descriptionInvalid, goal.refusal.message, {
@@ -654,10 +707,12 @@ export class JobEngine {
       effective: null,
       routes: null,
       route: null,
-      reviewRoute: null,
-      reviewRouteError: null,
       baseline: null,
       worktree: null,
+      // What this task actually holds in the workspace lock registry. Each entry is
+      // `{ path, nonce, mode, purpose }`: `exclusive` holds name the directory the run
+      // writes to, `preparation` holds are the short shared ones taken while a Git tree
+      // is created. Both are released by {@link releaseLeases}, newest first.
       leases: [],
       // The process-local provider-definition lease this task holds, taken before
       // it awaited the route ensure and given back only by {@link finalize}: it is
@@ -683,12 +738,25 @@ export class JobEngine {
       // execution path and conversation, never the internal parent object.
       continuationParent: null,
       continuationRecord: null,
+      // The parent's Agent Teams facts (`teamFactsOf`), read once during continuation
+      // admission from the same documents whose ownership was just proven. Admission's
+      // effective step decides what may be inherited from them; nothing re-reads history
+      // for it. `null` for a task that is not a continuation.
+      continuationTeam: null,
+      // The frozen Agent Teams decision (`null` when none is applied), WHERE it came from
+      // (`request` / `continuation` / `settings-default`) and whether it is the operator's
+      // DEFAULT filling an absent choice. The three are kept apart so a record never
+      // presents a default as a request, and so the runner can refuse an explicit or
+      // inherited choice it cannot apply while still letting the documented OFF default
+      // through on an older host.
+      agentTeams: null,
+      agentTeamsOrigin: null,
+      agentTeamsFromDefault: false,
       // The identity map row, read exactly once, and the single durable snapshot the
       // continuation is judged by. Both are admission-only facts; the public task view
       // exposes the resulting execution path and conversation, never the internals.
       continuationIdentity: null,
       reusedWorktree: false,
-      review: { state: REVIEW_STATES.notRun, verdict: null, text: '', error: null },
       error: null,
       cancelRequested: false,
       cancelledBy: null,
@@ -737,7 +805,11 @@ export class JobEngine {
       // published only once the durable write has CONFIRMED it (see `recordHostReview`).
       hostAcceptance: null,
       settled,
-      settle: () => { settle(); },
+      cleanupSettled: false,
+      settle() {
+        this.cleanupSettled = true;
+        settle();
+      },
     };
   }
 
@@ -831,6 +903,15 @@ export class JobEngine {
     // ---- 4. effective configuration and the concurrency slot -----------------
     task.phase = 'effective';
     const overrides = sanitizeOverrides(grant.overrides ?? request?.overrides);
+    // WHERE the frozen team choice came from: the dispatcher's own per-task value, the
+    // chain a follow-up continues, or the operator's new-task default. Recorded so a
+    // reader can tell "you asked for this" from "the setting decided this".
+    let teamChoiceOrigin = typeof overrides.agentTeams === 'boolean' ? 'request' : null;
+    // Whether the frozen choice is the OPERATOR'S DEFAULT filling an absent one. Only that
+    // kind may proceed when the host has no agent-teams service: an explicit choice — and
+    // a choice inherited from a chain, which the dispatcher did make at some point — is
+    // refused instead of silently running under the Session's own mode.
+    let teamChoiceFromDefault = false;
     if (task.continuationRecord !== null) {
       const parentIsolation = task.continuationRecord.isolation;
       if (overrides.isolation !== undefined && overrides.isolation !== parentIsolation) {
@@ -847,11 +928,39 @@ export class JobEngine {
       overrides.isolation = parentIsolation;
       // The Agent Teams decision follows the same rule as isolation for a CONTINUATION:
       // it is inherited from the parent UNLESS the dispatcher states it explicitly, so a
-      // follow-up keeps the chain's team mode instead of silently flipping it. `null`
-      // (no choice anywhere) stays `null` and the Session keeps its own mode.
-      if (overrides.agentTeams === undefined && typeof task.continuationRecord.agentTeams === 'boolean') {
-        overrides.agentTeams = task.continuationRecord.agentTeams;
+      // follow-up keeps the chain's team mode instead of silently flipping it.
+      //
+      // What may be inherited is a value that actually reached a native Session. A parent
+      // whose decision was the operator's default, asked for OFF, and was answered by a
+      // host with no agent-teams service never wrote anything (`teamFactsOf` says so), so
+      // there is nothing to carry forward: this follow-up sends no choice and keeps its
+      // Session's own mode. It also deliberately does NOT fall back to today's new-task
+      // default — that setting is about new tasks, not about a live conversation.
+      //
+      // Everything else is inherited exactly as before, including a real explicit
+      // `true`/`false`, a value inherited earlier in the chain, and an older record that
+      // stored `false` with no receipt (that run really did write it).
+      const inheritedTeam = task.continuationTeam ?? teamFactsOf(
+        task.continuationRecord.agentTeams, null, null,
+      );
+      if (overrides.agentTeams === undefined && inheritedTeam.inheritable === true) {
+        overrides.agentTeams = inheritedTeam.value;
+        teamChoiceOrigin = 'continuation';
       }
+    }
+    // The operator's NEW-TASK default fills an absent choice for a NEW task only.
+    //
+    // It deliberately does NOT fill a continuation: a follow-up belongs to an existing
+    // conversation whose mode the operator may have set in DSH itself, and inventing a
+    // choice there would overwrite a live Session's selection with a setting that was
+    // never about it. So a continuation with no provable parent decision and no explicit
+    // choice stays ABSENT (`null`): no `agentTeams` is sent, the native Session keeps its
+    // current value, and the record says the mode was not decided here rather than
+    // claiming it was turned off.
+    if (typeof overrides.agentTeams !== 'boolean' && task.continuationRecord === null) {
+      overrides.agentTeams = operatorTeamDefault(settings);
+      teamChoiceOrigin = 'settings-default';
+      teamChoiceFromDefault = true;
     }
     let effective;
     try {
@@ -861,8 +970,15 @@ export class JobEngine {
       const { agentTeams: teamChoice, ...settingsOverrides } = overrides;
       effective = resolveEffectiveConfig(settings, { projectPath: sourcePath, overrides: settingsOverrides });
       // Frozen on the task so the view, the run and a later continuation all state the
-      // SAME explicit decision. `null` = the commander made no choice for this task.
+      // SAME explicit decision. `null` = no choice applied, which the runner reports as
+      // "no choice" rather than guessing one.
       task.agentTeams = typeof teamChoice === 'boolean' ? teamChoice : null;
+      task.agentTeamsOrigin = task.agentTeams === null ? null : teamChoiceOrigin;
+      // Whether that frozen choice is the operator's default rather than something a
+      // person decided. The runner needs it to tell "the setting asked for this" (which
+      // may proceed unpublished on an older host) from "somebody asked for this" (which
+      // must be refused rather than silently ignored).
+      task.agentTeamsFromDefault = task.agentTeams !== null && teamChoiceFromDefault === true;
     } catch (error) {
       throw new JobError(JOB_CODES.routingRefused, error?.message ?? 'the effective configuration was refused', {
         cause: error?.code ?? null,
@@ -870,10 +986,24 @@ export class JobEngine {
       });
     }
     task.effective = effective;
-    // The worker timeout is a budget for the whole task, preflight included, so
-    // the deadline is re-armed from creation time rather than from this point.
-    task.deadlineAt = task.createdAt + effective.worker.timeoutSeconds * 1000;
-    this.armPreflightDeadline(task, task.deadlineAt - Date.now());
+    // The execution budget the RUN gets. `executionTimeoutSeconds === null` is the
+    // documented default: an ordinary delegated task has NO total execution
+    // deadline, so silence is reported by the monitoring block and never turned
+    // into a failure. A number here means the dispatcher explicitly asked for a
+    // per-job cap (`overrides.timeoutSeconds`) — the one retained compatibility
+    // path — and it is measured from creation, preflight included, exactly as
+    // before. `deadlineAt: null` is the explicit "no deadline" fact the view and
+    // the preflight gate both read.
+    const executionSeconds = effective.worker.executionTimeoutSeconds;
+    if (Number.isFinite(executionSeconds) && executionSeconds > 0) {
+      task.deadlineAt = task.createdAt + executionSeconds * 1000;
+      this.armPreflightDeadline(task, task.deadlineAt - Date.now());
+    } else {
+      task.deadlineAt = null;
+      // Admission still needs a bound of its own (see DEFAULT_PREFLIGHT_TIMEOUT_MS);
+      // it bounds STARTUP only and is cleared on every exit from admission.
+      this.armPreflightDeadline(task, this.preflightTimeoutMs);
+    }
     this.assertLive(task, 'effective');
     // The slot claim and the count happen in one synchronous step, ordered by
     // admission sequence, so two concurrent starts cannot both take the slot.
@@ -881,7 +1011,7 @@ export class JobEngine {
     // does that only after the native executor is confirmed stopped.
     this.reserveSlot(task, effective.worker.maxParallelism);
 
-    // ---- 5. provider routes for worker and review, from one snapshot ---------
+    // ---- 5. provider routes for the worker, from one snapshot ---------
     task.phase = 'providers';
     // The provider-definition lease is taken *before* the first await of this
     // step, in this same synchronous section. The native adapter serves the latest
@@ -895,32 +1025,87 @@ export class JobEngine {
     this.assertLive(task, 'providers');
     const workerRouteId = this.routeFor(task.routes, effective.worker.providerId, 'worker');
 
-    // ---- 6. lock the source workspace before anything is audited or created --
-    task.phase = 'source-lock';
-    this.acquireSourceLock(task);
+    // ---- 6 and 7. isolation, and the directory this run owns -----------------
+    //
+    // Which directory a run writes to decides what it has to hold, so the two are
+    // decided together rather than "lock the source, then prepare the tree":
+    //
+    //  - **shared**: the run writes to the source checkout itself. The source is
+    //    held EXCLUSIVELY for the whole run, exactly as before, so two shared runs
+    //    of one repository still refuse each other with `JOB_WORKSPACE_BUSY`.
+    //  - **worktree**: the run writes to its own checkout. The source is held only
+    //    for PREPARATION — the Git worktree creation, and the commit it is pinned
+    //    to — and released as soon as the tree exists, then the tree is held
+    //    exclusively. Two isolated runs of one source prepare one at a time (the
+    //    turn below) and then run at the same time in separate directories, which
+    //    is the whole point of the mode. They no longer refuse each other merely
+    //    for sharing a source repository.
+    //
+    // The turn and the preparation lease answer two different hazards and neither
+    // replaces the other: the turn keeps two `git worktree add` calls out of each
+    // other's way in one administrative area, and the preparation lease makes a
+    // shared run (which holds the source exclusively) exclude preparation while it
+    // writes, in both orders. Preparation is over before the run exists, so
+    // preparation cannot deadlock against anything a run holds.
+    const isolation = effective.worker.isolation;
+    if (isolation !== 'worktree' && isolation !== 'shared') {
+      // Unreachable for a validated snapshot; refusing is still the only honest
+      // answer to a mode this build cannot honour.
+      throw new JobError(JOB_CODES.isolationRefused, `isolation ${String(isolation)} is not implemented`, {
+        requested: isolation ?? null,
+      });
+    }
 
-    // ---- 7. isolation: a real worktree, or explicitly shared -----------------
-    if (effective.worker.isolation === 'worktree') {
-      task.phase = 'worktree';
-      const prepared = task.continuationRecord === null
-        ? await this.guardPreflight(task, 'worktree', () => this.prepareWorktree(task), {
+    if (isolation === 'shared') {
+      // ---- 6. lock the source workspace before anything is audited or created --
+      task.phase = 'source-lock';
+      this.acquireSourceLock(task);
+    } else {
+      // ---- 7. isolation: a real worktree, or an adopted one for a follow-up ----
+      //
+      // Two isolated runs of one source write to different checkouts, so they must RUN
+      // together; only the Git preparation is serialised, because `git worktree add` and
+      // the status read share the source's administrative area. A shared run holds the
+      // source exclusively while it writes, so preparation and a shared run exclude each
+      // other in both orders.
+      //
+      // The GUARD wraps the whole queue turn, not just the Git call inside it: the queue
+      // wait is a native-service-shaped await like any other, so it needs the same
+      // cancellation and deadline bound, and `onLateSettle` still collects a tree that
+      // finished after this start was abandoned.
+      task.phase = 'worktree-queue';
+      const prepared = await this.guardPreflight(
+        task,
+        'worktree',
+        () => this.withPreparationTurn(task, () => (task.continuationRecord === null
+          ? this.prepareWorktree(task)
+          : this.reuseContinuationWorktree(task))),
+        {
           // A tree that finished after this start was abandoned still exists on
           // disk. It is recorded and marked complete, never deleted or merged: it
           // is evidence, and the host decides what happens to it.
           onLateSettle: (value) => this.adoptLateWorktree(task, value),
-        })
-        : await this.guardPreflight(task, 'continuation-worktree', () => this.reuseContinuationWorktree(task));
+        },
+      );
       task.worktree = prepared;
       task.executionPath = prepared.workspacePath;
       task.reusedWorktree = task.continuationRecord !== null;
       this.assertLive(task, 'worktree');
-      this.acquireExecutionLock(task);
-    } else if (effective.worker.isolation !== 'shared') {
-      // Unreachable for a validated snapshot; refusing is still the only honest
-      // answer to a mode this build cannot honour.
-      throw new JobError(JOB_CODES.isolationRefused, `isolation ${String(effective.worker.isolation)} is not implemented`, {
-        requested: effective.worker.isolation ?? null,
-      });
+      if (!task.leases.some((lease) => lease.mode === LOCK_MODES.exclusive && samePath(lease.path, task.executionPath))) {
+        // A follow-up drives the directory its parent ran in, so this keeps two
+        // continuations of one chain from writing to one checkout. The refusal is the
+        // same one a busy shared run produces, so a caller can tell the two apart by
+        // `details.purpose`.
+        const treeBusy = this.locks.isLocked(task.executionPath, { mode: LOCK_MODES.exclusive });
+        if (treeBusy && !this.holdsLease(task, task.executionPath)) {
+          throw new JobError(JOB_CODES.busy, 'another job is already running in the isolated workspace', {
+            purpose: 'execution',
+            phase: 'worktree',
+            path: task.executionPath,
+          });
+        }
+        this.acquireExecutionLock(task);
+      }
     }
 
     // ---- 8. baseline in the workspace the run will actually mutate -----------
@@ -964,34 +1149,7 @@ export class JobEngine {
     this.assertLive(task, 'worker-route');
     task.route = route;
 
-    // ---- 10. review route, frozen BEFORE the worker runs ---------------------
-    // A review that resolved its route after execution would judge the work with
-    // whatever configuration existed later, or with an ambient route. A review
-    // routing failure is recorded on the review record and never refuses the
-    // task, and it never turns into approval.
-    if (effective.review.enabled === true) {
-      task.phase = 'review-route';
-      try {
-        const reviewRouteId = this.routeFor(task.routes, effective.review.providerId, 'review');
-        task.reviewRoute = await this.guardPreflight(task, 'review-route', () => resolveRoute(this.deps, {
-          providerId: effective.review.providerId,
-          providerRoute: reviewRouteId,
-          model: effective.review.model,
-          reasoningEffort: effective.review.reasoningEffort,
-        }, { signal: task.controller.signal }));
-      } catch (error) {
-        if (error instanceof JobError) throw error;
-        task.reviewRoute = null;
-        task.reviewRouteError = {
-          code: 'REVIEW_ROUTING_REFUSED',
-          message: diagnostic(error?.message ?? 'the review route could not be confirmed', 400),
-          cause: typeof error?.code === 'string' ? error.code : null,
-        };
-      }
-      this.assertLive(task, 'review-route');
-    }
-
-    // ---- 11. last preflight gate before any native create --------------------
+    // ---- 10. last preflight gate before any native create --------------------
     task.phase = 'admitted';
     this.assertLive(task, 'admitted');
   }
@@ -1108,6 +1266,12 @@ export class JobEngine {
 
   /**
    * Record and finish a worktree that was prepared after its start was abandoned.
+   *
+   * The Git call finished after the submission gave up (cancel, or the admission
+   * deadline). The queue released the source lease on that settlement, so nothing is
+   * left to return; what remains is the TREE, which is evidence: it is recorded on the
+   * task and marked complete, never merged and never deleted. The host reviews or
+   * disposes it explicitly.
    * @param {object} task - task record.
    * @param {unknown} prepared - the late value, if it is usable.
    * @returns {void}
@@ -1139,7 +1303,7 @@ export class JobEngine {
 
   /**
    * Record the one terminal state a task may have. The first writer wins, so a
-   * late promise, a late review result or a second failure can never revive or
+   * late promise or a second failure can never revive or
    * overwrite a task that has already ended.
    * @param {object} task - task record.
    * @param {string} state - terminal state to record.
@@ -1204,7 +1368,7 @@ export class JobEngine {
    * Idempotent by latch. A task keeps its record after it is terminal, so every
    * terminal path — success, failure, cancellation, timeout, admission refusal,
    * dispose — has to come through here, and a second path that races the first
-   * (a late review refusal, `cancel()` after `dispose()`) awaits the same
+   * (`cancel()` after `dispose()`) awaits the same
    * promise instead of releasing twice.
    *
    * It refuses to hand anything back while the native executor this task started
@@ -1371,7 +1535,7 @@ export class JobEngine {
   /**
    * Ensure the native provider routes for one settings snapshot.
    *
-   * One call per snapshot, before either the worker or the review route is
+   * One call per snapshot, before the worker route is
    * resolved, so both selections come from the same mapping. Previously ensured
    * routes stay with the registry until plugin dispose; the engine never narrows
    * the set it passes in.
@@ -1490,7 +1654,7 @@ export class JobEngine {
    * resolving one produced the field failure this module exists to prevent.
    * @param {Map<string, string> | null} routes - route mapping, or null for the legacy path.
    * @param {string | null} providerId - operator-facing profile id.
-   * @param {string} role - `worker` or `review`, for diagnostics.
+   * @param {string} role - route role for diagnostics.
    * @returns {string} native route id.
    */
   routeFor(routes, providerId, role) {
@@ -1520,38 +1684,253 @@ export class JobEngine {
   }
 
   /**
-   * Acquire the lease on the source workspace.
+   * Acquire the EXCLUSIVE lease on the source workspace.
+   *
+   * This is the shared-isolation case: the run writes to the source checkout, so
+   * nothing else — another shared run, or another run's Git preparation — may
+   * touch it for as long as the run lives.
    * @param {object} task - pending record.
    * @returns {void}
    */
   acquireSourceLock(task) {
     try {
-      const lease = this.locks.acquire(task.sourcePath, { taskId: task.taskId });
-      task.leases.push({ path: task.sourcePath, nonce: lease.nonce });
+      // `explicitRelease`: a shared run may legitimately last hours (a delegated run
+      // has no total time limit by default), so the sourcestays this run's until
+      // {@link finalize} returns it — never until a wall-clock bound expires.
+      const lease = this.locks.acquire(task.sourcePath, {
+        taskId: task.taskId,
+        mode: LOCK_MODES.exclusive,
+        explicitRelease: true,
+      });
+      task.leases.push({ path: task.sourcePath, nonce: lease.nonce, mode: LOCK_MODES.exclusive, purpose: 'source' });
     } catch (error) {
       if (error instanceof WorkspaceError && error.code === LOCK_CODES.busy) {
-        throw new JobError(JOB_CODES.busy, error.message, redactDeep(error.details ?? {}));
+        throw new JobError(JOB_CODES.busy, error.message, { purpose: 'source', ...redactDeep(error.details ?? {}) });
       }
       throw error;
     }
   }
 
   /**
-   * Acquire the lease on the execution workspace (the worktree), after the
-   * source lease. A shared run reuses the source lease instead of double-locking
-   * one path.
+   * Run one Git preparation under the per-source FIFO, and nothing else.
+   *
+   * ## Why a queue exists
+   *
+   * Two isolated runs of one source write to two DIFFERENT checkouts, so they must RUN
+   * at the same time. What they share is Git's administrative area: `worktree add`, the
+   * pinned-commit read, `status` and `prune` all touch the same `.git/worktrees` index,
+   * and `git status` there can see the source checkout. So only the PREPARATION step is
+   * serialised per source, never the run.
+   *
+   * ## How the exclusion is actually enforced
+   *
+   * Two independent mechanisms, and both must hold:
+   *
+   *  - **The FIFO** — arrivals queue by resolved source path and only the head runs
+   *    its Git work. A waiter that gives up while queued leaves and hands the place on,
+   *    so the queue never jams.
+   *  - **A hard exclusive lease on the source**, taken by the head in a LOCAL variable
+   *    and released in the same `finally` that ends its Git work. It is deliberately
+   *    NOT recorded in `task.leases`: an admission that is cancelled would otherwise
+   *    let the ordinary `finalize` release it while `git worktree add` was still
+   *    writing, which is exactly how a second preparation could begin beside the first
+   *    (`peak: 2`).
+   *
+   * The lease is what makes the guarantee survive a cancellation. The outer
+   * {@link JobEngine#guardPreflight} may return to `start()` — and `cancel()` may
+   * complete — while this async operation is still running; the operation keeps the
+   * lease until Git really answers, so the next head cannot start Git until then. This
+   * method therefore never has to "step aside" early: its `finally` runs when the work
+   * it awaits is truly over.
+   * @param {object} task - pending run with a resolved source path.
+   * @param {() => Promise<object>} work - the Git preparation to run as the head.
+   * @returns {Promise<object>} the preparation's result.
+   */
+  async withPreparationTurn(task, work) {
+    const key = lockKeyOf(task.sourcePath);
+    let queue = this.preparationTurns.get(key);
+    if (queue === undefined) {
+      queue = [];
+      this.preparationTurns.set(key, queue);
+    }
+    const entry = { key, queue, signal: task.controller.signal, wake: null, granted: null, left: false };
+    entry.granted = new Promise((resolvePromise) => { entry.wake = () => resolvePromise(); });
+    queue.push(entry);
+    // The FIRST arrival takes the turn at once: there is no predecessor to hand it over.
+    // A later arrival waits for the hand-over in `finally`, which happens only after the
+    // head's Git work is finished and its lease is back — never before.
+    if (queue.length === 1) entry.wake();
+
+    let release = null;
+    try {
+      // A waiter that is not the head subscribes FIRST, so a hand-over that happens
+      // between these two steps cannot be missed.
+      const queued = this.awaitPreparationTurn(task, entry);
+      await queued;
+      // Refusals after the wait must be seen here, in the same step that starts Git.
+      this.assertLive(task, 'worktree-queue');
+      // An EXCLUSIVE lease, held locally. A shared run holds the source the same way
+      // while it writes, so the two exclude each other in both orders.
+      release = this.acquirePreparationLease(task);
+      return await work();
+    } finally {
+      // Order is deliberate: the lease goes back BEFORE the place is handed on, so the
+      // next head can never observe a lease this turn is about to drop. The place is
+      // released only once this Git work has really finished — the whole point of the
+      // local lease is that the outer guard may have already returned to `start()`.
+      release?.();
+      this.leavePreparationQueue(entry);
+    }
+  }
+
+  /**
+   * Wait until this submission is the head of its source's preparation queue.
+   *
+   * Ends in one of three ways: the turn is granted, the task is cancelled or disposed,
+   * or {@link PREPARATION_QUEUE_LIMIT_MS} expires. Only the first may start Git; the
+   * others leave the queue (handing the place on) and are refused, so a cancelled
+   * submission can never create a tree.
+   * @param {object} task - pending run with a resolved source path.
+   * @param {object} entry - this submission's queue entry.
+   * @returns {Promise<void>} resolves when this submission is the head.
+   */
+  async awaitPreparationTurn(task, entry) {
+    const limit = Number.isFinite(this.preparationQueueLimitMs) && this.preparationQueueLimitMs > 0
+      ? this.preparationQueueLimitMs
+      : PREPARATION_QUEUE_LIMIT_MS;
+    let stopWatching = null;
+    const abandoned = new Promise((resolvePromise) => {
+      // A signal that is ALREADY aborted never fires its listener, so it is checked
+      // rather than awaited.
+      if (entry.signal?.aborted === true) {
+        resolvePromise('aborted');
+        return;
+      }
+      const onAbort = () => resolvePromise('aborted');
+      entry.signal?.addEventListener?.('abort', onAbort, { once: true });
+      const timer = setTimeout(() => resolvePromise('timeout'), limit);
+      timer?.unref?.();
+      stopWatching = () => {
+        entry.signal?.removeEventListener?.('abort', onAbort);
+        clearTimeout(timer);
+      };
+    });
+    let outcome;
+    try {
+      outcome = await Promise.race([entry.granted, abandoned]);
+    } finally {
+      stopWatching?.();
+    }
+    if (outcome === undefined) return;
+    // Refused while queued: leave now, hand the place on, and never start Git.
+    this.leavePreparationQueue(entry);
+    if (outcome === 'timeout') {
+      throw new JobError(JOB_CODES.timeout, 'the task could not prepare an isolated workspace in time', {
+        phase: 'worktree-queue',
+        queued: true,
+      });
+    }
+    throw this.preflightAbort(task, 'worktree-queue');
+  }
+
+  /**
+   * Remove one entry from its queue and pass the turn on. Idempotent.
+   * @param {object} entry - the queue entry to remove.
+   * @returns {void}
+   */
+  leavePreparationQueue(entry) {
+    if (entry.left === true) return;
+    entry.left = true;
+    const index = entry.queue.indexOf(entry);
+    if (index >= 0) entry.queue.splice(index, 1);
+    // A woken waiter that is itself abandoned drops out on its own turn and hands the
+    // place on again, so the place is never lost.
+    entry.queue[0]?.wake?.();
+    if (entry.queue.length === 0 && this.preparationTurns.get(entry.key) === entry.queue) {
+      this.preparationTurns.delete(entry.key);
+    }
+  }
+
+  /**
+   * Take the head's hard exclusive lease on the source, locally.
+   *
+   * Returned as a releaser rather than recorded on the task: the task's `leases` list
+   * is cleared by ordinary `finalize`, which may run while this Git call is still
+   * writing — releasing here would let a second preparation start beside it.
+   * @param {object} task - pending run with a resolved source path.
+   * @returns {() => void} idempotent releaser for exactly this nonce.
+   */
+  acquirePreparationLease(task) {
+    let lease;
+    try {
+      lease = this.locks.acquire(task.sourcePath, {
+        taskId: task.taskId,
+        mode: LOCK_MODES.exclusive,
+        explicitRelease: true,
+      });
+    } catch (error) {
+      if (error instanceof WorkspaceError && error.code === LOCK_CODES.busy) {
+        throw new JobError(JOB_CODES.busy, error.message, {
+          purpose: 'source',
+          ...redactDeep(error.details ?? {}),
+        });
+      }
+      throw error;
+    }
+    let released = false;
+    // The lease names its directory `workspacePath`; `path` is the name this module uses
+    // for the same value on a task's own lease records. Reading the wrong one would make
+    // every release a silent no-op keyed on `undefined`.
+    const heldPath = lease.workspacePath ?? task.sourcePath;
+    return () => {
+      if (released) return;
+      released = true;
+      try {
+        this.locks.release(heldPath, lease.nonce);
+      } catch {
+        // Releasing a lease we no longer hold is a no-op by design.
+      }
+    };
+  }
+
+  /**
+   * Whether this task already holds a lease on one path.
+   * @param {object} task - task record.
+   * @param {string} path - workspace path.
+   * @returns {boolean} true when a lease on that path is held.
+   */
+  holdsLease(task, path) {
+    return task.leases.some((lease) => samePath(lease.path, path));
+  }
+
+  /**
+   * Acquire the EXCLUSIVE lease on the execution workspace (the worktree), once it
+   * exists. A shared run already holds the source exclusively, so one path is never
+   * double-locked.
    * @param {object} task - pending record with a prepared execution path.
    * @returns {void}
    */
   acquireExecutionLock(task) {
     if (task.executionPath === null || samePath(task.executionPath, task.sourcePath)) return;
-    if (task.leases.some((lease) => samePath(lease.path, task.executionPath))) return;
+    if (this.holdsLease(task, task.executionPath)) return;
     try {
-      const lease = this.locks.acquire(task.executionPath, { taskId: task.taskId });
-      task.leases.push({ path: task.executionPath, nonce: lease.nonce });
+      // `explicitRelease`: an isolated run is a real execution whose length nobody
+      // bounded, so its checkout stays its own until {@link finalize} returns it.
+      const lease = this.locks.acquire(task.executionPath, {
+        taskId: task.taskId,
+        mode: LOCK_MODES.exclusive,
+        explicitRelease: true,
+      });
+      task.leases.push({
+        path: task.executionPath,
+        nonce: lease.nonce,
+        mode: LOCK_MODES.exclusive,
+        purpose: 'execution',
+      });
     } catch (error) {
       if (error instanceof WorkspaceError && error.code === LOCK_CODES.busy) {
         throw new JobError(JOB_CODES.busy, 'another job is already running in the isolated workspace', {
+          purpose: 'execution',
           ...redactDeep(error.details ?? {}),
         });
       }
@@ -1562,7 +1941,13 @@ export class JobEngine {
   /**
    * Prepare an isolated worktree, or refuse. There is no fallback to shared
    * execution: a missing service is a refusal, not a downgrade.
-   * @param {object} task - pending record with a locked source path.
+   *
+   * Called only as the head of its source's preparation queue, so the preparation
+   * lease on the source is already held (see {@link JobEngine#withPreparationTurn})
+   * and no sibling can be inside Git at the same time. This method therefore owns no
+   * lease of its own: whatever happens to the caller, the queue releases the one it
+   * took when this promise settles.
+   * @param {object} task - pending record with a resolved source path.
    * @returns {Promise<object>} prepared worktree metadata.
    */
   async prepareWorktree(task) {
@@ -1575,6 +1960,9 @@ export class JobEngine {
       );
     }
     let prepared;
+    // The Git call is awaited directly: the queue's `finally` releases the head's
+    // exclusive lease only after this promise settles, so an abandoned caller cannot
+    // let a second preparation start beside a running `git worktree add`.
     try {
       prepared = await manager.prepare({
         taskId: task.taskId,
@@ -1613,6 +2001,9 @@ export class JobEngine {
         cause: 'WORKTREE_SAME_PATH',
       });
     }
+    // A fresh worktree may be the first to create the root. Workspace registration
+    // only affects the sidebar and is independent of the task's own placement.
+    void this.deps.registerWorktreeWorkspace?.();
     return prepared;
   }
 
@@ -1676,6 +2067,12 @@ export class JobEngine {
     // row that cannot be found or read is a refusal, never a skip.
     const parent = this.tasks.get(parentId) ?? null;
     let row;
+    // The parent's recorded team receipt, kept beside the snapshot so the decision below
+    // reads facts from the SAME documents that were just proven rather than re-reading
+    // history later. A live record is authoritative; a row from a previous process
+    // supplies its stored `team`/`agentTeamsOrigin`, and the identity map (read once,
+    // below) supplies the chain's decision when an older row predates those fields.
+    let durableTeamRecord = {};
     if (parent !== null) {
       if (parent.connectionId !== caller) throw this.absentContinuation(parentId);
       row = {
@@ -1704,6 +2101,11 @@ export class JobEngine {
         conversation: durable.execution?.conversation ?? null,
         planNodeId: durable.planNodeId ?? null,
         parentNodeId: durable.parentNodeId ?? null,
+      };
+      durableTeamRecord = {
+        agentTeams: durable.agentTeams,
+        agentTeamsOrigin: durable.agentTeamsOrigin,
+        team: durable.team,
       };
     }
 
@@ -1745,6 +2147,12 @@ export class JobEngine {
     // isolation and worktree steps read to resume the parent instead of starting over.
     task.continuationParent = parent;
     task.continuationRecord = task.continuationIdentity;
+    // The parent's Agent Teams facts, taken from the same two documents that were just
+    // proven. Admission reads them once here, so a later step never re-reads history or
+    // the identity map for a decision it must not re-derive.
+    task.continuationTeam = parent !== null
+      ? teamFactsOf(parent.agentTeams, parent.agentTeamsOrigin, parent.execution?.team)
+      : teamFactsOf(durableTeamRecord.agentTeams, durableTeamRecord.agentTeamsOrigin, durableTeamRecord.team);
   }
 
   async assertPlanHierarchy(task, sourcePath) {
@@ -2819,6 +3227,7 @@ export class JobEngine {
    * @throws {JobError} when a different conclusion is recorded or already in flight.
    */
   beginReviewWrite(task, decision, note, completionSummary = null) {
+    this.assertRecordNotBeingRemoved(task.taskId);
     if (this.history === null || this.history === undefined || typeof this.history.save !== 'function') {
       // `persistHistory` answers success for the missing-store posture, which would let a
       // review be claimed as saved when nothing was written, so this is refused up front.
@@ -3359,7 +3768,12 @@ export class JobEngine {
   }
 
   /**
-   * Release every lease this task holds, newest first.
+   * Release every lease this task still holds, newest first.
+   *
+   * Only EXECUTION leases are recorded on a task. The head's Git-preparation lease is
+   * held in a local variable by {@link JobEngine#withPreparationTurn} and never enters
+   * this list, precisely so an admission that is cancelled while `git worktree add` is
+   * still running cannot have its source returned from here.
    * @param {object} task - task record.
    * @returns {void}
    */
@@ -3387,6 +3801,18 @@ export class JobEngine {
       task.state = TASK_STATES.running;
       task.phase = 'execute';
       task.startedAt = Date.now();
+      // The instant DSH really STARTED running this task, as the engine's own clock reads
+      // it. `startedAt` stays the wall-clock fact the view and the history report; this is
+      // the same moment expressed in the clock the monitors use, and it is what BOTH
+      // reminders measure from: the ten-minute inspection (always, busy or quiet) and the
+      // forty-minute delivery clock (until TaskBridge hands a new result to the commander).
+      // A recorded start that disagrees wildly with that clock is not an elapsed time, so
+      // the engine stamps its own instant instead of inheriting a foreign time base.
+      const clockNow = this.clock();
+      const plausible = Number.isFinite(task.startedAt) && task.startedAt > 0
+        && task.startedAt <= clockNow
+        && clockNow - task.startedAt <= MAX_PLAUSIBLE_START_SKEW_MS;
+      task.runStartedAt = plausible ? task.startedAt : clockNow;
     }
     // The monitor exists from the moment the run is driven, so an executor that
     // produces nothing at all is still measured from its own state time instead of
@@ -3398,7 +3824,18 @@ export class JobEngine {
     // (against `startedAt`, i.e. while the task was still `pending`) already holds a
     // reference to the monitor, and swapping it here would leave that observer
     // watching an object that never receives another event.
-    this.ensureMonitor(task);
+    const monitor = this.ensureMonitor(task);
+    // Arm the run's ON-DEMAND self-check timer. It is the one scheduler the monitor owns:
+    // a run is inspected ONCE when it has really been running for `selfCheckSeconds`,
+    // even when no host is waiting on it — and even while its model and tools stay busy.
+    // The instant is the run's real start + `selfCheckSeconds` (the stamp set just above), so
+    // queueing, admission and Session creation never arm it. finalize/cancel/dispose clear it
+    // (see `releaseMonitor`).
+    try {
+      monitor.scheduleSelfCheck?.();
+    } catch {
+      // Scheduling can never block a run from starting.
+    }
     try {
       const workerSelection = {
         // The public profile id stays the operator-facing identity; the native
@@ -3450,7 +3887,13 @@ export class JobEngine {
         title: task.title,
         cwd: task.executionPath,
         selection: workerSelection,
-        timeoutMs: task.effective.worker.timeoutSeconds * 1000,
+        // The RUN's own budget, or `null` for "no total deadline" (the default).
+        // An absent execution budget must not be sent as `undefined`: the runner
+        // treats a non-positive/non-integer value the same way, but stating `null`
+        // keeps the intent explicit in the request it receives.
+        timeoutMs: Number.isFinite(task.effective.worker.executionTimeoutSeconds)
+          ? task.effective.worker.executionTimeoutSeconds * 1000
+          : null,
         signal: task.controller.signal,
         // What this run does with its DSH conversation, frozen on the task at
         // creation: omitted means a new conversation, present means continue exactly
@@ -3495,10 +3938,18 @@ export class JobEngine {
         // forwarded — there is no field in the summary they could travel in.
         // This hook is also the only execution evidence the phase trusts.
         onEvent: (event) => { this.onExecutionEvent(task, event); },
-        // The commander's DSH Agent Teams decision for THIS task's own Session. Absent
-        // when the task froze `null` (no choice): the run then keeps the Session's
-        // current mode instead of guessing one.
-        ...(task.agentTeams === null || task.agentTeams === undefined ? {} : { agentTeams: task.agentTeams }),
+        // The DSH Agent Teams decision for THIS task's own Session. ABSENT when the task
+        // froze none — a continuation whose chain recorded no decision, so the native
+        // Session keeps whatever mode it already has instead of being overwritten by a
+        // setting that was never about it.
+        ...(task.agentTeams === null || task.agentTeams === undefined ? {} : {
+          agentTeams: task.agentTeams,
+          // A NARROW, strictly-boolean fact: is this the operator's default, or did a
+          // person decide it? The runner uses it to refuse explicit/inherited choices on a
+          // host with no agent-teams service, while the documented OFF default may proceed
+          // unpublished. Always a boolean, never the freeze's own tri-state.
+          agentTeamsImplicit: task.agentTeamsFromDefault === true,
+        }),
       });
       task.native.promise = pending;
       let run;
@@ -3604,19 +4055,6 @@ export class JobEngine {
         return;
       }
 
-      // Review runs only for a completed execution, and only when enabled. Its
-      // route was frozen during preflight; nothing here re-reads settings.
-      task.phase = 'review';
-      task.review = await this.runReview(task);
-
-      // A cancellation or revocation during the review makes the task terminal
-      // cancelled. It must never be reported as awaiting host review, because
-      // nothing was reviewed to completion.
-      if (this.isCancelled(task) || task.review.state === REVIEW_STATES.cancelled) {
-        this.finishCancelled(task, task.review.state === REVIEW_STATES.cancelled ? 'review-cancelled' : null);
-        return;
-      }
-
       task.state = TASK_STATES.awaitingHostReview;
       task.phase = 'awaiting-host-review';
       task.endedAt = Date.now();
@@ -3687,7 +4125,14 @@ export class JobEngine {
       now: () => this.clock(),
       ...(this.observationWait === undefined ? {} : { wait: this.observationWait }),
       waitSliceMs: this.observeSliceMs,
+      // The scheduler seam. Production leaves it absent and gets the real (unref'd)
+      // timer; a test injects its own so the scheduled self-check is driven at the
+      // instant it was armed for instead of waiting ten minutes of wall time.
+      ...(this.timerSeam === undefined ? {} : { setTimeout: this.timerSeam.setTimeout, clearTimeout: this.timerSeam.clearTimeout }),
       selfCheckSeconds: monitoring?.selfCheckSeconds ?? MONITORING_DEFAULTS.selfCheckSeconds,
+      // The ONE notification interval this product measures: consecutive time without
+      // real progress, reported as a run progress check asking the commander to look.
+      // `0` means the operator switched it off for this run.
       attentionSeconds: monitoring?.attentionSeconds ?? MONITORING_DEFAULTS.attentionSeconds,
       repeatFailureThreshold: monitoring?.repeatFailureThreshold ?? MONITORING_DEFAULTS.repeatFailureThreshold,
       log: (message, detail) => this.deps?.logger?.warn?.(message, detail),
@@ -3726,6 +4171,8 @@ export class JobEngine {
     const monitor = task?.monitor ?? null;
     if (monitor === null || monitor === undefined) return;
     try {
+      // `dispose` both finalizes the activity and clears the scheduled self-check, so a
+      // finished, failed, cancelled or torn-down run leaves NO timer behind.
       monitor.dispose(Number.isFinite(task.endedAt) ? task.endedAt : this.clock());
     } catch {
       // A monitor that refuses to dispose is a defect, not a reason to leave a
@@ -3784,8 +4231,15 @@ export class JobEngine {
   activityView(task) {
     const monitor = task?.monitor ?? null;
     if (monitor === null || monitor === undefined) return null;
-    const at = this.clock();
+    let at;
     try {
+      // A settled record is described at its OWN recorded end (`finalize` writes it onto the
+      // activity), so every elapsed value — including the delivery interval — is the span
+      // the run really had. A live run is described at the engine's clock.
+      const finalizedAt = monitor.activity?.final;
+      at = finalizedAt !== null && finalizedAt !== undefined && Number.isFinite(finalizedAt.endedAt)
+        ? finalizedAt.endedAt
+        : this.clock();
       return monitor.snapshot({ at, toolActive: this.toolActive(task) });
     } catch {
       return null;
@@ -3896,9 +4350,23 @@ export class JobEngine {
     if (settled !== null) reason = settled;
     // A reminder superseded by a terminal state or a pending request above is dropped:
     // those outrank it, and a failure report must not describe a task that now needs a
-    // different decision.
+    // different decision. The same rule covers the `checkpoint` classification: it is
+    // carried only when the reason actually is `attention`.
     const failure = reason === OBSERVE_TASK_REASONS.attention ? (outcome.failure ?? null) : null;
-    return this.observationOf(task, reason, monitor, waitMs, outcome.waitedMs, outcome.activitySinceWait, failure, failureAck);
+    const reminder = reason === OBSERVE_TASK_REASONS.attention
+      ? { checkpoint: outcome.checkpoint ?? null, progress: outcome.progress ?? null }
+      : null;
+    return this.observationOf(
+      task,
+      reason,
+      monitor,
+      waitMs,
+      outcome.waitedMs,
+      outcome.activitySinceWait,
+      failure,
+      failureAck,
+      reminder,
+    );
   }
 
   /**
@@ -4076,14 +4544,56 @@ export class JobEngine {
    *   what ended the wait.
    * @param {object | null} [failureAck] - the acknowledgment result, present only when
    *   the caller asked to acknowledge one delivered reminder by its `eventId`.
+   * @param {object | null} [reminder] - the reminder an `attention` observation
+   *   reported: `{ checkpoint, progress }`. `checkpoint` distinguishes a scheduled
+   *   progress check from the silence reminder and from the failure reminder;
+   *   `progress` is its bounded diagnostic. Absent for every other reason, so the
+   *   previous answer shape is unchanged for a caller that never sees one.
    * @returns {object} observation result.
    */
-  observationOf(task, reason, monitor, waitMs, waitedMs, activitySinceWait, failure = null, failureAck = null) {
+  observationOf(task, reason, monitor, waitMs, waitedMs, activitySinceWait, failure = null, failureAck = null, reminder = null) {
     const at = this.clock();
     const summary = this.observationSummary(task, at);
     const pending = task?.permission?.pending ?? null;
     const live = monitor ?? task?.monitor ?? null;
-    const selfCheck = live === null || live === undefined ? null : live.snapshot({ at }).selfCheck;
+    const selfCheckView = live === null || live === undefined ? null : live.snapshot({ at }).selfCheck;
+    const selfCheck = selfCheckView;
+    const isAttention = reason === OBSERVE_TASK_REASONS.attention;
+    // A reminder superseded by a more urgent reason (a pending request, or a terminal
+    // state) is DROPPED rather than carried: it would describe a task that now needs a
+    // different decision, and the next observation re-derives it from the monitor.
+    const checkpoint = isAttention && typeof reminder?.checkpoint === 'string' ? reminder.checkpoint : null;
+    const progress = checkpoint === CHECKPOINTS.progress && reminder?.progress !== null
+      && typeof reminder?.progress === 'object'
+      ? reminder.progress
+      : null;
+    // THE DELIVERY. This observation is the answer this process is about to hand to the
+    // commander, and the ONLY thing that advances the run's 40-minute clock is a new result
+    // the commander did not have before — which, in THIS wait protocol, means the run's
+    // terminal outcome. There is no mid-run stage result: the wait channel delivers the
+    // result when the task ends, and nothing else.
+    //
+    // So none of these is a delivery:
+    //  * a LOCAL self-check diagnostic, on any answer — including a plain heartbeat. Reading
+    //    the diagnostic is a read of local facts the plugin already holds; it is not work
+    //    returned to anyone, and if it reset the clock the run's own inspection would hide the
+    //    very stall that inspection exists to notice;
+    //  * DSH-internal model steps, reasoning, text deltas and tool activity;
+    //  * a heartbeat, an empty poll or a `wait-limit`;
+    //  * a permission or question wait, a repeated-failure reminder, the progress check itself;
+    //  * the run's START, which opens the FIRST interval rather than counting as one delivery.
+    //
+    // A genuine stage result reaches the monitor through the reserved, event-deduplicated
+    // {@link TaskMonitor#noteStageResult}; nothing in this engine calls it, because nothing in
+    // this protocol produces such a result yet. A test drives it directly.
+    let delivery = null;
+    try {
+      delivery = live === null || live === undefined || typeof live.delivery !== 'function'
+        ? null
+        : live.delivery({ at, delivered: terminalReason(task) !== null });
+    } catch {
+      delivery = null;
+    }
     return {
       task: summary,
       reason,
@@ -4103,13 +4613,29 @@ export class JobEngine {
       // thing that distinguishes that reminder from an ordinary silence report, whose
       // own diagnostic is `selfCheck`. Its `eventId` is the identity the receiver
       // acknowledges; the reminder is redelivered until that ack lands.
-      failure: reason === OBSERVE_TASK_REASONS.attention && failure !== null ? failure : null,
+      failure: isAttention && failure !== null ? failure : null,
+      // WHICH attention reminder this is, and — for a scheduled progress check — its
+      // bounded diagnostic. Present only on an `attention` observation, so the
+      // shape of every other reason is unchanged.
+      ...(checkpoint === null ? {} : { checkpoint }),
+      ...(progress === null ? {} : { progress }),
       // The acknowledgment result. Present (possibly with `acknowledged: false`) only
       // when the caller asked to acknowledge; absent otherwise, so an old caller's
       // observation shape is byte-for-byte unchanged.
       ...(failureAck === null ? {} : { failureAck }),
       activity: summary.activity,
       selfCheck,
+      // The delivery state, as two INDEPENDENT facts (present only when the monitor could
+      // state them, so an injected fixture's shape is unchanged): how long nothing was
+      // returned to the commander, and what DSH is doing right now. `returned` states
+      // whether THIS answer is what advanced the clock, so a caller never has to infer it.
+      ...(delivery === null ? {} : {
+        returnState: {
+          ...delivery,
+          returned: delivery.counted === true,
+          returnedReason: delivery.counted === true ? reason : null,
+        },
+      }),
       wait: { waitMs, waitedMs: Math.max(0, Math.trunc(waitedMs)), activitySinceWait: activitySinceWait === true },
     };
   }
@@ -4117,8 +4643,7 @@ export class JobEngine {
   /**
    * The compact task summary an observation returns.
    *
-   * Deliberately narrower than {@link view}: it carries the facts a waiting caller
-   * needs (identity, phase, timing, silence, the tool in flight, the frozen route)
+   * Deliberately narrower than {@link view}: it carries the facts a waiting caller   * needs (identity, phase, timing, silence, the tool in flight, the frozen route)
    * and NONE of the evidence a reviewer reads (diff, execution text, review text).
    * @param {object} task - task record.
    * @param {number} at - reference time.
@@ -4148,6 +4673,18 @@ export class JobEngine {
       selfCheck: monitor === null || monitor === undefined
         ? null
         : { episode: monitor.selfCheck.episode, checkedAt: monitor.selfCheck.checkedAt, verdict: monitor.selfCheck.verdict },
+      // The two independent facts a reminder must keep apart, in the compact summary a
+      // waiting caller reads: how long nothing has been returned to the commander, and
+      // what DSH is doing right now. Both are bounded reads of the monitor's own state.
+      returnState: monitor === null || monitor === undefined || typeof monitor.delivery !== 'function'
+        ? null
+        : (() => {
+          try {
+            return monitor.delivery({ at });
+          } catch {
+            return null;
+          }
+        })(),
       // The route this task froze at admission. Reported as the frozen triple, not
       // re-resolved: a settings edit during the wait must not change what a
       // finished run is described as having used.
@@ -4166,9 +4703,11 @@ export class JobEngine {
       // reviewed" from "the review is being written right now" and does not resubmit one.
       reviewPersistence: this.reviewPersistenceView(task),
       // The Agent Teams decision and outcome, short enough for a wait: `agentTeams` is the
-      // frozen request (or null), `team` the verified result (`applied`/`enabled`) or the
-      // reason it could not be applied. No team reasoning or task-board content travels.
+      // frozen request (or null), `agentTeamsOrigin` is where it came from, `team` the
+      // verified result (`applied`/`enabled`) or the reason it could not be applied. No
+      // team reasoning or task-board content travels.
       agentTeams: task.agentTeams ?? null,
+      agentTeamsOrigin: teamOriginOf(task),
       team: summarizedTeam(task.execution?.team ?? null),
     };
   }
@@ -4188,6 +4727,8 @@ export class JobEngine {
       isolation: task.effective.worker?.isolation ?? null,
       monitoring: {
         selfCheckSeconds: task.effective.monitoring?.selfCheckSeconds ?? null,
+        // The notification interval, stated so a wait answer explains the run progress
+        // check without the host having to infer a cadence.
         attentionSeconds: task.effective.monitoring?.attentionSeconds ?? null,
         repeatFailureThreshold: task.effective.monitoring?.repeatFailureThreshold ?? null,
       },
@@ -4532,6 +5073,7 @@ export class JobEngine {
    * @throws {JobError} on a recorded or in-flight conflict.
    */
   beginHistoryReviewWrite(row, decision, note, completionSummary = null) {
+    this.assertRecordNotBeingRemoved(row.taskId);
     const history = this.history;
     if (history === null || history === undefined || typeof history.update !== 'function') {
       throw new JobError(JOB_CODES.reviewNotPersisted,
@@ -4702,8 +5244,7 @@ export class JobEngine {
    *     to fail or un-finish the run that just succeeded;
    *   * a missing store is silent: an engine constructed without one simply cannot
    *     offer continuation, which is the safe default;
-   *   * an unplaced run (the additional review) records nothing, because it is not
-   *     part of the worker thread and must not become continuable.
+   *   * a run without a native conversation records no continuation identity.
    * @param {object} task - task record with a completed `task.execution`.
    * @returns {Promise<void>} resolves after the attempt, never rejects.
    */
@@ -4784,86 +5325,6 @@ export class JobEngine {
   }
 
   /**
-   * Run the optional independent review against the frozen review route.
-   * @param {object} task - completed-execution task.
-   * @returns {Promise<object>} review record.
-   */
-  async runReview(task) {
-    if (task.effective.review.enabled !== true) {
-      return { state: REVIEW_STATES.disabled, verdict: null, text: '', error: null };
-    }
-    if (task.reviewRouteError !== null) {
-      // A review routing failure is a review failure, not a task failure, and it
-      // is never an approval.
-      return {
-        state: REVIEW_STATES.failed,
-        verdict: null,
-        text: '',
-        error: task.reviewRouteError,
-        denials: [],
-        selection: reviewSelection(task.effective.review, null),
-      };
-    }
-    const route = task.reviewRoute;
-    if (route === null) {
-      return {
-        state: REVIEW_STATES.failed,
-        verdict: null,
-        text: '',
-        error: {
-          code: 'REVIEW_ROUTING_REFUSED',
-          message: 'the review route was not confirmed before execution',
-          cause: null,
-        },
-        denials: [],
-        selection: reviewSelection(task.effective.review, null),
-      };
-    }
-    if (this.isCancelled(task)) {
-      return {
-        state: REVIEW_STATES.cancelled,
-        verdict: null,
-        text: '',
-        error: { code: 'REVIEW_CANCELLED', message: 'the additional review was cancelled before it started' },
-        denials: [],
-        selection: reviewSelection(task.effective.review, route),
-      };
-    }
-    const prompt = buildReviewPrompt({
-      taskId: task.taskId,
-      taskPrompt: task.prompt,
-      workerSummary: task.execution?.text ?? '',
-      evidence: task.diff,
-    });
-    const result = await reviewWork(this.deps, {
-      taskId: task.taskId,
-      cwd: task.executionPath,
-      selection: {
-        // The public id is what an operator recognises; the native route is
-        // carried alongside it and is not disguised as a profile id.
-        providerId: task.effective.review.providerId,
-        providerRoute: route.providerRoute,
-        model: route.model,
-        reasoningEffort: route.reasoningEffort,
-      },
-      prompt,
-      evidence: task.diff,
-      timeoutMs: Math.min(task.effective.worker.timeoutSeconds, 1800) * 1000,
-      // Cancellation and revocation reach the reviewer through the same signal.
-      signal: task.controller.signal,
-    });
-    return {
-      state: result.state,
-      verdict: result.verdict,
-      text: result.text ?? '',
-      error: result.error ?? null,
-      denials: result.denials ?? [],
-      denialsDelivered: (result.denials ?? []).length,
-      selection: result.selection ?? reviewSelection(task.effective.review, route),
-    };
-  }
-
-  /**
    * Request cancellation of one task.
    * @param {string} taskId - task to cancel.
    * @param {string} reason - recorded provenance.
@@ -4880,6 +5341,31 @@ export class JobEngine {
       new Promise((resolvePromise) => { setTimeout(resolvePromise, SETTLE_TIMEOUT_MS).unref?.(); }),
     ]);
     return this.view(task);
+  }
+
+  assertRecordNotBeingRemoved(taskId) {
+    if (this.cleanupIds.has(taskId)) {
+      throw new JobError(JOB_CODES.taskNotFound, 'task record is being removed; refresh and retry', { taskId });
+    }
+  }
+
+  isTaskSettledForCleanup(taskId) {
+    return this.tasks.get(taskId)?.cleanupSettled === true;
+  }
+
+  // Hold these ids between the final check and the removal from disk and memory.
+  reserveCleanupIds(taskIds) {
+    for (const id of taskIds) this.cleanupIds.add(id);
+    return () => {
+      for (const id of taskIds) this.cleanupIds.delete(id);
+    };
+  }
+
+  forgetCleanedRecords(taskIds) {
+    for (const id of taskIds) {
+      this.tasks.delete(id);
+      this.reviewState.delete(id);
+    }
   }
 
   /**
@@ -4921,7 +5407,6 @@ export class JobEngine {
   view(task, options = {}) {
     const effective = task.effective === null ? null : {
       worker: { ...task.effective.worker },
-      review: { ...task.effective.review },
       // The conversation policy this task ran under. It is a rule, not a stored
       // setting: a new submission starts a new DSH conversation, and a follow-up
       // continues the thread named by `continueFromTaskId`.
@@ -4929,8 +5414,7 @@ export class JobEngine {
       // The silence thresholds this task froze at admission. Published so a reader
       // can interpret the activity block without consulting a settings document
       // that may have changed since.
-      monitoring: { ...(task.effective.monitoring ?? MONITORING_DEFAULTS) },
-      provenance: task.effective.provenance,
+      monitoring: { ...(task.effective.monitoring ?? MONITORING_DEFAULTS) },      provenance: task.effective.provenance,
     };
     const view = {
       taskId: task.taskId,
@@ -4961,14 +5445,6 @@ export class JobEngine {
         model: task.route.model,
         reasoningEffort: task.route.reasoningEffort,
       },
-      // Frozen during preflight: a later settings edit does not change it.
-      reviewRoute: task.reviewRoute === null ? null : {
-        providerId: effective === null ? null : effective.review.providerId,
-        providerRoute: task.reviewRoute.providerRoute,
-        model: task.reviewRoute.model,
-        reasoningEffort: task.reviewRoute.reasoningEffort,
-      },
-      reviewRouteError: task.reviewRouteError,
       worktree: task.worktree,
       baseline: task.baseline,
       diff: task.diff,
@@ -5011,7 +5487,6 @@ export class JobEngine {
         : {}),
       conversationSaved: task.conversationSaved,
       conversationError: task.conversationError,
-      review: task.review,
       error: task.error,
       cancelledBy: task.cancelledBy,
       // The per-call permission surface of this run: whether it was bridged, the
@@ -5032,6 +5507,10 @@ export class JobEngine {
       // confirmed on this run's Session. Kept as one block so "asked for teams" and
       // "teams actually on for this run" are never conflated.
       agentTeams: task.agentTeams ?? null,
+      // WHERE that frozen decision came from: `request` (the dispatcher stated it for this
+      // task), `continuation` (inherited from the chain this follow-up continues) or
+      // `settings-default` (the operator's new-task default filled an absent choice).
+      agentTeamsOrigin: teamOriginOf(task),
       team: task.execution?.team ?? null,
       // A bounded progress summary: counts, timestamps and the tool in flight. It
       // carries no model text, no reasoning, no tool arguments and no diff, so the
@@ -5061,7 +5540,7 @@ export class JobEngine {
   prune() {
     if (this.tasks.size <= MAX_RETAINED_TASKS) return;
     const terminal = [...this.tasks.values()]
-      .filter((task) => TERMINAL.has(task.state))
+      .filter((task) => TERMINAL.has(task.state) && task.cleanupSettled)
       .sort((a, b) => (a.endedAt ?? a.createdAt) - (b.endedAt ?? b.createdAt));
     for (const task of terminal) {
       if (this.tasks.size <= MAX_RETAINED_TASKS) break;
@@ -5173,25 +5652,18 @@ function nativeRouteId(value) {
  */
 function samePath(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const normalize = (value) => {
-    const trimmed = value.replace(/[\\/]+$/, '');
-    return process.platform === 'win32' ? trimmed.toLowerCase() : trimmed;
-  };
-  return normalize(a) === normalize(b);
+  return lockKeyOf(a) === lockKeyOf(b);
 }
 
 /**
- * Review selection projection for a review that never ran.
- * @param {object} review - effective review block.
- * @param {object | null} route - frozen route, if any.
- * @returns {object} selection summary.
+ * One directory's key for the in-process tables, folded the way the lock registry
+ * folds it so two spellings of one source share one preparation queue.
+ * @param {string} path - workspace path.
+ * @returns {string} normalized key.
  */
-function reviewSelection(review, route) {
-  return {
-    providerId: review?.providerId ?? null,
-    model: route?.model ?? review?.model ?? null,
-    reasoningEffort: route?.reasoningEffort ?? review?.reasoningEffort ?? null,
-  };
+function lockKeyOf(path) {
+  const trimmed = String(path).replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? trimmed.toLowerCase() : trimmed;
 }
 
 /**
@@ -5225,6 +5697,88 @@ export function sanitizeOverrides(value) {
     out.agentTeams = value.agentTeams;
   }
   return out;
+}
+
+/**
+ * The Agent Teams facts a parent recorded, as one conservative verdict for a follow-up.
+ *
+ * A continuation may only INHERIT a switch value that actually reached the native
+ * Session. One case must not be inherited: the operator's default filled an absent
+ * choice (`settings-default`), asked for OFF, and the host answered that it has no
+ * agent-teams service at all (`supported: false`, `applied: false`). Nothing was ever
+ * written in that run, so there is no native value to carry forward — and re-sending
+ * `false` as though somebody had chosen it would make a capable-no-more host refuse a run
+ * that previously worked, while a host without the service would be told a mode it never
+ * had. Such a chain keeps its Session's current mode instead.
+ *
+ * Every other shape is inheritable, deliberately INCLUDING a bug of an earlier build that
+ * recorded `false` for an implicit default with NO receipt at all (`team: null`): that
+ * run really did write `false` to its Session, and the follow-up must keep it.
+ *
+ * The test for "never applied" is deliberately strict — all of `origin ===
+ * 'settings-default'`, `value === false`, `team.supported === false` and
+ * `team.applied === false` must hold. Anything else (an explicit request, an inherited
+ * chain value, a receipt that claims support, an unknown origin, a missing receipt) is a
+ * real decision and is inherited exactly as before.
+ * @param {unknown} value - the parent's frozen `agentTeams` (boolean or null).
+ * @param {unknown} origin - the parent's `agentTeamsOrigin`.
+ * @param {unknown} team - the parent's run receipt (`team` block or its summary).
+ * @returns {{ value: boolean | null, inheritable: boolean, neverAppliedDefault: boolean,
+ *   origin: string | null, applied: boolean | null, supported: boolean | null }} facts.
+ */
+function teamFactsOf(value, origin, team) {
+  const decision = typeof value === 'boolean' ? value : null;
+  const kind = origin === 'request' || origin === 'continuation' || origin === 'settings-default'
+    ? origin
+    : null;
+  const receipt = team !== null && typeof team === 'object' && !Array.isArray(team) ? team : null;
+  const applied = receipt !== null && typeof receipt.applied === 'boolean' ? receipt.applied : null;
+  const supported = receipt !== null && typeof receipt.supported === 'boolean' ? receipt.supported : null;
+  const neverAppliedDefault = decision === false
+    && kind === 'settings-default'
+    && supported === false
+    && applied === false;
+  return {
+    value: decision,
+    // Only a recorded boolean can be carried forward; `null` means the parent recorded
+    // nothing, which is the existing "keep the Session's own mode" case.
+    inheritable: decision !== null && !neverAppliedDefault,
+    neverAppliedDefault,
+    origin: kind,
+    applied,
+    supported,
+  };
+}
+
+/**
+ * The operator's Agent Teams default for a NEW task, read from one settings snapshot.
+ *
+ * Absent or unreadable means the documented OFF default — never "on" and never
+ * "no choice": an upgraded document that predates the setting, and a settings
+ * snapshot a deployment served without one, both resolve to `false`, which is what
+ * a fresh install stores. The value is only ever a boolean, so a hand-edited
+ * document that slipped a string in cannot become a truthy selection.
+ * @param {object | null} settings - the settings snapshot admission froze.
+ * @returns {boolean} the default for a new task with no per-task choice.
+ */
+function operatorTeamDefault(settings) {
+  const value = settings?.execution?.agentTeamsDefault;
+  return typeof value === 'boolean' ? value : DEFAULT_AGENT_TEAMS_FOR_NEW_TASKS;
+}
+
+/**
+ * WHERE a task's frozen Agent Teams decision came from, as a closed vocabulary.
+ *
+ * `null` when no decision is frozen (no choice applied at all). A value outside
+ * the three documented origins is reported as `null` rather than echoed, so a
+ * restored record cannot introduce a fourth word.
+ * @param {object} task - task record.
+ * @returns {'request' | 'continuation' | 'settings-default' | null} the origin.
+ */
+function teamOriginOf(task) {
+  if (typeof task?.agentTeams !== 'boolean') return null;
+  const origin = task.agentTeamsOrigin;
+  return origin === 'request' || origin === 'continuation' || origin === 'settings-default' ? origin : null;
 }
 
 export { AuthError, AUTH_CODES, defaultSettings };

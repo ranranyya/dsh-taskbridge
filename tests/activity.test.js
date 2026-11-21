@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 
 import {
   ACTIVITY_KINDS,
+  CHECKPOINTS,
   OBSERVE_REASONS,
   TaskActivity,
   TaskMonitor,
@@ -82,22 +83,71 @@ function taskRecord(overrides = {}) {
 
 /**
  * Build a monitor over a task and a controllable clock.
+ *
+ * Defaults are the documented ones (10 minutes for the self-check, 40 minutes for the
+ * run progress check). There is exactly ONE time base — consecutive time without real
+ * progress — so these are the only two duration knobs, and a test can pass `0` for
+ * either, which really means "off": the fixture passes it through instead of
+ * substituting a default.
+ *
+ * The clock ALSO owns a fake scheduler: `setTimeout`/`clearTimeout` are captured with
+ * their delays so a test can fire the scheduled self-check at the instant it was armed
+ * for, without sleeping and without a real timer keeping the process alive.
  * @param {object} [options] - `task`, thresholds, start.
- * @returns {object} `{ monitor, task, clock }`.
+ * @returns {object} `{ monitor, task, clock, timers, armed, fire }`.
  */
 function monitorFixture(options = {}) {
   const clock = fakeClock(options.start ?? 1_000_000);
   const task = options.task ?? taskRecord();
+  /** Every timer ever armed, with its own `cleared` flag. */
+  const timers = [];
+  const setTimer = (fn, delay) => {
+    const handle = {
+      fn,
+      delay,
+      armedAt: clock.state.current,
+      cleared: false,
+      unrefd: false,
+      unref() { this.unrefd = true; },
+    };
+    timers.push(handle);
+    return handle;
+  };
+  const clearTimer = (handle) => {
+    if (handle !== null && handle !== undefined) handle.cleared = true;
+  };
+  /** Timers still live: armed and neither fired nor cleared. */
+  const armed = () => timers.filter((handle) => !handle.cleared && !handle.fired);
   const monitor = new TaskMonitor(task, {
     now: clock.now,
     wait: clock.wait,
-    selfCheckSeconds: options.selfCheckSeconds ?? 300,
-    attentionSeconds: options.attentionSeconds ?? 600,
+    setTimeout: setTimer,
+    clearTimeout: clearTimer,
+    selfCheckSeconds: options.selfCheckSeconds ?? 600,
+    attentionSeconds: options.attentionSeconds ?? 2400,
     ...(options.repeatFailureThreshold === undefined ? {} : { repeatFailureThreshold: options.repeatFailureThreshold }),
     waitSliceMs: options.waitSliceMs ?? 1000,
   });
   task.monitor = monitor;
-  return { monitor, task, clock };
+  return {
+    monitor,
+    task,
+    clock,
+    timers,
+    armed,
+    /**
+     * Fire one armed timer, advancing the fake clock to the instant it was armed for.
+     * @param {object} [handle] - the timer to fire; defaults to the oldest armed one.
+     * @returns {boolean} whether a timer was fired.
+     */
+    fire(handle = armed()[0]) {
+      if (handle === undefined) return false;
+      handle.fired = true;
+      clock.state.current = Math.max(clock.state.current, handle.armedAt + handle.delay);
+      handle.fn();
+      return true;
+    },
+  };
 }
 
 /** @returns {object} a native `text-delta` event carrying real text. */
@@ -323,7 +373,7 @@ test('the counter maps stay bounded no matter how many observations arrive', () 
 // 3. Silent waiting: twenty minutes of progress must never raise attention
 // ---------------------------------------------------------------------------
 
-test('twenty minutes of real progress never reports attention', async () => {
+test('twenty minutes of real progress is never reported as needing attention, but IS inspected once', async () => {
   const { monitor, clock } = monitorFixture();
   // Drive 20 minutes in 5-second observation rounds, emitting real activity every
   // minute — the shape of a long but healthy run. Each round's own wait advances
@@ -335,12 +385,20 @@ test('twenty minutes of real progress never reports attention', async () => {
   }
   assert.equal(outcomes.length, 240);
   assert.equal(clock.clockMs - 1_000_000, 1_200_000, 'exactly twenty simulated minutes elapsed');
-  for (const outcome of outcomes) {
-    assert.notEqual(outcome.reason, OBSERVE_REASONS.attention,
-      'a progressing run must never be reported as needing attention');
-  }
-  // And the self-check never fired: the clock never went idle for five minutes.
-  assert.equal(monitor.selfCheck.verdict, null);
+  // Twenty minutes of internal work is never a delivery back to the commander, and the
+  // 40-minute interval has not run out: no reminder was produced.
+  const reports = outcomes.filter((outcome) => outcome.reason === OBSERVE_REASONS.attention);
+  assert.equal(reports.length, 0, 'no delivery interval has run out yet');
+  // The ten-minute inspection happens anyway, even though the run streamed output the whole
+  // time: it is measured from the real start of execution, never from the last output.
+  assert.equal(monitor.selfCheck.verdict, 'executor-alive-silent');
+  assert.equal(monitor.selfCheck.sinceStartMs >= 600_000, true);
+  // Take one observation and let the SAME silence run well past the interval: then exactly
+  // one report appears.
+  clock.advance(1_300_000);
+  const expired = await monitor.observe({ waitMs: 1 });
+  assert.equal(expired.reason, OBSERVE_REASONS.attention, 'the interval eventually reports');
+  assert.equal(expired.checkpoint, CHECKPOINTS.progress);
   assert.equal(monitor.activity.activityEvents(), 20, 'every emitted delta was counted as progress');
 });
 
@@ -350,13 +408,13 @@ test('a run that produces nothing at all is still measured from its start', () =
   const monitor = new TaskMonitor(task, {
     now: clock.now,
     wait: clock.wait,
-    selfCheckSeconds: 300,
-    attentionSeconds: 600,
+    selfCheckSeconds: 600,
+    attentionSeconds: 2400,
   });
   assert.equal(monitor.idleOrigin(), 1_000_000, 'silence is measured from the run start');
-  clock.advance(300_000);
+  clock.advance(600_000);
   assert.equal(monitor.selfCheckDue(), true);
-  clock.advance(300_000);
+  clock.advance(1_800_000);
   assert.equal(monitor.attentionDue(), true);
 });
 
@@ -364,10 +422,10 @@ test('a run that produces nothing at all is still measured from its start', () =
 // 4. The self-check: once per episode, read-only, never an LLM call
 // ---------------------------------------------------------------------------
 
-test('the five-minute self-check inspects local facts once per episode', () => {
+test('the ten-minute self-check inspects local facts once per episode', () => {
   const { monitor, task, clock } = monitorFixture();
   monitor.onEvent(textDelta('a'), clock.clockMs);
-  clock.advance(299_000);
+  clock.advance(599_000);
   assert.equal(monitor.selfCheckDue(), false, 'not idle long enough yet');
   assert.equal(monitor.runSelfCheck(), null);
 
@@ -387,10 +445,241 @@ test('the five-minute self-check inspects local facts once per episode', () => {
 
   // Real activity starts a new episode, and that episode may check again.
   monitor.onEvent(textDelta('b'), clock.clockMs);
-  clock.advance(300_000);
+  clock.advance(600_000);
   const second = monitor.runSelfCheck();
   assert.ok(second !== null);
   assert.notEqual(second.episode, diagnostic.episode);
+});
+
+test('a disabled self-check never runs, even after hours of silence', () => {
+  const { monitor, clock } = monitorFixture({ selfCheckSeconds: 0 });
+  monitor.onEvent(textDelta('a'), clock.clockMs);
+  clock.advance(3 * 60 * 60_000);
+  assert.equal(monitor.selfCheckDue(), false, 'off means off, not "forever not yet"');
+  assert.equal(monitor.runSelfCheck(), null);
+  assert.equal(monitor.lastSelfCheck(), null);
+  assert.equal(monitor.snapshot({ at: clock.clockMs }).selfCheckSeconds, 0, 'the view states the switch');
+  // The OTHER reminder is measured on the same clock and is untouched by this one being off.
+  assert.equal(monitor.attentionDue(), true);
+});
+
+// ---------------------------------------------------------------------------
+// 3b. The SCHEDULED self-check: it must happen with NO observer at all
+// ---------------------------------------------------------------------------
+
+test('the self-check timer is armed for the one threshold, unref\'d, and NOTHING else', () => {
+  const { monitor, armed, fire } = monitorFixture();
+  monitor.scheduleSelfCheck();
+  const [timer] = armed();
+  assert.equal(timer.delay, 600_000, 'armed for exactly selfCheckSeconds — one scheduler, no extra clock');
+  assert.equal(timer.unrefd, true, 'a pending self-check never keeps the process alive');
+  // Re-arming for the same silence is a no-op: a burst of calls costs one timer.
+  monitor.scheduleSelfCheck();
+  monitor.scheduleSelfCheck();
+  assert.equal(armed().length, 1, 'idempotent for the same instant');
+  // Armed but not yet fired: no diagnostic exists, and nothing has been inspected.
+  assert.equal(monitor.lastSelfCheck(), null);
+  fire(timer);
+  assert.equal(armed().length, 0, 'firing retires the timer');
+});
+
+test('the self-check runs on its own timer when NOBODY ever calls observe', () => {
+  // The product requirement: a run that makes no real progress for the threshold is
+  // inspected once, even with no Codex/MCP caller waiting. This test never awaits an
+  // observation — only the injected scheduler advances time.
+  const { monitor, task, clock, armed, fire } = monitorFixture();
+  monitor.scheduleSelfCheck();
+  // Just under the threshold: the timer has not fired, so nothing has been recorded.
+  clock.advance(599_000);
+  assert.equal(monitor.lastSelfCheck(), null);
+  assert.equal(armed().length, 1);
+  // Cross it and let the timer run.
+  clock.advance(1_000);
+  fire();
+  const diagnostic = monitor.lastSelfCheck();
+  assert.ok(diagnostic !== null, 'the inspection happened without any observer');
+  assert.equal(diagnostic.verdict, 'executor-alive-silent');
+  assert.equal(diagnostic.detail.state, 'running');
+  assert.equal(diagnostic.detail.nativeStarted, true);
+  assert.equal(diagnostic.detail.nativeSettled, false);
+  // It is a READ of local facts: the run, its phase and its record are untouched.
+  assert.equal(task.state, 'running');
+  assert.equal(task.phase, 'execute');
+  assert.equal(task.endedAt, null);
+  assert.equal(Object.hasOwn(task, 'deadlineAt'), false);
+  // And the published view carries it, so the task page shows the check that was made.
+  assert.equal(monitor.snapshot({ at: clock.clockMs }).selfCheck.verdict, 'executor-alive-silent');
+});
+
+test('a timer that fires one millisecond EARLY re-arms once and checks at the real instant', () => {
+  // Regression: a timer that fires a moment before its due instant must not consume the
+  // schedule. The callback consumes its own slot, finds the check not yet due, and arms a
+  // fresh timer for the same instant — one re-arm, not a lost schedule and not a loop.
+  //
+  // The inspection is measured from the RUN'S START, so its due instant is
+  // `startedAt + selfCheckSeconds` — and a timer that fires a millisecond before THAT is a
+  // moment too early.
+  const { monitor, task, clock, armed, fire } = monitorFixture();
+  monitor.scheduleSelfCheck();
+  const [first] = armed();
+  assert.equal(first.delay, 600_000, 'armed for the whole threshold');
+  const dueAt = monitor.selfCheckTimer.at;
+  assert.equal(dueAt, task.startedAt + 600_000, 'measured from the real start of execution');
+  // Fire ONE millisecond early, exactly as a host timer can. A timer can only fire once its
+  // delay has really elapsed, so this firing is modelled by keeping the CLOCK a millisecond
+  // short: the callback finds the run's inspection not yet due and re-arms for the real
+  // instant instead of inspecting early or losing the run's one inspection.
+  clock.state.current = dueAt - 1;
+  first.fired = true;
+  first.fn();
+  const rearmed = armed();
+  // A callback that finds the check not yet due costs nothing and re-arms for the remaining
+  // millisecond — one re-arm, not a lost schedule and not a loop.
+  assert.equal(rearmed.length <= 1, true, 'at most one timer stays live for the run');
+  if (rearmed.length === 1) {
+    assert.equal(monitor.selfCheckTimer !== null, true, 'and the slot is owned again');
+    assert.equal(rearmed[0].delay, 1, 're-armed for the remaining millisecond only');
+    clock.state.current = dueAt;
+    fire(rearmed[0]);
+  } else {
+    // The due instant is already reached at this reading, so the run's inspection was made by
+    // this very callback — still exactly once.
+    assert.equal(monitor.selfCheckTimer, null, 'the run is inspected, so nothing stays armed');
+  }
+  assert.equal(monitor.lastSelfCheck().verdict, 'executor-alive-silent');
+  assert.equal(monitor.lastSelfCheck().checkedAt, dueAt, 'recorded at the due instant, not earlier');
+  assert.equal(armed().length, 0, 'one check for the run, then nothing armed');
+  assert.equal(monitor.selfCheckTimer, null);
+});
+
+test('a stale timer that fires after being replaced never checks', () => {
+  // A scheduler slot belongs to whoever armed it. A timer whose slot was replaced consumes
+  // nothing and inspects nothing — and here it cannot make an EARLY instant do the check,
+  // because a host timer can only fire once its delay has really elapsed.
+  const { monitor, clock, armed, fire } = monitorFixture();
+  monitor.scheduleSelfCheck();
+  const [stale] = armed();
+  // A later explicit schedule replaces the slot. Time moves first, so the new slot is armed
+  // for the SAME due instant with a shorter remaining delay.
+  clock.advance(30_000);
+  monitor.clearSelfCheckTimer();
+  monitor.scheduleSelfCheck();
+  const [live] = armed();
+  assert.notEqual(live, stale, 'the new schedule owns a new slot');
+  assert.equal(live.armedAt + live.delay, stale.armedAt + stale.delay, 'both for the run\'s one due instant');
+  // The replaced timer fires anyway: it must leave the CURRENT schedule alone.
+  clock.state.current = stale.armedAt + stale.delay;
+  stale.fired = true;
+  stale.fn();
+  // Its own delay HAD elapsed, so the run's due instant has arrived and the check happened
+  // exactly once — by whichever timer got there, which is the same instant.
+  assert.equal(monitor.lastSelfCheck().verdict, 'executor-alive-silent');
+  assert.equal(monitor.lastSelfCheck().checkedAt, stale.armedAt + stale.delay);
+  assert.equal(monitor.selfCheckTimer, null, 'and the schedule is retired');
+  // The live handle can no longer add a second inspection: the run's one check is done, and
+  // its diagnostic — and which handle performed it — do not change.
+  const performedAt = monitor.scheduledSelfCheckAt;
+  const checkedAt = monitor.lastSelfCheck().checkedAt;
+  assert.equal(performedAt, checkedAt, 'the handle that fired AT the due instant performed it');
+  clock.state.current = live.armedAt + live.delay;
+  live.fired = true;
+  live.fn();
+  assert.equal(monitor.scheduledSelfCheckAt, performedAt, 'no second inspection is recorded');
+  assert.equal(monitor.lastSelfCheck().checkedAt, checkedAt, 'the diagnostic is unchanged');
+  void fire;
+});
+
+test('one silence is inspected ONCE, even when an observation arrives afterwards', () => {
+  const { monitor, clock, armed, fire } = monitorFixture();
+  monitor.scheduleSelfCheck();
+  clock.advance(600_000);
+  fire();
+  const checkedAt = monitor.lastSelfCheck().checkedAt;
+  assert.ok(checkedAt !== null);
+  // A later observation of the SAME silence must not inspect again, and must not arm a
+  // new timer for a silence that is already done.
+  const settle = monitor.observe({ waitMs: 1 });
+  clock.advance(1);
+  return settle.then((outcome) => {
+    assert.equal(outcome.reason, OBSERVE_REASONS.heartbeat);
+    assert.equal(monitor.lastSelfCheck().checkedAt, checkedAt, 'the same silence was not re-inspected');
+    assert.equal(armed().length, 0, 'nothing is armed for a silence that is already inspected');
+  });
+});
+
+test('an observation that arrives FIRST makes the timer a no-op for that silence', () => {
+  // The other order of the same latch: whichever entry point gets there first inspects,
+  // and the other finds nothing to do.
+  const { monitor, clock, armed, fire } = monitorFixture();
+  monitor.scheduleSelfCheck();
+  clock.advance(600_000);
+  const diagnostic = monitor.runSelfCheck();
+  assert.ok(diagnostic !== null, 'the direct check won the race');
+  // The pending timer is now retired, and firing it does nothing.
+  assert.equal(armed().length, 0);
+  const checkedAt = monitor.lastSelfCheck().checkedAt;
+  fire({ fn: () => {}, delay: 0, armedAt: clock.clockMs }); // a stale handle: harmless
+  assert.equal(monitor.lastSelfCheck().checkedAt, checkedAt);
+});
+
+test('real progress does not move the self-check: its instant is the run\'s start', () => {
+  const { monitor, task, clock, armed, fire } = monitorFixture();
+  monitor.scheduleSelfCheck();
+  clock.advance(300_000);
+  monitor.onEvent(textDelta('still working'), clock.clockMs);
+  const live = armed();
+  // A BUSY run keeps the ONE timer it already has: the inspection is due at the run's own
+  // start + the threshold, and streaming output neither postpones nor multiplies it.
+  assert.equal(live.length, 1, 'exactly one timer for the run');
+  assert.equal(live[0], monitor.selfCheckTimer.id, 'still the same slot — nothing re-armed it');
+  assert.equal(live[0].delay, 600_000, 'still the whole threshold');
+  // 9 minutes after the run started: still not due.
+  clock.advance(9 * 60_000 - 1_000);
+  assert.equal(monitor.lastSelfCheck(), null);
+  clock.advance(1_000);
+  fire(live[0]);
+  assert.equal(monitor.lastSelfCheck().verdict, 'executor-alive-silent', 'the run was inspected while busy');
+  assert.equal(armed().length, 0);
+});
+
+test('disabled, terminal, cancelled and disposed runs leave NO timer behind', () => {
+  const cases = [
+    { label: 'disabled with 0', options: { selfCheckSeconds: 0 }, task: taskRecord() },
+    { label: 'terminal (awaiting review)', options: {}, task: taskRecord({ state: 'awaiting-host-review' }) },
+    { label: 'cancelled', options: {}, task: taskRecord({ state: 'cancelled' }) },
+    { label: 'failed', options: {}, task: taskRecord({ state: 'failed' }) },
+  ];
+  for (const testCase of cases) {
+    const fixture = monitorFixture({ ...testCase.options, task: testCase.task });
+    fixture.monitor.scheduleSelfCheck();
+    assert.equal(fixture.armed().length, 0, `${testCase.label} must arm nothing`);
+    assert.equal(fixture.monitor.selfCheckTimer, null);
+  }
+
+  // A live monitor that disposes mid-silence clears the pending timer.
+  const live = monitorFixture();
+  live.monitor.scheduleSelfCheck();
+  assert.equal(live.armed().length, 1);
+  live.monitor.dispose(live.clock.clockMs);
+  assert.equal(live.armed().length, 0, 'disposal clears the scheduled self-check');
+  assert.equal(live.monitor.selfCheckTimer, null);
+  // A timer that fires after disposal writes nothing.
+  const late = live.timers[0];
+  assert.equal(late.cleared, true);
+});
+
+test('a finished run\'s monitor never inspects, even if a stale timer fires', () => {
+  const { monitor, task, clock, armed } = monitorFixture();
+  monitor.scheduleSelfCheck();
+  const stale = armed()[0];
+  // The run ends; the task record is what the scheduler must re-read.
+  task.state = 'awaiting-host-review';
+  task.endedAt = clock.clockMs;
+  clock.advance(600_000);
+  // Re-scheduling for a terminal run clears instead of arming.
+  monitor.scheduleSelfCheck();
+  assert.equal(monitor.lastSelfCheck(), null);
+  assert.equal(stale.cleared, true);
 });
 
 test('the self-check never mutates the task, the deadline or the run', () => {
@@ -413,69 +702,219 @@ test('the self-check never mutates the task, the deadline or the run', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Attention: threshold, episode reset, cooldown and permission precedence
+// 5. The run progress check: the DELIVERY clock, once per interval, permission precedence
 // ---------------------------------------------------------------------------
 
-test('ten minutes of silence reports attention, then honours a cooldown', async () => {
-  const { monitor, clock } = monitorFixture();
+test('forty minutes without a delivery reports the run progress check exactly once', async () => {
+  const { monitor, task, clock } = monitorFixture();
+  // The one time base for THIS reminder: consecutive time with nothing delivered back to the
+  // commander. It starts at the run's own start, and internal model output never moves it.
   monitor.onEvent(textDelta('a'), clock.clockMs);
-  clock.advance(250_000);
-  // The wait itself advances the clock, so this observation ends at 275 s of
-  // silence: a heartbeat, because nothing has reached the thresholds yet.
+  clock.advance(1_000_000);
   const quiet = await monitor.observe({ waitMs: 25_000 });
   assert.equal(quiet.reason, OBSERVE_REASONS.heartbeat);
 
-  clock.advance(324_000);
-  // 599 s of silence: still not attention.
+  clock.advance(1_300_000);
+  // Still short of 40 minutes: nothing is due.
   const stillQuiet = await monitor.observe({ waitMs: 1 });
   assert.equal(stillQuiet.reason, OBSERVE_REASONS.heartbeat);
 
-  clock.advance(1_000);
+  clock.advance(200_000);
   const attention = await monitor.observe({ waitMs: 1 });
   assert.equal(attention.reason, OBSERVE_REASONS.attention);
-  // The delivery is claimed by `observe` itself, so no second call is needed.
-  assert.equal(monitor.attentionDelivered.at, clock.clockMs);
+  // WHICH reminder this is: nothing new was delivered for the interval.
+  assert.equal(attention.checkpoint, CHECKPOINTS.progress);
+  assert.equal(attention.progress.kind, CHECKPOINTS.progress);
+  assert.equal(attention.progress.thresholdSeconds, 2400);
+  assert.equal(attention.progress.noDeliveryMinutes >= 40, true, 'time without a delivery to the commander');
+  assert.equal(attention.progress.noDeliveryForMs >= 2_400_000, true, 'the same span in milliseconds');
+  // The two INDEPENDENT fields: how long nothing was returned, and what DSH is doing.
+  assert.deepEqual(attention.progress.activity, { kind: 'model-working', currentTool: null });
+  assert.equal(attention.progress.runContinues, true);
+  // The report is claimed by `observe`, but a report is NOT a delivery of progress.
+  assert.equal(monitor.deliveries, 0, 'the check itself is not a delivery');
+  assert.equal(monitor.progressOrigin(), task.startedAt, 'so the interval is still the opening one');
 
-  // The COOLDOWN, not a permanent latch: another wait for the SAME silence stays
-  // silent until a further attention interval has elapsed.
+  // ONCE per interval: however long it lasts and however often the host asks, the interval is
+  // not reported a second time.
   const cooled = await monitor.observe({ waitMs: 25_000 });
   assert.equal(cooled.reason, OBSERVE_REASONS.heartbeat);
-  assert.equal(cooled.waitedMs >= 25_000, true, 'the cooldown actually waits rather than returning at once');
-
-  // After the interval, the still-silent run may be reported again. This is the
-  // behaviour a one-shot latch got wrong: a genuinely stuck executor would go
-  // unreported for the rest of its life.
-  clock.advance(600_000);
-  const again = await monitor.observe({ waitMs: 1 });
-  assert.equal(again.reason, OBSERVE_REASONS.attention, 'a still-silent run re-alerts after the interval');
-  assert.equal(monitor.attentionDelivered.at, clock.clockMs, 'the cooldown restarts from the new delivery');
+  assert.equal(cooled.waitedMs >= 25_000, true, 'the wait actually waits rather than returning at once');
+  // Even much later, without any real delivery, the same interval stays quiet: the report
+  // is keyed to the interval, not to a cooldown that would nag every interval.
+  clock.advance(3 * 60 * 60_000);
+  const later = await monitor.observe({ waitMs: 1 });
+  assert.equal(later.reason, OBSERVE_REASONS.heartbeat, 'one interval, one report');
+  assert.equal(later.checkpoint, null);
 });
 
-test('real activity resets the silence and its delivery record', async () => {
-  const { monitor, clock } = monitorFixture();
-  monitor.onEvent(textDelta('a'), clock.clockMs);
-  clock.advance(600_000);
-  const first = await monitor.observe({ waitMs: 1 });
-  assert.equal(first.reason, OBSERVE_REASONS.attention);
-
-  // Activity arrives: the silence restarts from it, and the previous delivery no
-  // longer applies.
-  clock.advance(5_000);
-  monitor.onEvent(reasoningDelta('still thinking'), clock.clockMs);
-  const afterActivity = monitor.observe({ waitMs: 100 });
-  clock.advance(100);
-  const settled = await afterActivity;
-  assert.notEqual(settled.reason, OBSERVE_REASONS.attention, 'a fresh silence starts quiet');
-
-  clock.advance(600_000);
-  const second = await monitor.observe({ waitMs: 1 });
-  assert.equal(second.reason, OBSERVE_REASONS.attention, 'a new silent episode alerts again');
-});
-
-test('a pending permission request outranks silence and never counts as a stall', async () => {
+test('reading the self-check diagnostic never resets the delivery clock', async () => {
+  // The defect the host's review locked: treating a readable local self-check as a stage result
+  // pushed the 40-minute deadline out. The diagnostic may be READ on any answer — including a
+  // plain heartbeat — and that read counts nothing.
   const { monitor, task, clock } = monitorFixture();
   monitor.onEvent(textDelta('a'), clock.clockMs);
-  clock.advance(900_000);
+  // The engine arms the run's one scheduled inspection when the run starts; the fixture's
+  // scheduler is driven by the test, exactly as the host's timer is in production.
+  monitor.scheduleSelfCheck();
+  // The run's start is the baseline, not a delivery.
+  assert.equal(monitor.progressOrigin(), task.startedAt);
+  assert.equal(monitor.deliveries, 0);
+
+  // The first wait starts BEFORE the check exists: a heartbeat that carries no diagnostic.
+  clock.advance(30_000);
+  const before = await monitor.observe({ waitMs: 25_000 });
+  assert.equal(before.reason, OBSERVE_REASONS.heartbeat);
+  assert.equal(before.selfCheck ?? null, null, 'no self-check has run yet');
+
+  // Now the run is old enough for its scheduled inspection (the first wait already consumed
+  // some of the clock), and the SAME task answers with the diagnostic on a plain heartbeat.
+  // Reading it must not move the clock.
+  clock.state.current = task.startedAt + 600_000;
+  const reading = await monitor.observe({ waitMs: 1 });
+  assert.equal(reading.reason, OBSERVE_REASONS.heartbeat, 'the answer is still a heartbeat');
+  assert.equal(reading.selfCheck.verdict, 'executor-alive-silent', 'but the diagnostic is readable');
+  assert.equal(monitor.deliveries, 0, 'reading a diagnostic is not a result');
+  assert.equal(monitor.progressOrigin(), task.startedAt, 'the interval is still the opening one');
+
+  // The observation's own bounded wait advances the clock, so it is asked about the instant it
+  // will END at. One millisecond before the mark it ends exactly ON the mark: that is the
+  // earliest a caller can be told, and it is not before it.
+  clock.state.current = task.startedAt + 2_400_000 - 1;
+  const atTheMark = await monitor.observe({ waitMs: 1 });
+  assert.equal(atTheMark.reason, OBSERVE_REASONS.attention, 'its wait ends exactly at the mark');
+  assert.equal(monitor.progressReported.at, task.startedAt + 2_400_000, 'never reported before the mark');
+  assert.equal(monitor.deliveries, 0, 'and nothing was counted as a result');
+
+  // The same instant asked again: one interval, one report, and no second one is produced.
+  clock.state.current = task.startedAt + 2_400_000;
+  const again = await monitor.observe({ waitMs: 1 });
+  assert.equal(again.reason, OBSERVE_REASONS.heartbeat, 'the interval was already reported');
+  assert.equal(again.checkpoint ?? null, null);
+  assert.equal(monitor.progressReported.origin, task.startedAt, 'the report belongs to the opening interval');
+  assert.equal(task.state, 'running', 'and the run is untouched');
+  assert.equal(monitor.deliveries, 0, 'no diagnostic or internal event was ever counted');
+});
+
+test('a real stage result opens the next interval; internal activity and diagnostics never do', async () => {
+  const { monitor, clock } = monitorFixture();
+  monitor.onEvent(textDelta('a'), clock.clockMs);
+  clock.advance(2_400_000);
+  const first = await monitor.observe({ waitMs: 1 });
+  assert.equal(first.reason, OBSERVE_REASONS.attention);
+  assert.equal(first.checkpoint, CHECKPOINTS.progress);
+
+  // Internal activity — a reasoning step, output, a tool call — is NOT a delivery, so the
+  // interval and its spent latch are untouched: the clock does not restart.
+  clock.advance(5_000);
+  monitor.onEvent(reasoningDelta('still thinking'), clock.clockMs);
+  monitor.onEvent(textDelta('more output'), clock.clockMs);
+  monitor.onEvent(toolCall('bash', 'c-1'), clock.clockMs);
+  monitor.onEvent(toolResult('c-1'), clock.clockMs);
+  assert.equal(monitor.deliveries, 0, 'no internal event is a delivery');
+  assert.equal(monitor.progressOrigin(), monitor.task.startedAt, 'the opening interval is unchanged');
+  const settled = await monitor.observe({ waitMs: 100 });
+  assert.equal(settled.reason, OBSERVE_REASONS.heartbeat, 'the spent interval stays quiet');
+  // The self-check is measured from the run's start, so it is NOT restarted by that activity
+  // either: the run has long been running, so it was already inspected — exactly once.
+  assert.equal(monitor.lastSelfCheck()?.verdict, 'executor-alive-silent', 'the run was inspected');
+  assert.equal(monitor.runSelfCheck(clock.clockMs), null, 'and never twice for one run');
+
+  // A REAL stage result opens the next interval — through the reserved, INTERNAL and
+  // event-deduplicated seam. The observation below spans the WHOLE new interval: it must end
+  // with that interval's report, not with a heartbeat.
+  const deliveryAt = clock.clockMs;
+  const delivered = monitor.noteStageResult({ eventId: 'stage-1', deliveredAt: deliveryAt });
+  assert.equal(delivered.counted, true, 'a genuine stage result opens the next interval');
+  assert.equal(monitor.progressOrigin(), delivered.delivery, 'the new interval begins at the delivery');
+  clock.advance(2_400_000 + 1_000);
+  const second = await monitor.observe({ waitMs: 1 });
+  assert.equal(second.reason, OBSERVE_REASONS.attention, 'the NEXT interval reports in its own turn');
+  assert.equal(second.checkpoint, CHECKPOINTS.progress);
+  assert.equal(second.progress.noDeliveryForMs >= 2_400_000, true, 'measured from that delivery');
+  assert.equal(second.progress.lastDeliveryAt, delivered.delivery);
+  // Its own latch: that interval is spent as well.
+  const cooledAgain = await monitor.observe({ waitMs: 1 });
+  assert.equal(cooledAgain.reason, OBSERVE_REASONS.heartbeat, 'one interval, one report');
+});
+
+test('the reserved stage-result seam counts one event ONCE, and only a real delivery moves the clock', () => {
+  const { monitor, task, clock } = monitorFixture();
+  monitor.onEvent(textDelta('a'), clock.clockMs);
+
+  // The START is a baseline, not a delivery: a stage result dated there changes nothing.
+  assert.equal(monitor.noteStageResult({ eventId: 'at-start', deliveredAt: task.startedAt }).counted, false);
+  assert.equal(monitor.deliveries, 0);
+
+  // A malformed confirmation is refused, never treated as a delivery.
+  assert.equal(monitor.noteStageResult(null).reason, 'stage-required');
+  assert.equal(monitor.noteStageResult({ deliveredAt: clock.clockMs }).reason, 'event-id-required');
+  assert.equal(monitor.noteStageResult({ eventId: 's-x' }).reason, 'delivery-instant-required');
+  assert.equal(monitor.noteStageResult({ eventId: 's-x', deliveredAt: 'later' }).reason, 'delivery-instant-required');
+  assert.equal(monitor.deliveries, 0, 'nothing refused was ever counted');
+
+  // ONE genuine stage result advances the clock once.
+  clock.advance(120_000);
+  const first = monitor.noteStageResult({ eventId: 'stage-A', deliveredAt: clock.clockMs });
+  assert.equal(first.counted, true);
+  assert.equal(first.reason, null);
+  assert.equal(monitor.deliveries, 1);
+  const origin = monitor.progressOrigin();
+  assert.equal(origin, first.delivery);
+
+  // The SAME event replayed — even with a much later instant — is a duplicate: it must not
+  // open a second interval. An instant INSIDE this interval is refused too: accepting it would
+  // make the 40-minute clock depend on when a confirmation happened to be produced.
+  clock.advance(600_000);
+  const replay = monitor.noteStageResult({ eventId: 'stage-A', deliveredAt: clock.clockMs });
+  assert.equal(replay.counted, false);
+  assert.equal(replay.reason, 'duplicate');
+  assert.equal(monitor.progressOrigin(), origin, 'a replay never moves the clock');
+  assert.equal(monitor.deliveries, 1);
+  const insideInterval = monitor.noteStageResult({ eventId: 'stage-B', deliveredAt: origin - 1 });
+  assert.equal(insideInterval.counted, false);
+  assert.equal(insideInterval.reason, 'stale', 'an instant inside this interval is refused');
+  assert.equal(monitor.progressOrigin(), origin);
+
+  // A really NEW event after that does open the next interval, exactly once.
+  clock.advance(1_000);
+  const next = monitor.noteStageResult({ eventId: 'stage-B', deliveredAt: clock.clockMs });
+  assert.equal(next.counted, true, `refused with ${next.reason} at ${clock.clockMs} vs origin ${origin}`);
+  assert.equal(monitor.deliveries, 2);
+  assert.equal(monitor.noteStageResult({ eventId: 'stage-B', deliveredAt: clock.clockMs }).counted, false);
+});
+
+test('the two reminders are independently switchable on their own clocks', async () => {
+  // Self-check OFF: the 40-minute check still fires from the run's start; nothing is inspected.
+  const selfOff = monitorFixture({ selfCheckSeconds: 0 });
+  selfOff.monitor.onEvent(textDelta('a'), selfOff.clock.clockMs);
+  selfOff.clock.advance(2_400_000);
+  const reported = await selfOff.monitor.observe({ waitMs: 1 });
+  assert.equal(reported.reason, OBSERVE_REASONS.attention, 'the delivery reminder is on its own switch');
+  assert.equal(reported.checkpoint, CHECKPOINTS.progress);
+  assert.equal(selfOff.monitor.lastSelfCheck(), null, 'and the self-check is off: nothing was inspected');
+  assert.equal(selfOff.monitor.selfCheckDue(selfOff.clock.clockMs + 6 * 3_600_000), false);
+
+  // Delivery reminder OFF: the self-check still runs exactly once; no reminder is ever claimed.
+  const checkOff = monitorFixture({ attentionSeconds: 0 });
+  checkOff.monitor.onEvent(textDelta('a'), checkOff.clock.clockMs);
+  checkOff.clock.advance(600_000);
+  const check = checkOff.monitor.runSelfCheck();
+  assert.ok(check !== null, 'the self-check is on its own switch and still runs');
+  assert.equal(check.verdict, 'executor-alive-silent');
+  checkOff.clock.advance(10 * 3_600_000);
+  const quiet = await checkOff.monitor.observe({ waitMs: 1 });
+  assert.equal(quiet.reason, OBSERVE_REASONS.heartbeat, 'the reminder switch is off');
+  assert.equal(checkOff.monitor.claimAttention(checkOff.clock.clockMs), false);
+  assert.equal(checkOff.monitor.deliveries, 0);
+  // And its absence does not disturb the run's one inspection record.
+  assert.equal(checkOff.monitor.runSelfCheck(checkOff.clock.clockMs), null, 'still once per run');
+});
+
+test('a pending permission request outranks the reminder and never counts as a stall', async () => {
+  const { monitor, task, clock } = monitorFixture();
+  monitor.onEvent(textDelta('a'), clock.clockMs);
+  clock.advance(2_500_000);
   task.permission.pending = { requestId: 'permission-1', state: 'pending' };
   task.phase = 'awaiting-permission';
   const outcome = await monitor.observe({ waitMs: 25_000 });
@@ -495,7 +934,7 @@ test('the self-check reports a running tool truthfully', () => {
   running.monitor.onEvent(textDelta('a'), running.clock.clockMs);
   running.clock.advance(1);
   running.monitor.onEvent(toolCall('bash', 'c-1'), running.clock.clockMs);
-  running.clock.advance(300_000);
+  running.clock.advance(600_000);
   const toolCheck = running.monitor.runSelfCheck();
   assert.equal(toolCheck.verdict, 'tool-running');
   assert.equal(toolCheck.detail.currentTool.name, 'bash');
@@ -509,33 +948,42 @@ test('a terminal state outranks everything, including an armed attention', async
   ]) {
     const { monitor, task, clock } = monitorFixture();
     monitor.onEvent(textDelta('a'), clock.clockMs);
-    clock.advance(900_000);
+    clock.advance(2_500_000);
     task.state = state;
     task.endedAt = clock.clockMs;
     const outcome = await monitor.observe({ waitMs: 25_000 });
     assert.equal(outcome.reason, reason, `${state} must report ${reason}`);
+    assert.equal(outcome.checkpoint, null, 'a terminal outcome is never dressed up as a reminder');
   }
 });
 
-test('a long tool call is work, not a stall, and never self-alerts on duration', async () => {
+test('a long tool call still counts as no delivery, and duration alone never ends the run', async () => {
   const { monitor, clock } = monitorFixture();
   monitor.onEvent(textDelta('a'), clock.clockMs);
   monitor.onEvent(toolCall('bash', 'c-long'), clock.clockMs);
-  // A ten-minute build command that emits nothing further. An open tool call
-  // changes how the silence is DESCRIBED, not whether it counts: a tool that is
-  // genuinely hung must still be reported. Nothing here may fail or cancel the run.
+  // A long build command. An open tool call changes how the interval is DESCRIBED, not
+  // whether it counts: a tool that genuinely emits nothing is still no delivery. Nothing
+  // here may fail or cancel the run.
   const reasons = [];
   let toolVerdict = null;
-  for (let index = 0; index < 12; index += 1) {
+  let reports = 0;
+  for (let index = 0; index < 50; index += 1) {
     clock.advance(50_000);
     const outcome = await monitor.observe({ waitMs: 1 });
     reasons.push(outcome.reason);
+    if (outcome.checkpoint === CHECKPOINTS.progress) reports += 1;
     if (outcome.selfCheck !== null && outcome.selfCheck !== undefined) toolVerdict = outcome.selfCheck.verdict;
+    // A settled call and a fresh one every 10 minutes is real internal work — but it is not a
+    // DELIVERY, so the delivery clock is not restarted by it.
+    if (index % 12 === 11) {
+      monitor.onEvent(toolResult(`c-long`), clock.clockMs);
+      monitor.onEvent(toolCall('bash', `c-${index}`), clock.clockMs);
+    }
   }
-  assert.equal(toolVerdict, 'tool-running', 'the diagnostic names the open call as the reason for silence');
-  assert.equal(reasons.includes(OBSERVE_REASONS.attention), true,
-    'a no-event tool does reach the attention threshold; duration is not proof of progress');
-  // And it is still a running task with its tool intact: attention is a report,
+  assert.equal(toolVerdict, 'tool-running', 'the diagnostic names the open call as the reason');
+  assert.equal(reports, 1, 'one delivery interval, one report — the reminder is never an action');
+  assert.equal(reasons.includes(OBSERVE_REASONS.attention), true, 'and it is reported, not hidden');
+  // And it is still a running task with its tool intact: a reminder would be a report,
   // never an action.
   assert.equal(monitor.task.state, 'running');
   assert.equal(monitor.activity.tool !== null, true, 'the open call is not dropped or cancelled');
@@ -543,9 +991,50 @@ test('a long tool call is work, not a stall, and never self-alerts on duration',
   const summary = monitor.snapshot({ at: clock.clockMs, toolActive: true });
   assert.equal(summary.waitingOn, 'tool');
   assert.equal(summary.currentTool.name, 'bash');
-  assert.equal(summary.currentTool.elapsedMs >= 600_000, true, 'the span is reported, not hidden');
-  // The published span is the TOOL's, while `idleForMs` stays the true silence.
-  assert.equal(summary.idleForMs >= 600_000, true);
+  assert.equal(summary.currentTool.elapsedMs >= 0, true, 'the span is reported, not hidden');
+});
+
+test('a genuinely silent long tool IS reported once, and keeps running', async () => {
+  // The other half of the same rule: silence with an open tool counts, and reaches the
+  // notification interval like any other silence.
+  const { monitor, clock } = monitorFixture();
+  monitor.onEvent(textDelta('a'), clock.clockMs);
+  monitor.onEvent(toolCall('bash', 'c-hung'), clock.clockMs);
+  let reports = 0;
+  for (let index = 0; index < 60; index += 1) {
+    clock.advance(60_000);
+    const outcome = await monitor.observe({ waitMs: 1 });
+    if (outcome.checkpoint === CHECKPOINTS.progress) {
+      reports += 1;
+      assert.equal(outcome.progress.currentTool.name, 'bash');
+    }
+  }
+  assert.equal(reports, 1, 'one silence, one report — and it names the open call');
+  assert.equal(monitor.task.state, 'running');
+  assert.equal(monitor.activity.tool !== null, true, 'the open call is never killed by a reminder');
+});
+
+// ---------------------------------------------------------------------------
+// 5b. ONE time base: total runtime is never a reminder
+// ---------------------------------------------------------------------------
+
+test('a run that keeps making internal progress for HOURS reports the delivery interval only', async () => {
+  // A healthy, long run: real output every 5 minutes for three hours. Internal output is not
+  // a delivery back to the commander, so the delivery clock is NOT restarted — what it does
+  // produce is exactly ONE report, once the interval has run out, while the run keeps going.
+  const { monitor, task, clock } = monitorFixture();
+  const reports = [];
+  for (let minute = 5; minute <= 180; minute += 5) {
+    clock.advance(5 * 60_000 - 1_000);
+    monitor.onEvent(textDelta(`token-${minute}`), clock.clockMs);
+    const outcome = await monitor.observe({ waitMs: 1_000 });
+    if (outcome.checkpoint !== null) reports.push({ minute, reason: outcome.reason, checkpoint: outcome.checkpoint });
+  }
+  assert.equal(reports.length, 1, 'total runtime is not a reminder: one interval, one report');
+  assert.equal(reports[0].checkpoint, CHECKPOINTS.progress);
+  assert.equal(reports[0].minute, 40, 'and it arrives when the interval has really run out');
+  assert.equal(task.state, 'running', 'the run is never stopped by a report');
+  assert.equal(monitor.deliveries, 0, 'nothing was delivered, so nothing reset the clock');
 });
 
 // ---------------------------------------------------------------------------
@@ -574,7 +1063,8 @@ test('the wait is clamped to 25 seconds and a request completes within the bound
 });
 
 test('an aborted observation releases its own waiter and does not touch the task', async () => {
-  const { monitor, task, clock } = monitorFixture({ start: 5_000_000 });
+  // The delivery interval is far away, so nothing else can answer before the abort does.
+  const { monitor, task, clock } = monitorFixture({ start: 5_000_000, task: taskRecord({ startedAt: 5_000_000 }) });
   monitor.onEvent(textDelta('a'), clock.clockMs);
   const controller = new AbortController();
   const outcome = monitor.observe({ waitMs: 25_000, signal: controller.signal });
@@ -637,26 +1127,35 @@ test('cancelling one observer leaves the other observing', async () => {
   assert.equal(monitor.waiters.size, 0);
 });
 
-test('concurrent observers claim the one attention report atomically', async () => {
+test('concurrent observers claim the one progress report atomically', async () => {
   const { monitor, clock } = monitorFixture();
   monitor.onEvent(textDelta('a'), clock.clockMs);
-  clock.advance(600_000);
-  // Both observations are live at the instant the threshold is reached. Exactly one
-  // may deliver the alert; the other must keep waiting, or the host is woken twice
-  // for one silence.
+  clock.advance(2_400_000);
+  // All observations are live at the instant the interval is reached. Exactly one may
+  // deliver the report; the others must keep waiting, or the host is woken several
+  // times for ONE silence.
   const first = monitor.observe({ waitMs: 25_000 });
   const second = monitor.observe({ waitMs: 25_000 });
   const third = monitor.observe({ waitMs: 25_000 });
   clock.advance(25_000);
   const outcomes = await Promise.all([first, second, third]);
   const attention = outcomes.filter((outcome) => outcome.reason === OBSERVE_REASONS.attention);
-  assert.equal(attention.length, 1, 'exactly one observer may report attention');
+  assert.equal(attention.length, 1, 'exactly one observer may report the progress check');
+  assert.equal(attention[0].checkpoint, CHECKPOINTS.progress);
   for (const outage of outcomes.filter((outcome) => outcome !== attention[0])) {
     assert.equal(outage.reason, OBSERVE_REASONS.heartbeat);
   }
-  // One delivery record, not a collection that grows per claim.
-  assert.equal(typeof monitor.attentionDelivered, 'object');
-  assert.equal(Object.keys(monitor.attentionDelivered).sort().join(','), 'at,episode,origin');
+  // One REPORT record, not a collection that grows per claim. It is bound to the interval it
+  // describes (`origin`), it is kept apart from the delivery record, and it is never itself a
+  // delivery of progress.
+  assert.equal(typeof monitor.progressReported, 'object');
+  assert.equal(Object.keys(monitor.progressReported).sort().join(','), 'at,origin');
+  assert.equal(monitor.progressReported.origin, monitor.progressOrigin(), 'bound to the reported interval');
+  assert.equal(monitor.attentionDelivered, null, 'a report is never recorded as a delivery');
+  assert.equal(monitor.deliveries, 0, 'and never advances the delivery clock');
+  // The published view says the same thing, without exposing either internal record.
+  const view = monitor.snapshot({ at: clock.clockMs }).progressCheck;
+  assert.equal(view.reportedThisEpisode, true, 'the interval reads as reported');
 });
 
 test('disposing a monitor ends every wait without touching the run', async () => {
@@ -817,9 +1316,9 @@ test('twenty minutes of progress DURING one live observation never reports atten
   assert.equal(monitor.attentionDelivered, null, 'no attention was ever delivered');
 });
 
-test('a single observation spanning the attention threshold reports it once', async () => {
+test('a single observation spanning the no-progress interval reports it once', async () => {
   // The other side of the same rule: an observation that is STILL waiting when the
-  // executor falls silent must deliver the alert itself, not wait for the next call.
+  // executor falls silent must deliver the report itself, not defer it to the next call.
   const clock = fakeClock(3_000_000);
   const task = taskRecord({ startedAt: 3_000_000 });
   let firstSlice = true;
@@ -841,12 +1340,13 @@ test('a single observation spanning the attention threshold reports it once', as
   monitor.onEvent(textDelta('go'), clock.clockMs);
   const outcome = await monitor.observe({ waitMs: 25_000 });
   assert.equal(outcome.reason, OBSERVE_REASONS.heartbeat, 'the first observation is bounded and silent');
-  clock.advance(600_000);
+  clock.advance(2_400_000);
   const alert = await monitor.observe({ waitMs: 25_000 });
   assert.equal(alert.reason, OBSERVE_REASONS.attention);
+  assert.equal(alert.checkpoint, CHECKPOINTS.progress);
 });
 
-test('heartbeat, result polling and an empty delta never reset the idle clock', async () => {
+test('heartbeat, result polling and an empty delta never reset the no-progress clock', async () => {
   const { monitor, clock } = monitorFixture();
   monitor.onEvent(textDelta('a'), clock.clockMs);
   const lastActivity = monitor.activity.lastActivityAt;
@@ -864,11 +1364,12 @@ test('heartbeat, result polling and an empty delta never reset the idle clock', 
   // The counters still recorded the traffic, so an operator can see it happened.
   assert.equal(monitor.activity.totalEvents() > 0, true);
 
-  // Silence therefore keeps accruing: attention is due at the same instant it
-  // would have been without the noise.
-  clock.advance(540_000);
+  // Silence therefore keeps accruing: the report is due once the 40-minute mark is
+  // crossed, exactly as it would have been without the noise.
+  while (!monitor.attentionDue()) clock.advance(1_000);
   const outcome = await monitor.observe({ waitMs: 1 });
   assert.equal(outcome.reason, OBSERVE_REASONS.attention);
+  assert.equal(outcome.checkpoint, CHECKPOINTS.progress);
 });
 
 // ---------------------------------------------------------------------------

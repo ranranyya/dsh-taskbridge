@@ -43,6 +43,7 @@ import {
   isQuestionAnswerable,
 } from './server.js';
 import { REPEATED_FAILURE_KIND } from '../jobs/diagnostics.js';
+import { CHECKPOINTS } from '../jobs/activity.js';
 
 /** Re-exported so a caller can assert the discriminator without importing the engine. */
 export { REPEATED_FAILURE_KIND };
@@ -101,6 +102,10 @@ const TASK_FIELDS = Object.freeze([
   // are on for this run (`applied`/`enabled`) or why they are not (`reason`) without
   // reading the full result. Four booleans plus a bounded reason — no team content.
   'agentTeams',
+  // Where that frozen decision came from (`request` / `continuation` / `settings-default`),
+  // so a wait answer distinguishes "you asked for this" from "the operator's setting
+  // decided it" without reading the full result.
+  'agentTeamsOrigin',
   'team',
 ]);
 
@@ -252,10 +257,22 @@ function resolvedTaskState(task, reason) {
 
 /**
  * The instructions a host reads in a wait answer.
+ *
+ * The `attention` wording is chosen by `facts.checkpoint` — a scheduled progress
+ * check of a still-active run, the repeated-failure reminder, or the delivery
+ * interval — because the correct response differs. Every branch keeps the same two
+ * invariants: nothing was changed automatically, and the host keeps waiting on the
+ * SAME task unless it has a concrete reason to act.
+ *
+ * The progress branch is worded in terms of what the product actually measures: nothing new
+ * was RETURNED to the host. A local self-check read, internal model/tool activity, a heartbeat
+ * and the check itself are not results, and the wording must not imply that they are.
  * @param {string} reason - the reported reason.
- * @param {{ resolved?: boolean, taskState?: string | null, kind?: string }} [facts] - `resolved`: the
- *   reason was settled by {@link resolveInterruption} rather than read verbatim;
- *   `taskState`: the state the answer reports, for the `interrupted` wording.
+ * @param {{ resolved?: boolean, taskState?: string | null, kind?: string, checkpoint?: string | null,
+ *   progress?: object | null }} [facts] - `resolved`: the reason was settled by
+ *   {@link resolveInterruption} rather than read verbatim; `taskState`: the state the
+ *   answer reports, for the `interrupted` wording; `checkpoint`: which `attention`
+ *   reminder this is; `progress`: its bounded diagnostic.
  * @returns {string} one actionable sentence.
  */
 function instructionFor(reason, facts = {}) {
@@ -269,13 +286,31 @@ function instructionFor(reason, facts = {}) {
         + 'permission.requestId (and permission.fingerprint for allow-once), or reject it. The task is still '
         + 'running and waiting.';
     case 'attention':
-      if (facts.failureKind === REPEATED_FAILURE_KIND) {
+      if (facts.checkpoint === REPEATED_FAILURE_KIND || facts.failureKind === REPEATED_FAILURE_KIND) {
         return 'The worker has repeated the SAME tool operation and failed the same way several times in a row, '
           + 'while the task is still running. See `failure` (toolName, failureCode, consecutive). This is a '
           + 'question, not a verdict: decide deliberately whether to keep waiting, cancel, or follow up. Nothing '
           + 'was cancelled or changed automatically, and the run is still going.';
       }
-      return 'No activity has been observed for the configured inactivity threshold (ten minutes by default) '
+      if (facts.checkpoint === CHECKPOINTS.progress) {
+        // The run progress check: the host is asked to look, and the default answer is
+        // to keep waiting on the SAME task. It is NOT reported because the task has run
+        // for a long time — only because nothing new was DELIVERED back to the host for the
+        // interval. A local self-check diagnostic, internal model or tool activity, heartbeats
+        // and this check itself are not deliveries.
+        const idle = Number.isFinite(facts.progress?.noDeliveryMinutes)
+          ? `for about ${facts.progress.noDeliveryMinutes} minutes`
+          : 'for the configured interval';
+        return `Run progress check: nothing new has been returned ${idle} while the task is still `
+          + 'running (see `progress`: `noDeliveryForMs` is how long nothing came back, `activity` is what DSH is '
+          + 'doing right now, and `selfCheckVerdict` is the last local inspection). This is a checkpoint, NOT a '
+          + 'failure and NOT a verdict on the run\'s total duration: a task that keeps delivering results '
+          + 'never produces one, and reading the local self-check is not itself a result. Check whether the work so '
+          + 'far still matches the goal, and then KEEP WAITING on the SAME taskId unless you find a concrete error or '
+          + 'a real drift from the goal. Nothing was cancelled, restarted, resubmitted or re-queued, and this '
+          + 'interval will not be reported again.';
+      }
+      return 'Nothing has been reported back for the configured no-progress threshold (ten minutes by default) '
         + 'while the task is still running. The run may be stuck. Check the current tool and idle time; cancel '
         + 'or follow up deliberately rather than assuming completion.';
     case 'ready':
@@ -714,6 +749,24 @@ export async function waitForTask(options) {
       && typeof observation?.failure === 'object'
       ? observation.failure
       : null;
+    // WHICH `attention` reminder this is: the run progress check (`progress`) or the
+    // repeated-failure reminder (`failure`). They need different responses, and a host
+    // must not have to guess from prose. Derived from the engine's own claim when it
+    // published one; otherwise from the `failure` block, so an older engine that predates
+    // the field still classifies its reminders correctly.
+    //
+    // The classification is closed: an engine (or a fixture) that leaked a checkpoint
+    // onto a reason that is not `attention` — a terminal outcome, a pending decision —
+    // cannot make this answer claim one.
+    const checkpoint = reason === 'attention'
+      ? (typeof observation?.checkpoint === 'string' && CHECKPOINTS[observation.checkpoint] !== undefined
+        ? observation.checkpoint
+        : (failure !== null ? CHECKPOINTS.failure : CHECKPOINTS.progress))
+      : null;
+    const progress = checkpoint === CHECKPOINTS.progress && observation?.progress !== null
+      && typeof observation?.progress === 'object'
+      ? observation.progress
+      : null;
     const out = {
       taskId: typeof task.taskId === 'string' ? task.taskId : taskId,
       state,
@@ -731,11 +784,17 @@ export async function waitForTask(options) {
         taskState: state,
         kind: facts.kind,
         failureKind: failure?.kind ?? null,
+        checkpoint,
+        progress,
       }),
       task,
       metrics: metrics(1),
     };
     if (failure !== null) out.failure = failure;
+    if (checkpoint !== null) out.checkpoint = checkpoint;
+    // The bounded progress diagnostic (elapsed, interval, phase, open tool, silence)
+    // — facts the engine already held, no output, diff or review prose.
+    if (progress !== null) out.progress = progress;
     // The permission block is carried WHOLE — identity, fingerprint, completeness
     // flags and the redacted operation — because a host that had to read
     // `delegate_result` first would be doing two round trips to answer one question,

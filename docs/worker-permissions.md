@@ -2,7 +2,7 @@
 
 This document describes the worker sandbox, per-call approval and ordinary-question boundaries. The standing worker sandbox remains `workspace-write`; a question answer never grants access. A single approved operation does not authorize another call.
 
-**1.5.0 acceptance status:** the verified test.2 candidate was installed through native DSH Desktop plugin management. Real provider runs exercised both rejection and a separately approved call, delivery of the rejection reason, native question forwarding, answer-and-wait, and decision-and-wait. An actual Desktop restart retained the source identity, Session and saved host acceptance. A subsequent real-model, twelve-round timing/read-only exercise lasted over twenty minutes with one MCP wait and no intermediate result reads. See [1.5.0 release notes](releases/1.5.0.zh.md).
+**1.5.0 acceptance status:** the verified test.2 candidate was installed through native DSH Desktop plugin management. Real provider runs exercised both rejection and a separately approved call, delivery of the rejection reason, native question forwarding, answer-and-wait, and decision-and-wait. An actual Desktop restart retained the source identity, Session and saved host acceptance. A subsequent real-model, twelve-round timing/read-only exercise lasted over twenty minutes with one MCP wait and no intermediate result reads. See [1.5.0 release notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.0.zh.md).
 
 Historical validation sections below describe their own older builds and do not override this current acceptance statement. These checks do not prove every host/platform combination or turn the same-user loopback switch into per-process authentication.
 
@@ -308,19 +308,9 @@ it is a stand-in rather than a different protocol.
 question answers on their own `questionAnswers` axis. A question answer is **never** counted
 as a permission decision or a refusal: it authorizes nothing.
 
-## Reviews: the sandbox policy and the bridge do not apply
-The optional read-only review agent uses its own composition (its own provider,
-model and effort, read-only tools and its own workspace). It does **not** run through
-the worker sandbox path, it gets **no permission bridge**, and this release does not
-change its tool surface or its permissions. **Only the sandbox policy and the bridge
-are excluded here.** Model selection is a different contract: on `0.2.2-rc.1` the
-reviewer's provider/model/effort are applied through the same durable
-`agent.model.select(...)` surface and read back like the worker's, because a recorded
-route is what makes the reviewer's own composition provable. The exclusion in this
-section is about `workspace-write` / `never` / `ask` and the per-call decision, not
-about how a model is chosen.
+## Scope of the permission bridge
 
-An ordinary DSH session is untouched for the same reason: the bridge is armed only
+The bridge is armed only
 inside a delegated worker run, it is registered as an answerer on that Agent's own
 scoped context, and it declines (falls through to the next answerer) every request
 that is not its own Agent's.

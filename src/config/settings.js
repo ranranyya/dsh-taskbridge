@@ -29,11 +29,11 @@ import {
   ConfigError,
   canonicalProjectKey,
   validateConversationSettings,
+  validateExecutionSettings,
   validateJobOverrides,
   validateMonitoringSettings,
   validateProjectOverride,
   validateProviderProfile,
-  validateReviewSettings,
   validateSelection,
   validateSettings,
   validateWorkerSettings,
@@ -108,7 +108,6 @@ function projectOverrideIndex(projectOverrides) {
 export function resolveEffectiveConfig(settings, { projectPath = null, overrides = {} } = {}) {
   const applied = [];
   let worker = { ...settings.worker };
-  let review = { ...settings.review };
   const canonical = projectPath === null || projectPath === undefined ? null : projectKey(projectPath);
 
   if (canonical !== null) {
@@ -117,10 +116,6 @@ export function resolveEffectiveConfig(settings, { projectPath = null, overrides
       if (projectBlock.worker !== undefined) {
         worker = mergeWorker(worker, projectBlock.worker);
         applied.push('project:worker');
-      }
-      if (projectBlock.review !== undefined) {
-        review = { ...projectBlock.review };
-        applied.push('project:review');
       }
     }
   }
@@ -135,9 +130,6 @@ export function resolveEffectiveConfig(settings, { projectPath = null, overrides
   // project block cannot leave a provider/model pair that global settings once
   // made legal and a later edit invalidated.
   const selection = validateSelection(worker, settings.providers, 'effective.worker');
-  const effectiveReview = review.enabled
-    ? { ...review, ...pluckSelection(validateSelection(review, settings.providers, 'effective.review')) }
-    : { enabled: false, providerId: null, model: null, reasoningEffort: null };
 
   return deepFreeze({
     schemaVersion: SCHEMA_VERSION,
@@ -145,7 +137,16 @@ export function resolveEffectiveConfig(settings, { projectPath = null, overrides
       providerId: selection.providerId,
       model: selection.model,
       reasoningEffort: selection.reasoningEffort,
+      // LEGACY, reported verbatim so a reader can see what the stored document
+      // still says. It is NOT a run budget: nothing bounds an ordinary task by it.
       timeoutSeconds: worker.timeoutSeconds,
+      // The budget the RUN actually gets. `null` is the documented state: an
+      // ordinary delegated task has no total execution deadline — silence is
+      // reported by the monitoring block, never turned into a failure. A number
+      // appears only when the caller explicitly asked for a per-job cap through
+      // `overrides.timeoutSeconds` (the compatibility path the engine still
+      // honours), and that number is what the engine applies.
+      executionTimeoutSeconds: normalizedOverrides.timeoutSeconds ?? null,
       maxParallelism: worker.maxParallelism,
       isolation: worker.isolation,
       // Explicit placeholder for the native provider route. In this stage the
@@ -154,29 +155,9 @@ export function resolveEffectiveConfig(settings, { projectPath = null, overrides
       // its decision against this field rather than re-deriving it.
       providerRoute: selection.providerId,
     },
-    review: {
-      enabled: effectiveReview.enabled === true,
-      providerId: effectiveReview.providerId ?? null,
-      model: effectiveReview.model ?? null,
-      reasoningEffort: effectiveReview.reasoningEffort ?? null,
-      providerRoute: effectiveReview.providerId ?? null,
-    },
-    // What this task does with its DSH conversation is NOT a settings fact any
-    // more: it is decided per submission by `continueFromTaskId`. The frozen
-    // snapshot therefore carries the rule rather than a stored mode, so a task
-    // record states what the plugin will do instead of echoing a retired setting.
+    // The conversation rule is frozen with the task. The monitoring thresholds
+    // apply to new tasks when settings change.
     conversation: { policy: CONVERSATION_POLICY },
-    // The silence thresholds and the repeated-failure count this task runs under,
-    // FROZEN at admission. They are global-only (no project or per-job layer): an
-    // operator edits them rarely, and a per-job override would let one submission ask
-    // to be watched on a different clock than the alert thresholds the operator
-    // actually set. Freezing them here is what makes an edit during a live run apply to
-    // the NEXT task instead of silently retiming one already in flight.
-    monitoring: {
-      selfCheckSeconds: settings.monitoring.selfCheckSeconds,
-      attentionSeconds: settings.monitoring.attentionSeconds,
-      repeatFailureThreshold: settings.monitoring.repeatFailureThreshold,
-    },
     provenance: {
       // Canonical, not the caller's spelling: a recorded snapshot must compare
       // equal to the key its override is stored under.
@@ -184,19 +165,31 @@ export function resolveEffectiveConfig(settings, { projectPath = null, overrides
       projectKey: canonical === null ? null : canonical.key,
       applied,
     },
+    // Frozen verbatim, `0` included: `0` means "this reminder is off", which is a
+    // decision a running task must keep and must not be re-read out of a settings
+    // document that has since changed. Stated LAST so this single block is the one
+    // definition of the monitoring snapshot.
+    monitoring: {
+      selfCheckSeconds: settings.monitoring.selfCheckSeconds,
+      attentionSeconds: settings.monitoring.attentionSeconds,
+      repeatFailureThreshold: settings.monitoring.repeatFailureThreshold,
+    },
   });
 }
 
 function mergeWorker(base, patch) {
   const next = { ...base };
-  for (const key of ['providerId', 'model', 'reasoningEffort', 'timeoutSeconds', 'isolation', 'maxParallelism']) {
+  // `timeoutSeconds` is deliberately NOT merged. It is a retired field: a project
+  // override that still carries one must not be able to turn it into a run budget,
+  // and an operator who set it years ago must not silently cap new tasks through a
+  // layer they cannot see in the settings page. The effective snapshot publishes the
+  // GLOBAL stored value as `worker.timeoutSeconds` (read-only, for readers of the
+  // document) and the actual budget as `worker.executionTimeoutSeconds`, which only
+  // an explicit per-job override can set.
+  for (const key of ['providerId', 'model', 'reasoningEffort', 'isolation', 'maxParallelism']) {
     if (patch[key] !== undefined) next[key] = patch[key];
   }
   return next;
-}
-
-function pluckSelection(selection) {
-  return { providerId: selection.providerId, model: selection.model, reasoningEffort: selection.reasoningEffort };
 }
 
 /**
@@ -208,8 +201,7 @@ function publicPreset(preset) {
   return {
     id: preset.id,
     name: preset.name,
-    worker: preset.worker === null ? null : { ...preset.worker },
-    review: preset.review === null ? null : { ...preset.review },
+    worker: { ...preset.worker },
   };
 }
 
@@ -217,7 +209,7 @@ function publicPreset(preset) {
  * Public, secret-free projection of settings for a settings surface or export.
  *
  * This is also the export shape: a preset holds only provider ids and
- * worker/review blocks, so exporting presets exports no endpoint and no
+ * worker settings, so exporting presets exports no endpoint and no
  * credential. A credential *reference* is included because it is a name, not a
  * value; the value never enters this document.
  * @param {object} settings - validated settings.
@@ -240,12 +232,15 @@ export function publicSettings(settings) {
       models: provider.models.map((model) => ({ ...model, efforts: [...model.efforts] })),
     })),
     worker: { ...settings.worker },
-    review: { ...settings.review },
     authorization: { ...settings.authorization },
     // Included so a settings surface (and an export/import round-trip) sees the
     // actual thresholds a new task will freeze. They are plain bounded integers,
     // never a secret.
     monitoring: { ...validateMonitoringSettings(settings.monitoring) },
+    // Included so a settings surface (and an export/import round-trip) sees the
+    // actual default a NEW task will freeze. Absent in a stored document it is the
+    // documented OFF default, never "on" and never "no choice".
+    execution: { ...validateExecutionSettings(settings.execution) },
     projectOverrides: structuredClone(settings.projectOverrides ?? {}),
     presets: presets.map(publicPreset),
     // Kept in the export for compatibility with documents and clients that read
@@ -387,9 +382,7 @@ export class SettingsService {
   }
 
   /**
-   * Remove one provider profile. A provider still referenced by worker or
-   * review settings is refused: silently dropping the reference would leave
-   * delegation pointing at nothing.
+   * Remove one provider profile. Refuse a provider that the worker or a project override selects.
    * @param {string} providerId - provider to remove.
    * @returns {Promise<object>} committed settings.
    */
@@ -400,11 +393,8 @@ export class SettingsService {
       if (previous.worker.providerId === providerId) {
         throw new ConfigError('PROVIDER_IN_USE', 'the worker settings select this provider', { providerId, role: 'worker' });
       }
-      if (previous.review.enabled && previous.review.providerId === providerId) {
-        throw new ConfigError('PROVIDER_IN_USE', 'the additional review selects this provider', { providerId, role: 'review' });
-      }
       for (const [projectPath, block] of Object.entries(previous.projectOverrides)) {
-        if (block?.worker?.providerId === providerId || block?.review?.providerId === providerId) {
+        if (block?.worker?.providerId === providerId) {
           throw new ConfigError('PROVIDER_IN_USE', 'a project override selects this provider', { providerId, projectPath });
         }
       }
@@ -416,7 +406,6 @@ export class SettingsService {
           ...previous,
           providers,
           worker: defaultSettings().worker,
-          review: defaultSettings().review,
           projectOverrides: {},
           presets: [],
         }, previous);
@@ -457,20 +446,6 @@ export class SettingsService {
       + 'and a follow-up continues the thread named by continueFromTaskId',
       { field: 'conversation.mode', replacement: 'continueFromTaskId' },
     );
-  }
-
-  /**
-   * Replace the additional-review block. Enabling review requires a complete,
-   * independently valid provider/model/effort triple.
-   * @param {unknown} candidate - candidate review block.
-   * @returns {Promise<object>} committed settings.
-   */
-  async setReview(candidate) {
-    return await this.serialize(async () => {
-      const previous = await this.snapshot();
-      const review = validateReviewSettings(candidate, previous.providers);
-      return await this.persistWithinQueue({ ...previous, review }, previous);
-    });
   }
 
   /**
@@ -550,6 +525,29 @@ export class SettingsService {
     return await this.serialize(async () => {
       const previous = await this.snapshot();
       return await this.persistWithinQueue({ ...previous, monitoring }, previous);
+    });
+  }
+
+  /**
+   * Replace the operator's execution-choice block.
+   *
+   * Today that block holds one decision: whether a NEW delegated task should have
+   * DSH Agent Teams on when its dispatcher states no per-task choice. This is a
+   * TASK default only — it is not DSH's global switch, and it never overrides a
+   * per-task `agentTeams` value a dispatcher states.
+   *
+   * Shape validation is pure, so it happens before the turn is queued; the write
+   * then takes the same serialized queue as every other settings mutation, so it
+   * cannot lose a concurrent edit. A task already running keeps the snapshot it
+   * froze at admission; only a later submission reads the new default.
+   * @param {unknown} candidate - `{ agentTeamsDefault }`.
+   * @returns {Promise<object>} committed settings.
+   */
+  async setExecution(candidate) {
+    const execution = validateExecutionSettings(candidate);
+    return await this.serialize(async () => {
+      const previous = await this.snapshot();
+      return await this.persistWithinQueue({ ...previous, execution }, previous);
     });
   }
 

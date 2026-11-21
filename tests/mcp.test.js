@@ -1554,8 +1554,7 @@ test('a real task with an audit diff over the bound still reads back as parseabl
       assert.equal(body.task.state, settled.state);
       assert.equal(body.task.phase, settled.phase, 'phase must be carried through unchanged');
       assert.equal(body.task.route.providerRoute, settled.route.providerRoute, 'worker routing must survive');
-      assert.deepEqual(body.task.reviewRoute, settled.reviewRoute, 'review routing must survive unchanged');
-      assert.equal(body.task.review.verdict, settled.review.verdict);
+      assert.equal(body.task.review ?? null, null, 'a new task has no independent review');
       assert.equal(body.task.selfApproved, false);
       assert.equal(body.task.hostAcceptance, null);
 

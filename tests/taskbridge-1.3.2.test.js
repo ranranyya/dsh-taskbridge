@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { taskTitle } from '../src/jobs/title.js';
 import { placeSession, ensureWorkspace } from '../src/runtime/session-placement.js';
-import { runCodexAction, refreshKnownAgentTemplate, AGENT_FILENAME, isExplicitlyMigratableScript } from '../src/codex/installer.js';
+import { runCodexAction, refreshKnownAgentTemplate, AGENT_FILENAME, isExplicitlyMigratableScript, useDirectoryClassifier } from '../src/codex/installer.js';
 import { fakeWorkspaceController, fakeSessionController } from './helpers/fakes.js';
 
 test('titles use the task goal rather than an executor role and preserve Chinese content', () => {
@@ -47,6 +47,11 @@ for (const action of ['install', 'startup']) test(`${action} migrates the actual
   const current = join(home, 'agents', AGENT_FILENAME);
   const published = await readFile(new URL('./fixtures/codex-agent-1.3.1.toml', import.meta.url));
   const env = { CODEX_HOME: home, DSH_HOME: home };
+  // The boundary check asks Windows for `ReparsePoint` through one PowerShell child, and
+  // this carrier cannot spawn children at all (EPERM). The seam answers the real question
+  // — "is this a plain directory?" — from Node, so the migration path is exercised
+  // instead of being refused as `boundary-unverified`.
+  const restoreClassifier = useDirectoryClassifier(async (paths) => new Map(paths.map((path) => [path, 'directory'])));
   try {
     await mkdir(join(home, 'agents'));
     await writeFile(legacy, published);
@@ -57,7 +62,10 @@ for (const action of ['install', 'startup']) test(`${action} migrates the actual
     await assert.rejects(access(legacy), { code: 'ENOENT' });
     if (action === 'startup') await assert.rejects(access(join(home, 'config.toml')), { code: 'ENOENT' });
     assert.deepEqual((await refreshKnownAgentTemplate(options)).changed, []);
-  } finally { await rm(home, { recursive: true, force: true }); }
+  } finally {
+    restoreClassifier();
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test('an edited old agent and an occupied new agent are preserved during migration', async () => {

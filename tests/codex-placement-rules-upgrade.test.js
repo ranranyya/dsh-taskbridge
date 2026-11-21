@@ -55,7 +55,7 @@ test('a real temporary Codex home upgrades only known rules and preserves custom
       mkdirSync(join(home, 'agents'));
       writeFileSync(agent, oldText);
       writeFileSync(config, configText);
-      const options = { codexHome: home, env: {}, version };
+      const options = { codexHome: home, env: { DSH_HOME: join(home, '.dsh-test-home') }, version };
       assert.equal((await readCodexStatus(options)).agent.state, 'outdated');
       const upgraded = await refreshKnownAgentTemplate(options);
       assert.deepEqual(upgraded.changed, ['agent']);

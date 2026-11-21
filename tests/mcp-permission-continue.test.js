@@ -41,7 +41,7 @@ import {
 import { decidedRequestMatcher, decisionReceipt } from '../src/mcp/continuation.js';
 import { NOT_INTEGRATED, createCallMetrics } from '../src/mcp/metrics.js';
 import { MAX_OBSERVE_WAIT_MS } from '../src/http/execution-plane.js';
-import { buildWorkerPrompt } from '../src/review/prompts.js';
+import { buildWorkerPrompt } from '../src/runtime/worker-prompt.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1458,4 +1458,11 @@ test('the worker prompt states how to read logs, run tests and ask for extra per
   // The pre-existing invariants are still there.
   assert.match(flat, /Do not commit, push, tag, or rewrite git history/u);
   assert.match(flat, /You cannot approve your own work/u);
+});
+
+test('the delegated worker cannot approve its own work or rewrite history', () => {
+  const prompt = buildWorkerPrompt({ taskId: 'task-1', prompt: 'Add a function', isolation: 'shared' });
+  assert.match(prompt, /Do not commit, push, tag, or rewrite git history/);
+  assert.match(prompt, /the host decides acceptance/);
+  assert.match(prompt, /Do not claim checks you did not run/);
 });

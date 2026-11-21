@@ -41,6 +41,7 @@ import { sameRecordedDirectory } from '../jobs/continuation-identity.js';
 import { buildTaskTree } from '../jobs/task-tree.js';
 import { findDisplayNode } from '../jobs/task-display.js';
 import { MAX_PLAN_BATCH, PLAN_CODES } from '../jobs/plan-store.js';
+import { cleanupOverview, runCleanup } from '../jobs/record-cleanup.js';
 
 /**
  * Route prefix, already below `/api` because the native exact-route registry
@@ -151,6 +152,45 @@ export function userPlaneRoutes(deps) {
         return jsonResponse(200, {
           ok: true,
           monitoring: { ...committed.monitoring },
+          // The whole document is returned too, because the page adopts it after a
+          // narrow save and must not have to issue a second read to stay truthful.
+          settings: publicSettings(committed),
+        });
+      },
+    },
+    // One narrow route for the operator's execution choices — today, the Agent Teams
+    // default a NEW task gets when its dispatcher states no per-task choice.
+    //
+    // Like the monitoring route it is on the AUTHENTICATED operator plane, and the MCP
+    // surface never gains a settings write. It is deliberately narrow: it can set ONE
+    // task default and nothing else. It cannot turn on DSH's global agent-teams switch,
+    // cannot change a provider, a model, an effort, an isolation mode, a grant or the
+    // delegation switch, and it cannot change a task that already ran — those froze their
+    // own decision at admission. `setExecution` validates its own block.
+    {
+      path: `${USER_PLANE_PREFIX}/execution`,
+      methods: ['POST'],
+      requestBody: BODY_MODE,
+      fetch: async (request) => {
+        const body = await readJsonRequest(request);
+        if (body.execution === undefined) {
+          throw new HttpError(400, 'EXECUTION_SETTINGS_MISSING', 'an execution block is required');
+        }
+        // A refused block is the caller's mistake, not a server fault: the shared
+        // translator would render the validator's unlisted code as a 500, so it is
+        // re-thrown here as a 400 that keeps the original code and its field details.
+        // Nothing is written when this throws.
+        let committed;
+        try {
+          committed = await deps.settings.setExecution(body.execution);
+        } catch (error) {
+          const code = typeof error?.code === 'string' ? error.code : '';
+          if (!code.startsWith('EXECUTION_')) throw error;
+          throw new HttpError(400, code, String(error?.message ?? 'the execution block is invalid'), error?.details ?? {});
+        }
+        return jsonResponse(200, {
+          ok: true,
+          execution: { ...committed.execution },
           // The whole document is returned too, because the page adopts it after a
           // narrow save and must not have to issue a second read to stay truthful.
           settings: publicSettings(committed),
@@ -331,6 +371,10 @@ export function userPlaneRoutes(deps) {
     //     projection is read-only in both directions: it neither dispatches work
     //     nor rewrites the document.
     //
+    // Removal of those records is its own route (`POST /tasks/cleanup`, below). The
+    // list only PUBLISHES, per execution chain, whether that chain may be removed;
+    // it never deletes anything, so refreshing the page cannot destroy a record.
+    //
     // A history document that cannot be read is a *visible refusal*, never an
     // empty success: answering `tasks: []` for an unreadable archive would tell
     // an operator that nothing ever ran.
@@ -356,6 +400,47 @@ export function userPlaneRoutes(deps) {
           plans,
           tree,
         });
+      },
+    },
+    // The session-placement map, narrowed to the fields the sidebar's grouped
+    // workspaces view needs to PROVE which real DSH sessions this plugin created.
+    //
+    // It exists because the grouped view runs in the browser, where a task record may
+    // already have been cleaned or hidden, while the durable map is the one document
+    // that still says "TaskBridge drove session X in workspace Y for source path S".
+    // Without it, a session whose records are gone has to be guessed at — and that is
+    // exactly the guess the sidebar must never make.
+    //
+    // What crosses the boundary is identity only, and it is the map's own field list
+    // (`RECORD_FIELDS`): task/source/execution paths, their digests, the Workspace,
+    // the Session, the isolation and the managed-tree facts. Never a prompt, a
+    // transcript, a model output, a token or a credential — none of them is in the
+    // document. This route is a read: it writes nothing and drives nothing.
+    {
+      path: `${USER_PLANE_PREFIX}/session-map`,
+      methods: ['GET'],
+      requestBody: BODY_MODE,
+      fetch: async () => {
+        const store = deps.sessionStore ?? null;
+        if (store === null || store === undefined || typeof store.list !== 'function') {
+          throw new HttpError(
+            503,
+            'SESSION_MAP_UNAVAILABLE',
+            'this deployment keeps no task-to-conversation identity, so the sidebar cannot be grouped by it',
+          );
+        }
+        let rows;
+        try {
+          rows = await store.list();
+        } catch (error) {
+          throw new HttpError(
+            503,
+            'SESSION_MAP_UNREADABLE',
+            'the stored task-to-conversation identity could not be read',
+            { cause: typeof error?.code === 'string' ? error.code : 'SESSION_MAP_UNREADABLE' },
+          );
+        }
+        return jsonResponse(200, { ok: true, sessions: projectSessionMap(rows) });
       },
     },
     {
@@ -478,6 +563,34 @@ export function userPlaneRoutes(deps) {
             changedByThisAction: false,
           },
         });
+      },
+    },
+    // ---- task record cleanup (one narrow, explicit write) --------------------
+    // The operator selected finished execution chains in the task tree and confirmed.
+    // The body names those chains and their exact rounds and nothing else:
+    //
+    //     { confirm: true, chains: [{ chainId, taskIds: [...] }] }
+    //
+    // There is no time window, no path, no "delete all" flag and no per-node id: a
+    // caller cannot express "remove whatever finished last week", which is what makes
+    // the batch reviewable before it is sent. `runCleanup` re-reads the UNFILTERED
+    // current records and refuses the batch whole when any named chain is unknown,
+    // changed, live, undurable, still being reviewed, or still depended on by a
+    // continuation or a planning node — so a refusal writes nothing at all.
+    //
+    // What it removes is the durable record (and with it the review conclusion).
+    // It creates nothing else: no native Session, Workspace, worktree or source file
+    // is touched, no plan node is deleted or orphaned, and no other data file is
+    // written. It is a user-plane route only — the execution plane, the MCP surface
+    // and the native fence pick up no new capability from it.
+    {
+      path: `${USER_PLANE_PREFIX}/tasks/cleanup`,
+      methods: ['POST'],
+      requestBody: BODY_MODE,
+      fetch: async (request) => {
+        const body = await readJsonRequest(request);
+        const outcome = await runCleanup(deps, body);
+        return jsonResponse(200, { ok: true, ...outcome });
       },
     },
     {
@@ -932,6 +1045,26 @@ async function readTaskRecords(deps, options = {}) {
   }
   merged.sort(compareNewestFirst);
   const tree = buildTaskTree({ planNodes: planState.nodes, tasks: merged });
+  // Every chain of the projection carries its own cleanup facts, computed from the
+  // SAME unfiltered records above. The page draws a checkbox from this block and the
+  // delete route re-checks the very same rules before writing, so a row the operator
+  // can tick is a row whose server-side check will pass. A chain the projection could
+  // not describe (no facts) is left untouched and is therefore not selectable.
+  if (deps.history !== null && deps.history !== undefined && typeof deps.history.deleteMany === 'function') {
+    try {
+      const overview = await cleanupOverview(deps);
+      attachCleanupFacts(tree, overview.chains);
+    } catch (error) {
+      // A tree that cannot describe removal is still a readable tree; the page then
+      // shows the chains without the cleanup action instead of a broken list.
+      deps.logger?.warn?.('dsh-delegate: record cleanup facts could not be computed', error?.code ?? 'CLEANUP_UNAVAILABLE');
+      tree.cleanupAvailable = false;
+      tree.cleanupError = typeof error?.code === 'string' ? error.code : 'CLEANUP_UNAVAILABLE';
+    }
+  } else {
+    tree.cleanupAvailable = false;
+    tree.cleanupError = 'CLEANUP_UNAVAILABLE';
+  }
   if (deps.taskDisplay) {
     try {
       await deps.taskDisplay.project(tree);
@@ -961,8 +1094,70 @@ async function readTaskRecords(deps, options = {}) {
   };
 }
 
-// Older review writes could drop the top-level session id while retaining the
-// placement and paths. Only the operator's task list needs this navigation link.
+/**
+ * Attach the cleanup facts of one chain to every chain object of a projected tree.
+ *
+ * The chains inside `roots` are the projection's own objects, so this writes the
+ * block onto them in place instead of rebuilding the tree: `flatNodes` deliberately
+ * carries no chain detail and must not be widened (it is the transport shape an
+ * execution-plane reader sees).
+ * @param {object} tree - `buildTaskTree` result.
+ * @param {object[]} facts - `cleanupOverview(...).chains`.
+ * @returns {void}
+ */
+function attachCleanupFacts(tree, facts) {
+  const byId = new Map((Array.isArray(facts) ? facts : []).map((entry) => [entry.chainId, entry]));
+  const walk = (node) => {
+    const chains = node?.kind === 'plan' ? (node.executions ?? []) : (node?.chain ? [node.chain] : []);
+    for (const chain of chains) {
+      const fact = byId.get(chain.chainId) ?? null;
+      // No facts means "this host cannot say", which the page reads as not selectable.
+      if (fact === null) continue;
+      chain.cleanup = {
+        eligible: fact.eligible === true,
+        blockers: Array.isArray(fact.blockers) ? [...fact.blockers] : [],
+      };
+    }
+    for (const child of Array.isArray(node?.children) ? node.children : []) walk(child);
+  };
+  for (const root of Array.isArray(tree?.roots) ? tree.roots : []) walk(root);
+  tree.cleanupAvailable = true;
+  tree.cleanupError = null;
+}
+
+// The identity fields the grouped sidebar needs, and nothing else. This is the
+// session map's own field list narrowed to what a VIEW model consumes; an unknown
+// future field on a stored row is dropped here rather than published by accident.
+const SESSION_MAP_VIEW_FIELDS = Object.freeze([
+  'taskId', 'sourcePath', 'executionPath', 'sourcePathDigest', 'executionPathDigest',
+  'workspaceId', 'sessionId', 'isolation', 'worktreeId', 'worktreeState', 'updatedAt',
+]);
+
+/**
+ * Project the session-placement map onto the grouped sidebar's view fields.
+ *
+ * A row that cannot name a session or a Workspace proves nothing about the sidebar, so
+ * it is dropped instead of published half-formed: the browser would otherwise have to
+ * decide what a partially usable row means, and the answer could only be a guess.
+ * @param {unknown} rows - `SessionStore.list()` result.
+ * @returns {object[]} bounded rows, newest first.
+ */
+function projectSessionMap(rows) {
+  const usable = (Array.isArray(rows) ? rows : []).filter((row) => row !== null && typeof row === 'object'
+    && typeof row.sessionId === 'string' && row.sessionId !== ''
+    && typeof row.workspaceId === 'string' && row.workspaceId !== '');
+  const projected = usable.map((row) => {
+    const view = {};
+    for (const field of SESSION_MAP_VIEW_FIELDS) {
+      if (row[field] !== undefined) view[field] = row[field];
+    }
+    return view;
+  });
+  projected.sort((left, right) => (Number(right.updatedAt) || 0) - (Number(left.updatedAt) || 0));
+  return projected;
+}
+
+// Older review writes could drop the top-level session id while retaining the// placement and paths. Only the operator's task list needs this navigation link.
 async function restoreSidebarSessionIds(tasks, sessionStore) {
   const needsLink = (task) => task.archived === true && task.sessionId == null
     && typeof task.execution?.conversation?.workspaceId === 'string';

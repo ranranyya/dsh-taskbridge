@@ -311,7 +311,18 @@ async function fixture(options = {}) {
   // which is the "absent capability" case every other test in this file runs in.
   const teamCalls = [];
   let teamMode = typeof options.agentTeams === 'boolean' ? options.agentTeams : null;
-  const agentTeams = options.agentTeams === undefined
+  // A host that HAS the agent-teams service, unless a test asks for a host that does not.
+  //
+  // Why this default: from EXEC-1.6.1 on, a run that carries a team choice which cannot be
+  // applied is REFUSED before the prompt (that is the whole point of the fix — an explicit
+  // or inherited choice must never silently run under the Session's old mode). Only the
+  // operator's implicit off default may proceed unpublished. This file is about
+  // continuation ownership, admission and placement, so it models a capable host and
+  // reserves the absent-capability case for `agentTeams: false`, which is the one
+  // direction that must still run. Passing `agentTeamsUnavailable: true` models an older
+  // host for a test that wants to observe the refusal.
+  const hasService = options.agentTeamsUnavailable !== true;
+  const agentTeams = !hasService
     ? undefined
     : {
       async setEnabled(agent, enabled) {
@@ -1945,18 +1956,171 @@ test('team: a follow-up inherits the parent false, and an explicit choice overri
   }
 });
 
-test('team: no choice anywhere means NO write to the Session, and the run still executes', async () => {
-  const h = await fixture({ agentTeams: false });
+test('team: no per-task choice now follows the operator default, and a follow-up inherits it', async () => {
+  // EXEC-1.6.1: an ABSENT per-task choice is no longer "no decision at all" — the
+  // operator's TaskBridge default fills it (OFF on a fresh install and after an upgrade).
+  // What this test pins is the compatibility half: the run still executes, exactly ONE
+  // Session write is made (this run's own), and the record says WHERE the choice came from
+  // so a default is never presented as something the dispatcher asked for.
+  const h = await fixture({ agentTeams: true });
   try {
     const a = authorize(h.auth, h.workspace, 'A');
     const callsBefore = h.teamCalls.length;
     const taskId = await runOne(h.before, a, 'do work');
     const task = h.before.engine.get(taskId);
-    assert.equal(task.agentTeams, null, 'nothing was frozen');
-    assert.equal(task.execution.team.requested, null);
-    assert.equal(task.execution.team.reason, 'not-requested');
-    assert.equal(h.teamCalls.length, callsBefore, 'and no Session write was made');
+    assert.equal(task.agentTeams, false, 'the documented OFF default was frozen on the task');
+    assert.equal(task.agentTeamsOrigin, 'settings-default', 'and the record says it came from the default');
+    assert.equal(task.execution.team.requested, false);
+    assert.equal(task.execution.team.applied, true, 'DSH confirmed the selection for this run');
+    assert.equal(h.teamCalls.length, callsBefore + 1, 'exactly one write, for THIS run\u2019s own Session');
+    assert.equal(h.teamCalls[h.teamCalls.length - 1].enabled, false, 'and it set that Session to off');
     assert.equal(task.state, TASK_STATES.awaitingHostReview, 'the run executed normally');
+  } finally {
+    await h.close();
+  }
+});
+
+test('team: an operator default of ON applies to a new task, and a follow-up still inherits the chain', async () => {
+  // The other direction of the default. The parent takes it; the follow-up inherits the
+  // PARENT's recorded decision rather than re-reading the setting, which is what keeps a
+  // chain from flipping mid-way when the operator edits the default later.
+  const h = await fixture({ agentTeams: true });
+  try {
+    await h.before.settings.setExecution({ agentTeamsDefault: true });
+    const a = authorize(h.auth, h.workspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work');
+    const parent = h.before.engine.get(parentId);
+    assert.equal(parent.agentTeams, true, 'the operator default applied to the new task');
+    assert.equal(parent.agentTeamsOrigin, 'settings-default');
+    assert.equal(await h.before.sessionStore.get(parentId).then((row) => row.agentTeams), true,
+      'and the identity map recorded it for a later process');
+
+    // Flip the default OFF, then continue: the follow-up must still follow the CHAIN.
+    await h.before.settings.setExecution({ agentTeamsDefault: false });
+    const childId = await runOne(h.before, a, 'keep going', { continueFromTaskId: parentId });
+    const child = h.before.engine.get(childId);
+    assert.equal(child.agentTeams, true, 'the follow-up inherited the parent, not the new default');
+    assert.equal(child.agentTeamsOrigin, 'continuation');
+  } finally {
+    await h.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A host with NO agent-teams service, the operator default OFF, and a follow-up.
+//
+// This is the compatibility case the whole feature must not break. The first round has no
+// per-task choice, takes the documented OFF default, and is allowed to run unpublished
+// (`team.supported: false`, `applied: false`) — nothing was ever written to its Session,
+// because the host has nothing to write with. A follow-up therefore has NO native value to
+// inherit: re-sending that `false` as though a person had chosen it made the runner refuse
+// the second round with `RUN_AGENT_TEAMS_UNAVAILABLE`. It must instead keep the Session's
+// current mode, and it must NOT fall back to whichever new-task default happens to be
+// configured now.
+// ---------------------------------------------------------------------------
+
+test('team: with no team service, the default OFF runs, and a follow-up keeps the Session mode', async () => {
+  const h = await fixture({ agentTeamsUnavailable: true });
+  try {
+    const a = authorize(h.auth, h.workspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work');
+    const parent = h.before.engine.get(parentId);
+    // Round one: the default filled an absent choice and the host could not apply it.
+    assert.equal(parent.agentTeams, false);
+    assert.equal(parent.agentTeamsOrigin, 'settings-default');
+    assert.equal(parent.execution.team.supported, false, 'the host has no such capability');
+    assert.equal(parent.execution.team.applied, false, 'and nothing was written');
+    const parentSession = parent.execution.conversation.sessionId;
+
+    // Round two: no per-task choice. The parent's `false` was never a native value, so the
+    // follow-up must carry no choice at all rather than a fabricated one.
+    const childId = await runOne(h.before, a, 'keep going', { continueFromTaskId: parentId });
+    const child = h.before.engine.get(childId);
+    assert.equal(child.agentTeams, null, 'no choice was inherited, because none ever reached the Session');
+    assert.equal(child.agentTeamsOrigin, null, 'and none is attributed to the chain or the setting');
+    assert.equal(child.execution.team.requested, null, 'the runner was asked for nothing');
+    assert.equal(child.execution.team.reason, 'not-requested');
+    assert.equal(child.execution.conversation.sessionId, parentSession, 'the SAME DSH Session was continued');
+    assert.equal(child.state, TASK_STATES.awaitingHostReview, 'the follow-up executed normally');
+  } finally {
+    await h.close();
+  }
+});
+
+test('team: that no-service chain keeps its Session mode across a RESTART and a further round', async () => {
+  // The fact must survive a process boundary: a follow-up in a new process reads the
+  // parent from durable history, and must reach the same conclusion from the STORED
+  // `team`/`agentTeamsOrigin` — and, in turn, its own row must keep saying so, so a third
+  // round is not refused either.
+  const h = await fixture({ agentTeamsUnavailable: true });
+  try {
+    const a = authorize(h.auth, h.workspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work');
+    const parentSession = h.before.engine.get(parentId).execution.conversation.sessionId;
+
+    const after = await h.restart();
+    try {
+      const childId = await runOne(after, a, 'keep going', { continueFromTaskId: parentId });
+      const child = after.engine.get(childId);
+      assert.equal(child.agentTeams, null, 'read from durable history: still nothing to inherit');
+      assert.equal(child.execution.team.requested, null);
+      assert.equal(child.execution.conversation.sessionId, parentSession, 'the same Session across the restart');
+
+      // The follow-up's own row records no decision either, so a third round in ANOTHER
+      // process reaches the same answer instead of inheriting a fabricated `false`.
+      const third = await h.restart();
+      try {
+        const grandchildId = await runOne(third, a, 'one more round', { continueFromTaskId: childId });
+        const grandchild = third.engine.get(grandchildId);
+        assert.equal(grandchild.agentTeams, null, 'the chain stays in "keep the Session mode"');
+        assert.equal(grandchild.execution.team.requested, null);
+        assert.equal(grandchild.execution.conversation.sessionId, parentSession, 'still the same Session');
+      } finally {
+        await third.engine.dispose();
+      }
+    } finally {
+      await after.engine.dispose();
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test('team: the no-service chain does NOT read the current new-task default', async () => {
+  // A follow-up belongs to a live conversation, not to the settings page: flipping the
+  // default ON must not start injecting `true` into an existing chain either.
+  const h = await fixture({ agentTeamsUnavailable: true });
+  try {
+    const a = authorize(h.auth, h.workspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work');
+    await h.before.settings.setExecution({ agentTeamsDefault: true });
+    const childId = await runOne(h.before, a, 'keep going', { continueFromTaskId: parentId });
+    const child = h.before.engine.get(childId);
+    assert.equal(child.agentTeams, null, 'the new-task default did not reach the follow-up');
+    assert.equal(child.execution.team.requested, null);
+    assert.equal(child.state, TASK_STATES.awaitingHostReview);
+  } finally {
+    await h.close();
+  }
+});
+
+test('team: an APPLIED explicit false on a chain is still inherited on a capable host', async () => {
+  // The other side of the rule: a real, applied decision must keep travelling. Without
+  // this, the fix could be "ignore all inherited false", which is exactly what it must
+  // not become.
+  const h = await fixture({ agentTeams: true });
+  try {
+    const a = authorize(h.auth, h.workspace, 'A');
+    const parentId = await runOne(h.before, a, 'do work', { overrides: { agentTeams: false } });
+    const parent = h.before.engine.get(parentId);
+    assert.equal(parent.agentTeamsOrigin, 'request');
+    assert.equal(parent.execution.team.applied, true, 'this one really was written');
+
+    const childId = await runOne(h.before, a, 'keep going', { continueFromTaskId: parentId });
+    const child = h.before.engine.get(childId);
+    assert.equal(child.agentTeams, false, 'an applied explicit false is inherited');
+    assert.equal(child.agentTeamsOrigin, 'continuation');
+    assert.equal(child.execution.team.applied, true);
   } finally {
     await h.close();
   }

@@ -39,7 +39,7 @@ test('a valid settings document round-trips through validation', () => {
   const settings = validateSettings(validSettings());
   assert.equal(settings.providers[0].id, 'relay');
   assert.equal(settings.worker.reasoningEffort, 'medium');
-  assert.equal(settings.review.enabled, false);
+  assert.equal(Object.hasOwn(settings, 'review'), false);
 });
 
 test('a provider cannot carry a secret value in settings', () => {
@@ -95,26 +95,22 @@ test('selecting an undeclared effort for a model is refused', () => {
   );
 });
 
-test('enabling review without a selection is refused', () => {
-  assert.throws(
-    () => validateSettings(validSettings({ review: { enabled: true } })),
-    (error) => error.code === 'SELECTION_PROVIDER_REQUIRED',
+test('worker bounds are enforced, not clamped — except the retired timeout, which only normalizes', () => {
+  // `timeoutSeconds` is LEGACY: it no longer bounds a run, so an old document carrying
+  // an out-of-range value must still OPEN (normalized to the default) instead of making
+  // the whole settings document unreadable.
+  assert.equal(
+    validateWorkerSettings({ ...validSettings().worker, timeoutSeconds: 1 }, PROVIDERS).timeoutSeconds,
+    1800,
   );
-});
-
-test('enabling review with an independently valid selection is accepted', () => {
-  const settings = validateSettings(validSettings({
-    review: { enabled: true, providerId: 'relay', model: 'deepseek-chat', reasoningEffort: 'high' },
-  }));
-  assert.equal(settings.review.enabled, true);
-  assert.equal(settings.review.model, 'deepseek-chat');
-  assert.equal(settings.review.reasoningEffort, 'high');
-});
-
-test('worker bounds are enforced, not clamped', () => {
-  assert.throws(
-    () => validateWorkerSettings({ ...validSettings().worker, timeoutSeconds: 1 }, PROVIDERS),
-    (error) => error.code === 'WORKER_TIMEOUT_INVALID',
+  assert.equal(
+    validateWorkerSettings({ ...validSettings().worker, timeoutSeconds: 999_999 }, PROVIDERS).timeoutSeconds,
+    1800,
+  );
+  assert.equal(
+    validateWorkerSettings({ ...validSettings().worker, timeoutSeconds: 900 }, PROVIDERS).timeoutSeconds,
+    900,
+    'an in-range legacy value is preserved verbatim',
   );
   assert.throws(
     () => validateWorkerSettings({ ...validSettings().worker, maxParallelism: 99 }, PROVIDERS),
@@ -124,6 +120,27 @@ test('worker bounds are enforced, not clamped', () => {
     () => validateWorkerSettings({ ...validSettings().worker, isolation: 'sandbox' }, PROVIDERS),
     (error) => error.code === 'WORKER_ISOLATION_INVALID',
   );
+});
+
+test('the legacy timeout is reported but never becomes the run budget', () => {
+  const settings = validateSettings(validSettings({
+    worker: { ...validSettings().worker, timeoutSeconds: 1800 },
+  }));
+  const effective = resolveEffectiveConfig(settings, {});
+  assert.equal(effective.worker.timeoutSeconds, 1800, 'the stored legacy value is still readable');
+  assert.equal(effective.worker.executionTimeoutSeconds, null,
+    'but an ordinary run has NO total execution deadline');
+  // A project override cannot reintroduce a deadline either.
+  const withProject = validateSettings(validSettings({
+    projectOverrides: {
+      'C:\\work\\legacy': { worker: { providerId: 'relay', model: 'deepseek-chat', reasoningEffort: 'low', timeoutSeconds: 60 } },
+    },
+  }));
+  assert.equal(resolveEffectiveConfig(withProject, { projectPath: 'C:\\work\\legacy' }).worker.executionTimeoutSeconds, null);
+  // The ONE retained compatibility path: an explicit per-job override still caps it.
+  const capped = resolveEffectiveConfig(settings, { overrides: { timeoutSeconds: 120 } });
+  assert.equal(capped.worker.executionTimeoutSeconds, 120, 'an explicit per-job cap is honoured');
+  assert.equal(capped.worker.timeoutSeconds, 1800, 'and does not rewrite the stored legacy value');
 });
 
 test('layering composes project then job overrides over global settings', () => {
@@ -139,7 +156,13 @@ test('layering composes project then job overrides over global settings', () => 
     overrides: { reasoningEffort: 'high' },
   });
   assert.equal(effective.worker.reasoningEffort, 'high', 'job override wins over project');
-  assert.equal(effective.worker.timeoutSeconds, 900, 'project value survives when the job does not override it');
+  // A project block may still carry a legacy `timeoutSeconds`, but that field no
+  // longer bounds a run, so it is NOT merged into the effective worker: the published
+  // value is the GLOBAL stored one, and the run budget stays `null`.
+  assert.equal(effective.worker.timeoutSeconds, settings.worker.timeoutSeconds,
+    'a project override cannot reintroduce the retired timeout as a budget');
+  assert.equal(effective.worker.executionTimeoutSeconds, null, 'no total deadline for an ordinary run');
+  assert.equal(effective.worker.maxParallelism, 1, 'the project block still applies its other fields');
   assert.deepEqual(effective.provenance.applied, ['project:worker', 'job:worker']);
 });
 
@@ -466,42 +489,47 @@ test('the executable snapshot is immutable and names its provider route explicit
   assert.equal(effective.worker.model, 'deepseek-chat', 'omitted job overrides retain the model selected in DSH');
   assert.equal(effective.worker.reasoningEffort, 'medium', 'omitted job overrides retain the effort selected in DSH');
   assert.equal(effective.worker.providerRoute, 'relay', 'the route handed to the native agent is an explicit field');
-  assert.equal(effective.review.providerRoute, null);
+  assert.equal(Object.hasOwn(effective, 'review'), false);
   assert.throws(() => { effective.worker.model = 'deepseek-reasoner'; }, TypeError);
 });
 
-test('public settings and export include nonsecret presets and no credential value', async () => {
+test('legacy model review settings migrate without affecting execution settings or providers', async () => {
   const dir = await makeTempDir();
   try {
-    const service = new SettingsService(dir);
-    await service.replace({
-      ...validSettings(),
-      presets: [{
-        id: 'thorough',
-        name: 'Thorough',
-        worker: { providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high' },
-        review: { enabled: true, providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'medium' },
-      }],
-    });
-    const stored = await service.read();
-    assert.equal(stored.presets.length, 1);
-
-    for (const projection of [publicSettings(stored), exportSettings(stored)]) {
-      assert.deepEqual(projection.presets, [{
-        id: 'thorough',
-        name: 'Thorough',
-        worker: { ...projection.presets[0].worker },
-        review: {
-          enabled: true,
-          providerId: 'relay',
-          model: 'deepseek-reasoner',
-          reasoningEffort: 'medium',
+    const legacyReview = { enabled: true, providerId: 'missing-review-provider', model: 'retired', reasoningEffort: 'high' };
+    const worker = { ...validSettings().worker, reasoningEffort: 'high' };
+    const legacy = {
+      ...validSettings({
+        review: legacyReview,
+        projectOverrides: {
+          '/work/review-only': { review: legacyReview },
+          '/work/worker': { worker, review: legacyReview },
         },
-      }]);
+      }),
+      presets: [
+        { id: 'thorough', name: 'Thorough', worker, review: legacyReview },
+        { id: 'review-only', name: 'Review only', review: legacyReview },
+      ],
+    };
+    await writeFileAtomic(`${dir}/settings.json`, JSON.stringify(legacy));
+    const service = new SettingsService(dir);
+    const stored = await service.read();
+    const imported = await service.replaceValidated(legacy);
+    assert.deepEqual(imported, stored);
+    const workerOverride = Object.values(stored.projectOverrides)[0];
+    assert.equal(Object.keys(stored.projectOverrides).length, 1);
+    assert.equal(workerOverride.worker.reasoningEffort, 'high');
+    assert.equal(Object.hasOwn(workerOverride, 'review'), false);
+    assert.deepEqual(stored.presets.map(({ id }) => id), ['thorough']);
+    for (const projection of [stored, publicSettings(stored), exportSettings(stored)]) {
+      assert.equal(Object.hasOwn(projection, 'review'), false);
+      assert.equal(Object.hasOwn(projection.presets[0], 'review'), false);
+      assert.equal(projection.presets[0].worker.reasoningEffort, 'high');
       assert.equal(JSON.stringify(projection).includes('sk-'), false);
       assert.equal(JSON.stringify(projection).includes('DSH_DELEGATE_RELAY_KEY_VALUE'), false);
-      assert.equal(projection.providers[0].credentialRef, 'DSH_DELEGATE_RELAY_KEY', 'a reference is a name, not a value');
+      assert.equal(projection.providers[0].credentialRef, 'DSH_DELEGATE_RELAY_KEY');
     }
+    assert.equal((await new SettingsService(dir).read()).worker.reasoningEffort, legacy.worker.reasoningEffort);
   } finally {
     await cleanup(dir);
   }
@@ -679,14 +707,38 @@ test('replacing the configuration keeps a stored legacy block instead of droppin
 // Monitoring thresholds: defaults, validation, precedence and persistence
 // ---------------------------------------------------------------------------
 
-test('a document without a monitoring block loads with the documented defaults', () => {
+test('a document without a monitoring block loads with the documented 10/40-minute defaults', () => {
   const without = validSettings();
   assert.equal(Object.hasOwn(without, 'monitoring'), false, 'the fixture models a pre-feature document');
   const settings = validateSettings(without);
-  assert.deepEqual(settings.monitoring, { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: 3 });
+  assert.deepEqual(settings.monitoring, {
+    selfCheckSeconds: 600,
+    attentionSeconds: 2400,
+    repeatFailureThreshold: 3,
+  });
 });
 
-test('monitoring accepts whole seconds inside the documented bounds', () => {
+test('an older document keeps its deliberately configured thresholds on upgrade', () => {
+  // Both values were chosen by an operator: the upgrade must not re-default them.
+  const settings = validateSettings({
+    ...validSettings(),
+    monitoring: { selfCheckSeconds: 900, attentionSeconds: 5400, repeatFailureThreshold: 7 },
+  });
+  assert.deepEqual(settings.monitoring, { selfCheckSeconds: 900, attentionSeconds: 5400, repeatFailureThreshold: 7 });
+});
+
+test('an unpublished cadence key in a stored block is read and dropped, never refused', () => {
+  // The earlier candidate had its own runtime cadence. It is not a second clock and is
+  // shown nowhere, so the document must still open; the value simply does not survive.
+  const settings = validateSettings({
+    ...validSettings(),
+    monitoring: { selfCheckSeconds: 600, attentionSeconds: 2400, progressCheckSeconds: 1800, repeatFailureThreshold: 3 },
+  });
+  assert.equal(Object.hasOwn(settings.monitoring, 'progressCheckSeconds'), false, 'no third clock is stored');
+  assert.equal(settings.monitoring.attentionSeconds, 2400, 'the surviving interval is untouched');
+});
+
+test('monitoring accepts whole seconds inside the documented bounds, including 0 for off', () => {
   assert.deepEqual(
     validateSettings({ ...validSettings(), monitoring: { selfCheckSeconds: 30, attentionSeconds: 31 } }).monitoring,
     { selfCheckSeconds: 30, attentionSeconds: 31, repeatFailureThreshold: 3 },
@@ -698,14 +750,30 @@ test('monitoring accepts whole seconds inside the documented bounds', () => {
   // A partial block takes the default for the missing key.
   assert.deepEqual(
     validateSettings({ ...validSettings(), monitoring: { selfCheckSeconds: 120 } }).monitoring,
-    { selfCheckSeconds: 120, attentionSeconds: 600, repeatFailureThreshold: 3 },
+    { selfCheckSeconds: 120, attentionSeconds: 2400, repeatFailureThreshold: 3 },
   );
+});
+
+test('each reminder can be switched off independently with 0', () => {
+  const block = (monitoring) => validateSettings({ ...validSettings(), monitoring }).monitoring;
+  // Both off: the ordering rule no longer applies.
+  assert.deepEqual(block({ selfCheckSeconds: 0, attentionSeconds: 0 }), {
+    selfCheckSeconds: 0, attentionSeconds: 0, repeatFailureThreshold: 3,
+  });
+  // Self-check off but the progress check on: legal, even though the interval is
+  // numerically SMALLER than the disabled threshold would have been.
+  assert.deepEqual(block({ selfCheckSeconds: 0, attentionSeconds: 2400 }), {
+    selfCheckSeconds: 0, attentionSeconds: 2400, repeatFailureThreshold: 3,
+  });
+  assert.deepEqual(block({ selfCheckSeconds: 2400, attentionSeconds: 0 }), {
+    selfCheckSeconds: 2400, attentionSeconds: 0, repeatFailureThreshold: 3,
+  });
 });
 
 test('the repeated-failure reminder is a count: 0 disables it, and older documents keep the default', () => {
   const withCount = (repeatFailureThreshold) => validateSettings({
     ...validSettings(),
-    monitoring: { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold },
+    monitoring: { selfCheckSeconds: 600, attentionSeconds: 2400, repeatFailureThreshold },
   }).monitoring.repeatFailureThreshold;
   assert.equal(withCount(0), 0, '0 is the documented "off" value, not an error');
   assert.equal(withCount(1), 1);
@@ -723,16 +791,17 @@ test('the repeated-failure reminder is a count: 0 disables it, and older documen
 
 test('monitoring refuses out-of-range, non-integer and wrongly typed values', () => {
   const cases = [
-    [{ selfCheckSeconds: 29 }, 'MONITORING_INVALID'],
+    [{ selfCheckSeconds: -1 }, 'MONITORING_INVALID'],
     [{ selfCheckSeconds: 3601 }, 'MONITORING_INVALID'],
     [{ selfCheckSeconds: 300.5 }, 'MONITORING_INVALID'],
     [{ selfCheckSeconds: '300' }, 'MONITORING_INVALID'],
-    [{ attentionSeconds: 30 }, 'MONITORING_INVALID'],
+    [{ attentionSeconds: -1 }, 'MONITORING_INVALID'],
     [{ attentionSeconds: 7201 }, 'MONITORING_INVALID'],
     [{ attentionSeconds: null }, 'MONITORING_INVALID'],
     [{ attentionSeconds: Number.NaN }, 'MONITORING_INVALID'],
-    [{ selfCheckSeconds: 300, attentionSeconds: 300 }, 'MONITORING_TIMING_INVALID'],
-    [{ selfCheckSeconds: 600, attentionSeconds: 300 }, 'MONITORING_TIMING_INVALID'],
+    // The ordering rule applies ONLY while both reminders are enabled.
+    [{ selfCheckSeconds: 600, attentionSeconds: 600 }, 'MONITORING_TIMING_INVALID'],
+    [{ selfCheckSeconds: 2400, attentionSeconds: 300 }, 'MONITORING_TIMING_INVALID'],
   ];
   for (const [monitoring, code] of cases) {
     assert.throws(
@@ -740,6 +809,14 @@ test('monitoring refuses out-of-range, non-integer and wrongly typed values', ()
       (error) => error instanceof ConfigError && error.code === code,
       `monitoring ${JSON.stringify(monitoring)} must be refused with ${code}`,
     );
+  }
+  // A disabled threshold can never be "too early", so these are legal rather than errors.
+  for (const monitoring of [
+    { selfCheckSeconds: 0, attentionSeconds: 0 },
+    { selfCheckSeconds: 0, attentionSeconds: 600 },
+    { selfCheckSeconds: 2400, attentionSeconds: 0 },
+  ]) {
+    assert.doesNotThrow(() => validateSettings({ ...validSettings(), monitoring }));
   }
   // A non-object block is refused rather than coerced.
   for (const monitoring of ['300', 300, [300, 600], true]) {
@@ -763,9 +840,9 @@ test('monitoring refuses an unknown key instead of ignoring it', () => {
 test('public settings, export and effective snapshots all carry monitoring', () => {
   const settings = validateSettings({
     ...validSettings(),
-    monitoring: { selfCheckSeconds: 120, attentionSeconds: 240, repeatFailureThreshold: 4 },
+    monitoring: { selfCheckSeconds: 120, attentionSeconds: 2400, repeatFailureThreshold: 4 },
   });
-  const block = { selfCheckSeconds: 120, attentionSeconds: 240, repeatFailureThreshold: 4 };
+  const block = { selfCheckSeconds: 120, attentionSeconds: 2400, repeatFailureThreshold: 4 };
   assert.deepEqual(publicSettings(settings).monitoring, block);
   assert.deepEqual(exportSettings(settings).monitoring, block);
   const effective = resolveEffectiveConfig(settings, { projectPath: null });
@@ -778,7 +855,7 @@ test('public settings, export and effective snapshots all carry monitoring', () 
 test('monitoring is global-only: no project override or per-job override can retime it', () => {
   const settings = validateSettings({
     ...validSettings(),
-    monitoring: { selfCheckSeconds: 300, attentionSeconds: 600 },
+    monitoring: { selfCheckSeconds: 600, attentionSeconds: 2400 },
     // A project override is a complete worker triple, and it deliberately has no
     // monitoring field to give: the thresholds are deployment-wide.
     projectOverrides: {
@@ -788,10 +865,11 @@ test('monitoring is global-only: no project override or per-job override can ret
     },
   });
   const effective = resolveEffectiveConfig(settings, { projectPath: 'C:\\fixtures\\repo' });
-  assert.equal(effective.worker.timeoutSeconds, 900, 'the project override applied to its own block');
-  assert.equal(effective.worker.reasoningEffort, 'low');
+  assert.equal(effective.worker.reasoningEffort, 'low', 'the project override applied to its own block');
+  assert.equal(effective.worker.timeoutSeconds, settings.worker.timeoutSeconds,
+    'and its retired timeout field did not become a run budget');
   assert.deepEqual(effective.monitoring,
-    { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: 3 },
+    { selfCheckSeconds: 600, attentionSeconds: 2400, repeatFailureThreshold: 3 },
     'and did not touch the monitoring thresholds');
   assert.throws(
     () => resolveEffectiveConfig(settings, { projectPath: null, overrides: { monitoring: { selfCheckSeconds: 60 } } }),
@@ -808,13 +886,20 @@ test('an export/import round trip preserves monitoring', async () => {
     const exported = exportSettings(await service.read());
     // The count was not named, so the documented default is what is persisted and
     // exported; an older document must not gain a value nobody chose.
-    assert.deepEqual(exported.monitoring, { selfCheckSeconds: 90, attentionSeconds: 300, repeatFailureThreshold: 3 });
+    assert.deepEqual(exported.monitoring, {
+      selfCheckSeconds: 90,
+      attentionSeconds: 300,
+      repeatFailureThreshold: 3,
+    });
 
     const other = new SettingsService(await makeTempDir());
     try {
       await other.replaceValidated(exported);
-      assert.deepEqual((await other.read()).monitoring,
-        { selfCheckSeconds: 90, attentionSeconds: 300, repeatFailureThreshold: 3 });
+      assert.deepEqual((await other.read()).monitoring, {
+        selfCheckSeconds: 90,
+        attentionSeconds: 300,
+        repeatFailureThreshold: 3,
+      });
     } finally {
       await cleanup(other.document.path.replace(/[\\/][^\\/]+$/, ''));
     }
@@ -864,6 +949,101 @@ test('setMonitoring cannot lose a concurrent settings edit', async () => {
       { selfCheckSeconds: 60, attentionSeconds: 120, repeatFailureThreshold: 3 });
     assert.equal(settings.worker.model, 'deepseek-reasoner', 'the concurrent worker edit survived');
     assert.equal(settings.monitoring.check === undefined, true);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Agent Teams default for new tasks (EXEC-1.6.1)
+//
+// One operator setting, and it decides ONE thing: whether a NEW task that states no
+// per-task choice has DSH Agent Teams on. It is not DSH's global switch. The rule that
+// matters most here is the upgrade path: an old document and a brand-new install must
+// both load as OFF, because turning every new task into a team by upgrading is exactly
+// the silent behaviour change this setting must not cause.
+// ---------------------------------------------------------------------------
+
+test('an upgraded document with no execution block loads the new-task default as OFF', () => {
+  const legacy = validSettings();
+  delete legacy.execution;
+  const settings = validateSettings(legacy);
+  assert.deepEqual(settings.execution, { agentTeamsDefault: false });
+});
+
+test('a fresh install defaults the new-task Agent Teams choice to OFF', async () => {
+  const dir = await makeTempDir();
+  try {
+    // A directory with no document at all is the first-install case.
+    const service = new SettingsService(dir);
+    const settings = await service.read();
+    assert.deepEqual(settings.execution, { agentTeamsDefault: false });
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+test('the new-task Agent Teams choice round-trips, and both values are real decisions', () => {
+  const on = validateSettings({ ...validSettings(), execution: { agentTeamsDefault: true } });
+  assert.deepEqual(on.execution, { agentTeamsDefault: true });
+  const off = validateSettings({ ...validSettings(), execution: { agentTeamsDefault: false } });
+  assert.deepEqual(off.execution, { agentTeamsDefault: false }, 'an explicit off is stored as off, not as absent');
+});
+
+test('a non-boolean or unknown execution value is refused rather than coerced', () => {
+  for (const [label, block, code] of [
+    ['string "false"', { agentTeamsDefault: 'false' }, 'EXECUTION_SETTINGS_INVALID'],
+    ['number 0', { agentTeamsDefault: 0 }, 'EXECUTION_SETTINGS_INVALID'],
+    ['null', { agentTeamsDefault: null }, 'EXECUTION_SETTINGS_INVALID'],
+    ['unknown key', { agentTeamDefault: true }, 'EXECUTION_SETTINGS_INVALID'],
+    ['non-object block', ['on'], 'EXECUTION_SETTINGS_INVALID'],
+  ]) {
+    assert.throws(
+      () => validateSettings({ ...validSettings(), execution: block }),
+      (error) => {
+        assert.ok(error instanceof ConfigError, `${label}: a ConfigError`);
+        assert.equal(error.code, code, `${label}: stable code`);
+        return true;
+      },
+      label,
+    );
+  }
+});
+
+test('the public projection and export carry the new-task Agent Teams choice', () => {
+  const settings = validateSettings({ ...validSettings(), execution: { agentTeamsDefault: true } });
+  assert.deepEqual(publicSettings(settings).execution, { agentTeamsDefault: true });
+  assert.deepEqual(exportSettings(settings).execution, { agentTeamsDefault: true });
+});
+
+test('setExecution validates before writing, persists, and does not lose a concurrent edit', async () => {
+  const dir = await makeTempDir();
+  try {
+    const service = new SettingsService(dir);
+    await service.replace(validSettings());
+
+    const before = await service.read();
+    await assert.rejects(
+      () => service.setExecution({ agentTeamsDefault: 'yes' }),
+      (error) => error.code === 'EXECUTION_SETTINGS_INVALID',
+    );
+    assert.deepEqual((await service.read()).execution, before.execution, 'a refused write changes nothing');
+
+    const committed = await service.setExecution({ agentTeamsDefault: true });
+    assert.deepEqual(committed.execution, { agentTeamsDefault: true });
+
+    // A narrow save and a worker edit queued together both survive.
+    await Promise.all([
+      service.setExecution({ agentTeamsDefault: false }),
+      service.setWorker({ providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high', timeoutSeconds: 900 }),
+    ]);
+    const settings = await service.read();
+    assert.deepEqual(settings.execution, { agentTeamsDefault: false });
+    assert.equal(settings.worker.model, 'deepseek-reasoner', 'the concurrent worker edit survived');
+
+    // A fresh service over the same directory sees it, so the choice is durable.
+    const reopened = new SettingsService(dir);
+    assert.deepEqual((await reopened.read()).execution, { agentTeamsDefault: false });
   } finally {
     await cleanup(dir);
   }

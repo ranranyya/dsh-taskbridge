@@ -285,41 +285,47 @@ test('a CR inside a line is still a control character, so a broken document is r
 // ---------------------------------------------------------------------------
 // The shipped dispatch rules must not contradict each other.
 // ---------------------------------------------------------------------------
-// The template is an operator-facing contract. These assertions pin the three decisions
-// that used to be ambiguous: agentTeams belongs to the COMMANDER per task, preflight is
-// per CHAIN (a verified continuation reuses its facts), and a review only counts once the
-// write is durable.
+// The template is an operator-facing contract. These assertions pin the decisions that
+// used to be ambiguous: agentTeams follows the USER's TaskBridge default unless the user
+// stated a choice for this dispatch, preflight is per CHAIN (a verified continuation
+// reuses its facts), and a review only counts once the write is durable.
 
 /** The instruction body of the template shipped in this repository. */
 function templateText() {
   return readFileSync(new URL('../codex/dsh-taskbridge.toml', import.meta.url), 'utf8');
 }
 
-test('the template states agentTeams as the commander\u2019s per-task decision, never the operator\u2019s', () => {
+test('the template puts the agentTeams default under USER control, with a per-task override', () => {
   const text = templateText();
-  assert.match(text, /AGENT TEAMS IS YOUR DECISION, NOT THE OPERATOR'S/u);
-  assert.match(text, /Simple single-file or strongly sequential work: turn it OFF EXPLICITLY/u);
-  assert.match(text, /Say the\n\s+reason in the dispatch text|reason in the dispatch text/u);
+  assert.match(text, /the user controls in the\s+plugin's settings page/u);
+  assert.match(text, /新任务默认开启智能体\s*协作/u, 'the setting is named as the user sees it');
+  assert.match(text, /An explicit value always wins over the/u, 'a per-task choice wins over the default');
+  assert.match(text, /OMIT the field/u, 'with no user choice, the field is omitted');
+  assert.match(text, /settings-default/u, 'the default-applied case is named');
   assert.match(text, /never overrides them/u, 'the team choice never overrides provider/model/effort');
-  assert.match(text, /never fake success|never fake success,/u, 'an older tool must not be pretended to work');
+  assert.match(text, /never fake success/u, 'an older tool must not be pretended to work');
   assert.match(text, /A continuation does not re-decide it/u);
-  assert.doesNotMatch(text, /ask the operator to (?:choose|decide) (?:the )?team/i,
-    'the operator never chooses team mode per dispatch');
+  // The retired blanket rule must not come back.
+  assert.doesNotMatch(text, /AGENT TEAMS IS YOUR DECISION, NOT THE OPERATOR'S/u);
 });
 
-// OMITTING the field is not "off": `editDraft`/`openTask`-style omission means "no new
-// decision", and the run keeps (or inherits) the Session's selection. The template once
-// said "omit the field, or send false" as if both meant off, which is wrong.
+// OMITTING the field is NOT "off": on a new task it now means "follow the user's
+// TaskBridge default", and on a follow-up it keeps the chain's mode. The template once
+// said "omit the field, or send false" as if both meant off, which is wrong; it then went
+// the other way and told the commander to send `false` by habit, which silently overrode
+// the user's default. Neither phrasing may return.
 test('the template never presents OMITTING agentTeams as equivalent to turning it off', () => {
   const text = templateText();
-  assert.match(text, /OMITTING the field\s+is NOT "off"/u);
-  assert.match(text, /makes no new decision/u);
-  assert.match(text, /turn it OFF EXPLICITLY with\s+`agentTeams: false`/u);
-  assert.match(text, /must send `false` and state which actions/u, 'a no-redelegation repository must send false');
-  assert.match(text, /omitted value on a follow-up keeps the parent's mode/u);
-  // The removed, wrong phrasing must not come back.
+  assert.match(text, /If the user stated no choice, OMIT the field and do not set it in `overrides`/u);
+  assert.match(text, /A NEW task follows the user's TaskBridge default/u);
+  assert.match(text, /An omitted value keeps the parent's mode/u);
+  assert.match(text, /Send an explicit value only for the user's choice for this dispatch/u);
+  assert.match(text, /Surface any conflict with the user's choice\s+before dispatch/u);
+  // The removed, wrong phrasings must not come back.
   assert.doesNotMatch(text, /leave it off \(omit the field, or\s+send `false`\)/u);
   assert.doesNotMatch(text, /omit the field[^.]*is the default|that is the default[^.]*omit/u);
+  assert.doesNotMatch(text, /turn it OFF EXPLICITLY with[\s\S]{0,40}`agentTeams: false`/u,
+    'the old blanket "send false by default" instruction is gone');
 });
 
 test('rule 4b defers preflight to 2a instead of demanding it every round', () => {

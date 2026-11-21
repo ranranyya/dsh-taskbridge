@@ -125,6 +125,11 @@ export class PlanStore {
     return filtered.map((node) => structuredClone(node));
   }
 
+  // Let cleanup validate relationships while queued plan mutations are held.
+  async withStableNodes(action) {
+    return await this.enqueue(async () => action(await this.load()));
+  }
+
   async get(nodeId, connectionId) {
     if (typeof nodeId !== 'string' || nodeId.trim() === '') return null;
     if (typeof connectionId !== 'string' || connectionId.trim() === '') return null;

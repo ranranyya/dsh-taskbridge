@@ -137,6 +137,30 @@ rule applied synchronously to a live record, and placement calls it as a re-chec
 of a chain admission already proved — including the exact execution directory, so
 placement never resumes a thread whose Workspace id merely looks familiar.
 
+## TaskBridge in the DSH Workspace Tree
+
+The DSH workspace region stays visible alongside the TaskBridge task records entry. The
+ordinary workspaces, native menus (remove workspace, archive/unarchive
+session), and per-workspace actions are provided by DSH.
+
+Instead, the plugin registers the managed worktrees directory
+(`<data>/dsh-delegate/worktrees`) as a Workspace named TaskBridge. Registration happens
+at every activation, and a fresh install creates that directory inside the plugin's own
+data directory, so the group exists before the first isolated run. Choose **Workspace
+Tree** (按工作区树) in DSH's own **视图选项** (View Options → grouping): DSH nests every
+registered Workspace whose directory is below that root, which is where each isolated
+task's checkout and Workspace already live.
+
+New worktree runs get their own checkout and workspace. Explicit continuations keep
+using the original checkout and session.
+
+A shared run stays in the authorized source directory. Older workspaces outside
+the root stay at their recorded folders and their runs are listed in TaskBridge's
+task records. The grouping does not move files or change the directory associated
+with a workspace or session. An existing root Workspace keeps the name selected in
+DSH, and a host without the Workspace controller keeps the plugin loadable — only the
+grouping is unavailable.
+
 ## The admission gate, in order
 
 A `continueFromTaskId` submission is decided by one pass in `admit()`, before
@@ -332,10 +356,4 @@ label or fuzzy matching anywhere in this path.
 
 A resolved Agent belongs to its Session, so the runner never disposes one:
 disposal would end the conversation and make a later `continueFromTaskId`
-follow-up unable to resolve it. Only the unplaced path (`allowUnplaced`, used by
-the additional review) creates an Agent through `agents.create`, and only that
-Agent is disposed.
-
-The review sets `allowUnplaced: true` deliberately: it must not join the
-operator's Workspace history, it is not part of the worker thread, and it is not
-resumable by a later continuation.
+follow-up unable to resolve it. The runner disposes only Agents it creates itself.

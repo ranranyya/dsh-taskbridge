@@ -260,10 +260,100 @@ test('a failed write is reported and a later save recovers', async () => {
   }
 });
 
-test('a malformed document is refused and never overwritten, even by a later save', async () => {
+test('deleteMany removes one batch, keeps the memory view honest and survives a reload', async () => {
   const dir = await dataDir();
   try {
-    const raw = await writeDocument(dir, '{"schemaVersion":1,"jobs":[{"taskId":');
+    const store = new HistoryStore(dir);
+    await store.save(fixtureView({ taskId: 'task-one' }));
+    await store.save(fixtureView({ taskId: 'task-two', createdAt: 1_700_000_100_000 }));
+    await store.save(fixtureView({ taskId: 'task-three', createdAt: 1_700_000_200_000, state: 'failed' }));
+
+    const outcome = await store.deleteMany(['task-one', 'task-three']);
+    assert.deepEqual(outcome.deletedTaskIds, ['task-one', 'task-three']);
+    assert.equal(outcome.remaining, 1);
+    // The in-memory view is replaced only by what the write confirmed.
+    assert.deepEqual((await store.load()).map((job) => job.taskId), ['task-two']);
+
+    // …and the document itself lost exactly those records.
+    const document = JSON.parse(await readFile(historyFile(dir), 'utf8'));
+    assert.equal(document.schemaVersion, 1);
+    assert.deepEqual(document.jobs.map((job) => job.taskId), ['task-two']);
+    assert.deepEqual(await readdir(dir), ['history.json'], 'no temp file is left behind');
+    await store.dispose();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('deleteMany refuses a batch whole: a live, missing, repeated or malformed id writes nothing', async () => {
+  const dir = await dataDir();
+  try {
+    const store = new HistoryStore(dir);
+    await store.save(fixtureView({ taskId: 'task-done' }));
+    await store.save(fixtureView({ taskId: 'task-live', state: 'running', phase: 'execute', startedAt: 1_700_000_005_000, endedAt: null }));
+    const before = await readFile(historyFile(dir), 'utf8');
+
+    const live = await rejectsWith(store.deleteMany(['task-done', 'task-live']), HISTORY_CODES.deleteInvalid);
+    assert.deepEqual(live.details.live, ['task-live']);
+    assert.deepEqual(live.details.missing, []);
+    const missing = await rejectsWith(store.deleteMany(['task-done', 'task-ghost']), HISTORY_CODES.deleteInvalid);
+    assert.deepEqual(missing.details.missing, ['task-ghost']);
+    const repeated = await rejectsWith(store.deleteMany(['task-done', 'task-done']), HISTORY_CODES.deleteInvalid);
+    assert.equal(repeated.details.taskId, 'task-done');
+    for (const bad of [undefined, null, 'task-done', [], [7], [''], [{ taskId: 'task-done' }]]) {
+      await rejectsWith(store.deleteMany(bad), HISTORY_CODES.deleteInvalid);
+    }
+    const oversized = Array.from({ length: 501 }, (_, index) => `task-${index}`);
+    await rejectsWith(store.deleteMany(oversized), HISTORY_CODES.deleteInvalid);
+
+    assert.equal(await readFile(historyFile(dir), 'utf8'), before, 'a refused batch must not write one byte');
+    assert.deepEqual((await store.load()).map((job) => job.taskId).sort(), ['task-done', 'task-live']);
+    await store.dispose();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed delete write keeps the old records visible and a later delete succeeds', async () => {
+  const dir = await dataDir();
+  try {
+    let failDelete = false;
+    const failingFs = {
+      ...nodeFs,
+      writeFile: async (path, ...rest) => {
+        // Only the DELETE's temp file fails; the seed save writes normally, so the
+        // case under test is exactly "the removal could not be written".
+        if (String(path).endsWith('.tmp') && failDelete) {
+          failDelete = false;
+          const error = new Error('injected write failure');
+          error.code = 'EIO';
+          throw error;
+        }
+        return await nodeFs.writeFile(path, ...rest);
+      },
+    };
+    const store = new HistoryStore(dir, { fs: failingFs });
+    await store.save(fixtureView({ taskId: 'task-keep' }));
+    failDelete = true;
+    const error = await rejectsWith(store.deleteMany(['task-keep']), HISTORY_CODES.writeFailed);
+    assert.equal(error.details.cause, 'EIO');
+    // The record is NOT removed from the cached view, so it stays listed and queryable.
+    assert.deepEqual((await store.load()).map((job) => job.taskId), ['task-keep']);
+    assert.deepEqual(JSON.parse(await readFile(historyFile(dir), 'utf8')).jobs.map((job) => job.taskId), ['task-keep']);
+
+    // The failure is not cached: the same removal works once the filesystem does.
+    const outcome = await store.deleteMany(['task-keep']);
+    assert.deepEqual(outcome.deletedTaskIds, ['task-keep']);
+    assert.deepEqual(await store.load(), []);
+    await store.dispose();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a malformed document is refused and never overwritten, even by a later save', async () => {
+  const dir = await dataDir();
+  try {    const raw = await writeDocument(dir, '{"schemaVersion":1,"jobs":[{"taskId":');
     const store = new HistoryStore(dir);
     await rejectsWith(store.load(), HISTORY_CODES.malformed);
     await rejectsWith(store.load(), HISTORY_CODES.malformed);
@@ -1289,6 +1379,33 @@ test('identifying fields survive an entry fitted to its smallest budget', async 
     const [row] = await new HistoryStore(dir, limits).load();
     assert.equal(row.title, title);
     assert.equal(row.continueFromTaskId, 'task-parent-fit');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('restoring a legacy model review preserves the separate host conclusion', async () => {
+  const dir = await dataDir();
+  try {
+    const history = new HistoryStore(dir);
+    const legacy = fixtureView({
+      review: {
+        state: 'completed',
+        verdict: { verdict: 'changes-requested', reason: 'Historical model suggestion' },
+        text: 'Historical model findings',
+      },
+      hostAcceptance: {
+        state: 'accepted', accepted: true, note: 'Verified by the host',
+        completionSummary: 'Host summary', by: 'host', acceptedAt: 1_700_000_000_500,
+      },
+    });
+    await history.save(legacy);
+    const [restored] = await new HistoryStore(dir).load();
+    assert.equal(restored.review.text, 'Historical model findings');
+    assert.equal(restored.review.verdict.verdict, 'changes-requested');
+    assert.equal(restored.hostAcceptance.state, 'accepted');
+    assert.equal(restored.hostAcceptance.note, 'Verified by the host');
+    assert.equal(restored.hostAcceptance.completionSummary, 'Host summary');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

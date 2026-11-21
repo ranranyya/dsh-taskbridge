@@ -21,15 +21,14 @@ Worker self-tests and Crew completion are delivery evidence, not acceptance.
   fallthrough to official defaults. Running tasks retain their config snapshot.
 - Lifecycle: normal completion, model error, timeout, pending agent creation,
   cancellation and simultaneous jobs all release handles and workspace locks.
-- Review: when disabled, no reviewer agent/request. When enabled, separate
-  provider/model/effort and actually read-only tools/workspace; findings returned
-  without self-acceptance or automatic repair. Review errors stay distinct.
+- Review: the host can record its conclusion, and old task records still display
+  both the host's decision and any historical model findings.
 - Changes: real changed file/diff and actual check evidence visible. A job reports
   awaiting host review after successful execution, never host-approved by itself.
 - Secrets: masked config and exports, no secrets in MCP/history/errors or package.
 - UI: settings section actually mounts in a DSH web profile, all four areas and
   authorization operate, draft/error/loading feedback works. Verify new providers
-  and manual model IDs, effort capabilities, review toggle and task details.
+  and manual model IDs, effort capabilities and task details.
 - Package: install .tgz in an isolated DSH_HOME using supported CLI, launch on an
   unused port, confirm native plugin/client registration and fresh off state,
   connect the MCP adapter, exercise authorization and cancel, uninstall cleanly.

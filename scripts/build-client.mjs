@@ -187,6 +187,13 @@ function buildBundleText(binary) {
       // The readable source ships alongside the optimized bundle. Keep names in stack traces.
       '--minify',
       '--keep-names',
+      // The client bundle runs in a browser, where `process` does not exist. The one place
+      // that needs the HOST PLATFORM (the path canonicaliser, which must fold case on
+      // Windows exactly as `sessionPathKey` does) reads `globalThis.__…__`, and this define
+      // substitutes it. The identifier is a NAMESPACED MEMBER EXPRESSION on purpose: a bare
+      // identifier would be shadowed by the module's own (minified) local binding, and the
+      // substitution would silently miss — which is exactly the bug it exists to avoid.
+      `--define:globalThis.__DSH_TASKBRIDGE_CLIENT_PLATFORM__=${JSON.stringify(process.platform === 'win32' ? 'win32' : 'posix')}`,
       ...PLATFORM_EXTERNALS.map((spec) => `--external:${spec}`),
       `--outfile=${raw}`,
     ];

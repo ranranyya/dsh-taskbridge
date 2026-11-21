@@ -41,7 +41,7 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
  * so asserting itself would pass for any value. `1.5.0` adds question handling and combined waits.
  */
-const DELIVERABLE_VERSION = '1.6.0';
+const DELIVERABLE_VERSION = '1.7.0';
 
 /**
  * The published build this release upgrades *from*.
@@ -50,7 +50,7 @@ const DELIVERABLE_VERSION = '1.6.0';
  * current version must be strictly newer than this baseline,
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.5.4';
+const PREVIOUS_VERSION = '1.6.0';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -66,7 +66,7 @@ const HISTORICAL_VERSION_PATHS = new Set([
  * A published build may only be named next to a historical-contract document when its
  * bytes are still recognized by the migrator; otherwise the mention is a stale label.
  */
-const MIGRATABLE_AGENT_VERSIONS = ['0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12', '0.1.13', '0.1.14', '1.0.0', '1.1.0', '1.2.0', '1.3.0'];
+const MIGRATABLE_AGENT_VERSIONS = ['0.1.6', '0.1.7', '0.1.8', '0.1.9', '0.1.10', '0.1.11', '0.1.12', '0.1.13', '0.1.14', '1.0.0', '1.1.0', '1.2.0', '1.3.0', '1.6.0', '1.6.1-test.3'];
 /** A semver value: `MAJOR.MINOR.PATCH` with an optional prerelease suffix. */
 const SEMVER = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/u;
 
@@ -365,7 +365,7 @@ test('the stdio MCP executable is declared as a bin and points at a real script'
   assert.match(codexAgent, /is NOT a dispatch request/u);
   assert.match(codexAgent, /delegate_status/u);
   assert.match(codexAgent, /For a `shared` decision, pass only\s+`overrides = \{ isolation = "shared" \}`/u);
-  assert.match(codexAgent, /Never\s+override the configured provider, model, reasoning effort or timeout/u);
+  assert.match(codexAgent, /Never\s+override the configured provider, model or reasoning effort/u);
   assert.match(codexAgent, /configured isolation and matching project\s+override apply/u);
   assert.match(codexAgent, /configured isolation and matching project\s+override apply/u);
   assert.match(codexAgent, /actual provider\/model\/effort from the\s+result/u);
@@ -415,43 +415,6 @@ test('host-provided DSH peers have no version whitelist', () => {
   assert.equal(peers['@earendil-works/pi-ai'], '^0.87.1 || ^1.1.0');
 });
 
-test('the review composition native tool packages are declared, not assumed', () => {
-  // `src/review/preset.js` builds the dedicated read-only review preset from two
-  // native rows and loads them with a dynamic `import()` of these exact
-  // specifiers (`REVIEW_PACKAGES`). A plugin may not import a package it does not
-  // declare: an undeclared import resolves here only because a linked host tree
-  // happens to sit beside this one, and fails for a consumer installed from a
-  // tarball. So both names are peers (the host provides them) AND devDependencies
-  // (this repository pins them), exactly like the other native packages.
-  const REVIEW_PACKAGES = ['@deepseek-ai/dsh-tool-fs', '@deepseek-ai/dsh-tool-fs-search'];
-  const preset = readFileSync(join(ROOT, 'src', 'review', 'preset.js'), 'utf8');
-
-  for (const name of REVIEW_PACKAGES) {
-    // The module really imports what is declared, and it is declared as a peer
-    // without a DSH version whitelist (same rule as the row above).
-    assert.ok(preset.includes(`'${name}'`) || preset.includes(`"${name}"`), `${name} must be the specifier preset.js loads`);
-    assert.equal(
-      MANIFEST.peerDependencies[name],
-      '*',
-      `${name} must be a host-provided peer without a version whitelist`,
-    );
-    // Host-supplied as a service, so it must never also be a hard dependency.
-    assert.ok(!(name in MANIFEST.dependencies), `${name} must not be a runtime dependency`);
-  }
-
-  // The peer surface must name both rows and nothing speculative: every
-  // @deepseek-ai/dsh-* peer is either a runtime package this package imports
-  // directly or one of the two review rows.
-  const declaredNative = Object.keys(MANIFEST.peerDependencies).filter((name) => name.startsWith('@deepseek-ai/dsh'));
-  assert.deepEqual(declaredNative.sort(), [
-    '@deepseek-ai/dsh-agent',
-    '@deepseek-ai/dsh-llm',
-    '@deepseek-ai/dsh-llm-pi-ai',
-    '@deepseek-ai/dsh-tool-fs',
-    '@deepseek-ai/dsh-tool-fs-search',
-  ]);
-});
-
 test('devDependencies pin the development runtime, not the widened peer range', () => {
   // Peers advertise what the host may provide; devDependencies are what this
   // repository itself installs and tests against. The suite therefore keeps the
@@ -460,8 +423,6 @@ test('devDependencies pin the development runtime, not the widened peer range', 
     '@deepseek-ai/dsh-agent',
     '@deepseek-ai/dsh-llm',
     '@deepseek-ai/dsh-llm-pi-ai',
-    '@deepseek-ai/dsh-tool-fs',
-    '@deepseek-ai/dsh-tool-fs-search',
   ]) {
     assert.equal(MANIFEST.devDependencies[name], '0.2.0-rc.2', `${name} must stay pinned to the development runtime`);
     assert.ok(name in MANIFEST.peerDependencies, `${name} must remain a peer`);
@@ -789,28 +750,43 @@ test('every allowlist literal names a real file, so the manifest cannot drift', 
 test('the packed size stays bounded and contains no single-file outlier', () => {
   let total = 0;
   for (const path of PACKED) total += statSync(join(ROOT, path)).size;
-  // The archive is source plus one built bundle; a sudden multi-megabyte entry
-  // means a bundle, a lockfile or a fixture slipped in. The bound tracks the real
-  // contents (the generated `lib/client.js` dominates it) rather than a round number,
-  // so a NEW multi-hundred-kilobyte file still fails loudly.
-  //
-  // Raised from 2,760,000 for ONE reason: `src/codex/installer.js` grew (178,274 bytes now)
-  // while adding root-link (junction) pinning for the selected Codex home — real product
-  // code that ships. The bound tracks PACKED (manifest-derived) files only; test fixtures
-  // under `tests/` are never packed (`/^tests\//u` is an EXCLUDED_PATTERN), so the new
-  // `tests/fixtures/agent-1.5.1-test.1.toml` (40,266 bytes) contributes nothing here.
-  // The next largest packed entries are `src/jobs/engine.js` (247,676) and
-  // `lib/client.js` (193,866), both unchanged by this work. The bound still fails on
-  // anything that could hide a bundle, a lockfile or a fixture, which is what it exists for.
-  // 1.5.2 adds full bilingual product guides and two small workflow PNGs (about
-  // 100 KB combined growth). Keep a bounded allowance for those shipped docs;
-  // the single-file outlier and archive-exclusion checks still apply below.
-  assert.ok(total < 3_120_000, `unpacked size grew unexpectedly: ${total} bytes`);
-  // 1.6.0 adds the durable planning store (`src/jobs/plan-store.js`), deterministic
-  // tree projection (`src/jobs/task-tree.js`) and the `delegate_plan` MCP surface.
+  // Includes the task record services and the browser bundle with TanStack Table.
+  const TASK_RECORDS_GROWTH_BYTES = 160_000;
+  // The monitoring work (ONE no-progress clock, the progress-check receipt and the
+  // retired execution timeout) is a documented, bounded increment: rules, comments and
+  // tests, never a dependency. It is a fixed budget, not a growing allowance — a further
+  // feature must state its own increment explicitly.
+  const MONITORING_GROWTH_BYTES = 80_000;
+  // The user-controlled Agent Teams default (EXEC-1.6.1): one settings block, the freeze
+  // rule in admission, the origin field on records, the narrow operator route and the
+  // settings card. Rules, comments and tests only — no dependency. Like the budget above,
+  // this is a fixed increment a further feature must not borrow from.
+  const AGENT_TEAMS_DEFAULT_GROWTH_BYTES = 16_000;
+  // The two follow-up corrections the host required: the new-task default no longer fills
+  // a continuation's absent choice (so its Session keeps its own mode), and a run whose
+  // choice cannot be applied is REFUSED unless it is the implicit off default — plus the
+  // strict `isEnabled` read-back. Comments, a strict boolean, and the refusal matrix.
+  const AGENT_TEAMS_CHOICE_FIDELITY_BYTES = 4_000;
+  // Concurrent isolated runs of one source: the preparation queue and its turn, the
+  // two lease modes in the lock registry, the explicit-release lease, and the parallel
+  // concurrency tests. Rules, comments, tests and one settings hint — no dependency.
+  // Like the budgets above, this is a fixed increment a further feature must not borrow
+  // from.
+  const CONCURRENT_ISOLATION_GROWTH_BYTES = 32_000;
+  // The grouped Workspaces browser (sidebar.workspaces): one registration, one pure view
+  // model, the identity route and its view field list, and the client tests that drive them.
+  // Rules, comments and tests only — no dependency, no host package. Like the budgets above,
+  // this is a fixed increment a further feature must not borrow from.
+  // (Strict three levels added the project target picker, the record merge and its tests.)
+  const GROUPED_WORKSPACES_GROWTH_BYTES = 64_000;
+  const growth = TASK_RECORDS_GROWTH_BYTES + MONITORING_GROWTH_BYTES
+    + AGENT_TEAMS_DEFAULT_GROWTH_BYTES + AGENT_TEAMS_CHOICE_FIDELITY_BYTES
+    + CONCURRENT_ISOLATION_GROWTH_BYTES + GROUPED_WORKSPACES_GROWTH_BYTES;
+  assert.ok(total < 3_120_000 + growth, `unpacked size grew unexpectedly: ${total} bytes`);
   const RELEASE_BUDGET_BYTES = 3_080_000;
-  assert.ok(total <= RELEASE_BUDGET_BYTES,
-    `the archive must fit the 1.6.0 release budget of ${RELEASE_BUDGET_BYTES} bytes, saw ${total}`);
+  const budget = RELEASE_BUDGET_BYTES + growth;
+  assert.ok(total <= RELEASE_BUDGET_BYTES + growth,
+    `the archive with task record tools must fit ${budget} bytes, saw ${total}`);
   const largest = PACKED.map((path) => ({ path, size: statSync(join(ROOT, path)).size }))
     .sort((left, right) => right.size - left.size)[0];
   assert.ok(largest.size < 500_000, `unexpectedly large packed file: ${largest.path}`);

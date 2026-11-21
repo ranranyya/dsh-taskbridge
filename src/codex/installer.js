@@ -89,6 +89,7 @@ import { basename, delimiter, dirname, isAbsolute, join, parse, resolve, sep } f
 import { fileURLToPath } from 'node:url';
 
 import { writeFileAtomic } from '../config/store.js';
+import { recallTemplateDigest, rememberTemplateDigest, digestLf } from './agent-ownership.js';
 import {
   TomlDocument,
   TomlSyntaxError,
@@ -474,6 +475,47 @@ export const KNOWN_AGENT_TEMPLATES = [
   // Exact 1.5.4 template (CRLF/LF), preserved in tests/fixtures/agent-1.5.4.toml.
   { version: '1.5.4', sha256: '94ee47a0bfc16a36c76010d1e1a2476ff6117966f5c1559b01193353199f82e8' },
   { version: '1.5.4', sha256: '8efbe5d627f72b34fb66decd7784552b5eafb0289c409bb6443ae28094351aae' },
+  // Exact templates from the 1.6.0 and 1.6.1-test.1 packages, before the outage rules.
+  { version: '1.6.0', sha256: '5802a655a88f8c526f662615889969899e86c326ef66cf40c70b5cf2fb30e3e9' },
+  { version: '1.6.0', sha256: '56b887cd609467c2e82f8f036d25376acc13d5df54c5eec3b30d40c7dd7e5c87' },
+  { version: '1.6.0', sha256: '746ab52edbc28ecc19e287f60b6502ddbd2dd3fbb8b7ae60b51f4b4a5b96a6c9' },
+  { version: '1.6.0', sha256: '43b1b61157fab8a7fe74db70ee3686f1fc4eb3ec7d11c70d6b521af33bbade67' },
+  // Companion written by the installed test.3 package (LF and CRLF).
+  { version: '1.6.1-test.3', sha256: 'fdd88a4461864d612998f1cc13802a45bbc2aa04b19629b0e8bc0e75c0b9bfad' },
+  { version: '1.6.1-test.3', sha256: '4681ee17f741a56fbb9662aa5105863ab08badf8be7d7196c4268b816fc6fe94' },
+  // The published 1.6.1 companion and the local 1.6.1-test.5 prerelease that
+  // replaced it on this machine. Both are the SAME instruction body: `codex/dsh-taskbridge.toml`
+  // in the 1.6.1 sources, whose digest is unchanged by this work package. They differ
+  // only in the stamped `version` line that {@link renderAgentFile} writes, so each is a
+  // distinct exact identity that has to be enumerated on its own:
+  //
+  //   * `efdef5f6…` — `1.6.1` as an all-LF file (the form an LF checkout installs).
+  //   * `5da9fd5e…` — the same template, CRLF throughout (the repository's own spelling).
+  //   * `bf698c86…` — the packed `1.6.1-test.5` agent, i.e. this body stamped `1.6.1-test.5`
+  //     and written by this renderer (LF, the form the installer writes).
+  //   * `a45e12d0…` — that same test.5 file with CRLF terminators.
+  //
+  // Without them an untouched 1.6.1 or test.5 installation hashes to "unknown content"
+  // and is reported `modified`, i.e. "somebody else's file", which is the false conflict
+  // this work package removes. Every one is an exact identity: a single edited character
+  // — including an edited version line — hashes differently and stays the operator's.
+  { version: '1.6.1', sha256: 'efdef5f6e6ebcb26590ca929e674391b3c4fcdb3c017714d2322615783fdf712' },
+  { version: '1.6.1', sha256: '5da9fd5eb5a89fd3c76365faca78b51e34233d993605f1b55dff4b07ceb88b80' },
+  { version: '1.6.1-test.5', sha256: 'bf698c861e7e560c555f8350b711db88627dce4a8752b2cbebe8748b6d640d37' },
+  { version: '1.6.1-test.5', sha256: 'a45e12d0b234e80854e69429518a2def2d00338f968c2ecfc689307b792e4426' },
+  // The local `1.6.1-test.6` build. Its agent identity was verified from the release the
+  // operator actually installed: `dsh-taskbridge-1.6.1-test.6.tgz` (SHA-256 `71bfd28d…`)
+  // holds `package/codex/dsh-taskbridge.toml`, whose LF form hashes to the 1.6.1 body above
+  // and which that build stamped `version = "1.6.1-test.6"` and wrote with LF. Those exact
+  // bytes (`f4650d62…`) are preserved as `tests/fixtures/agent-1.6.1-test.6.toml`, and the
+  // digest was cross-checked against the installed file.
+  //
+  // Without this entry an untouched test.6 installation that has no installation record is
+  // reported `modified` — "somebody else's file" — so the install button can never refresh
+  // a file this plugin really published. Only these exact bytes qualify: a single edited
+  // character, an added line, or another body carrying the same version line hashes
+  // differently and stays the operator's file.
+  { version: '1.6.1-test.6', sha256: 'f4650d6250b4133f6693f11c8288e973b433bbfab02e76ebba0eda989594d7b8' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */
@@ -608,6 +650,17 @@ const PACKAGE_MANIFEST_PATH = join(PACKAGE_ROOT, 'package.json');
 
 /** Bound on a Codex config document this module is willing to edit. */
 const MAX_CONFIG_BYTES = 1024 * 1024;
+
+/**
+ * The non-enumerable key carrying a status read's environment to the installer's write paths.
+ *
+ * It is a SYMBOL, not a property name: `JSON.stringify`, object spread, `{...status}` and any
+ * transport copy of the document drop it, so `DSH_HOME` — and anything else in the host
+ * environment — can never travel in a status response. Only the installer's own write path
+ * reads it, and only to locate the plugin data directory.
+ * @type {symbol}
+ */
+const INTERNAL_ENV = Symbol('dsh-delegate.codex.status.env');
 
 /**
  * Refusal raised by the installer. Carries a stable code so the settings page can
@@ -1225,14 +1278,25 @@ async function runPowershell(script, env) {
 
 /**
  * Read a link's target for the diagnosis, never to follow it.
+ *
+ * A Windows junction cannot be read back as a path with `readlink`: Node reports it as a
+ * plain directory and answers `EINVAL` for both the text and the raw-bytes form (its
+ * substitute is a Win32 path behind a reparse header). The caller has already PROVED the
+ * entry is a reparse point from its attributes, so the diagnosis still has to be produced;
+ * `realpath` is the only portable way to name what it points at. It is used for the
+ * DIAGNOSIS ONLY — nothing below an unproven link is read or written.
  * @param {string} path - link path.
- * @returns {Promise<string | undefined>} target text when the platform reports one.
+ * @returns {Promise<string | undefined>} target when the platform reports one.
  */
 async function readLinkTarget(path) {
   try {
     return await readlink(path);
   } catch {
-    return undefined;
+    try {
+      return await realpath(path);
+    } catch {
+      return undefined;
+    }
   }
 }
 
@@ -1251,23 +1315,83 @@ async function readLinkTarget(path) {
  * from it) is what the write and delete paths re-prove against, so a file rewritten
  * between the read and the write is still detected even though this classification is
  * line-ending tolerant.
+ *
+ * A file whose LF-normalized digest equals the template digest this plugin recorded for THIS
+ * Codex home is `outdated` too — that is how a release whose byte form was never enumerated on
+ * its own still upgrades itself instead of flipping to "somebody else's file" (see
+ * `agent-ownership.js`). One changed character changes the digest, so an edited file still
+ * falls through to the rule below.
  * @param {string} path - agent file path.
  * @param {string} template - template text this build would write.
- * @returns {Promise<{ state: string, present: boolean, reason: string | null, contents: string | null }>} agent state and the exact bytes it was derived from.
+ * @param {string | null} [recordedDigest] - the LF digest this plugin recorded for this home.
+ * @returns {Promise<{ state: string, present: boolean, reason: string | null, contents: string | null, recorded?: boolean }>} agent state and the exact bytes it was derived from.
  */
-async function readAgentState(path, template) {
+async function readAgentState(path, template, recordedDigest = null) {
   const existing = await inspectFile(path);
   if (existing.kind === 'missing') return { state: AGENT_STATES.missing, present: false, reason: null, contents: null };
   if (existing.kind === 'other') return { state: AGENT_STATES.conflict, present: true, reason: 'not-a-regular-file', contents: null };
   const contents = existing.contents;
   if (sameAgentText(contents, template)) return { state: AGENT_STATES.installed, present: true, reason: null, contents };
   if (isKnownPriorTemplate(contents)) return { state: AGENT_STATES.outdated, present: true, reason: null, contents };
+  if (typeof recordedDigest === 'string' && recordedDigest !== '' && digestLf(contents) === recordedDigest) {
+    return { state: AGENT_STATES.outdated, present: true, reason: null, contents, recorded: true };
+  }
   return {
     state: AGENT_STATES.modified,
     present: true,
     reason: isKnownPriorTemplate(contents, { ignoreVersion: true }) ? 'edited' : 'unknown-content',
     contents,
   };
+}
+
+/**
+ * The template digest this plugin last proved it wrote into one Codex home, or null.
+ *
+ * Read-only and failure-tolerant by design: an unusable data directory, a link on the way, a
+ * damaged record — and every other error — is simply "no record", so it can never change how a
+ * file is classified. Nothing is created and nothing is written here.
+ * @param {string} home - the REAL, pinned Codex home.
+ * @param {Record<string, string | undefined>} env - environment (for `DSH_HOME`).
+ * @returns {Promise<string | null>} LF digest, or null.
+ */
+async function recallRecordedTemplate(home, env) {
+  if (typeof home !== 'string' || home.trim() === '' || !isAbsolute(home)) return null;
+  try {
+    return await recallTemplateDigest({ codexHome: home, env, classify: (path) => inspectDirectory(path).then((info) => info.kind) });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Record the template digest after a write this action just made, proved against the file.
+ *
+ * Called only from `install` and from the startup `refreshKnownAgentTemplate`, and only after the
+ * write reported success: it re-reads the agent file, requires it to be exactly the rendered
+ * template, and records the digest of THOSE bytes. `repair`, `remove` and `status` never reach
+ * this. A failed record is a lost proof for the next release, never a failed install.
+ * @param {object} before - the status the write was planned from.
+ * @returns {Promise<void>} resolves after the attempt.
+ */
+async function recordAgentTemplate(before) {
+  const env = before[INTERNAL_ENV];
+  if (env === undefined) return;
+  try {
+    await rememberTemplateDigest({
+      codexHome: before.codexHome,
+      env,
+      template: renderAgentFile(await readAgentTemplate(), before.packageVersion),
+      agentPath: before.agent.path,
+      readFile: async (path) => (await inspectFile(path)).contents,
+      writeFileAtomic,
+      mkdir,
+      classify: (path) => inspectDirectory(path).then((info) => info.kind),
+    });
+  } catch {
+    // A proof that cannot be recorded must never fail the install that produced it, and a
+    // refused record (a linked ancestor, a damaged file) is no record: the agent file stays
+    // classified by its own content.
+  }
 }
 
 /**
@@ -1544,8 +1668,30 @@ export function classifyMcpEntry(document, desired) {
   const previous = { command, args, envKeys, toolTimeoutSec: null, discoveryFile: null };
   if (marker === null) {
     // Values that happen to match are still not proof the plugin wrote them; the
-    // marker is the only authorship proof this format carries.
-    return { state: MCP_STATES.conflict, previous, reason: 'unmanaged-entry', ownedValues: {}, marked: false, drift: null };
+    // marker is the only authorship proof this format carries. The state is therefore
+    // always `conflict`: a status read, plugin startup and `remove` never adopt it.
+    //
+    // The reason distinguishes ONE case: values that are already exactly what this build
+    // writes (`unmanaged-entry-exact`) — the configuration the settings page shows, the
+    // screenshot case, entered by hand without the marker comment. Only the MCP-only
+    // repair may complete that one, by ADDING the marker and nothing else
+    // ({@link emplaceMcpMarker}); any other difference keeps the plain refusal.
+    //
+    // "Already exactly ours" also requires the definition to be ONE unambiguous table: the
+    // parser keeps every entry, so a duplicated key, an inline table plus a header, an extra
+    // sub-table or an unknown field would otherwise be merged into this object and the LAST
+    // value would silently win. Such a document is somebody else's and keeps the plain
+    // refusal, so a marker can never be attached to a shape this plugin did not write.
+    const exact = isUnambiguousOwnedDefinition(document, serverPath)
+      && markerlessEntryMatchesOwnedShape(values, desired);
+    return {
+      state: MCP_STATES.conflict,
+      previous,
+      reason: exact ? UNMANAGED_EXACT_REASON : 'unmanaged-entry',
+      ownedValues: {},
+      marked: false,
+      drift: null,
+    };
   }
   // A different *command* is a different program: even if the arguments look like
   // ours, running (or replacing) someone else's wrapper is not this plugin's call.
@@ -1694,9 +1840,12 @@ export async function isOwnedStaleEntry(classification, desired, options = {}) {
   // The script proof is a FILESYSTEM proof and runs here, at gate time, so a label
   // computed earlier cannot stand in for it.
   if (isExactInstalledScript(args[0], desired.args[0])) {
-    return classification.state === MCP_STATES.outdated
-      ? { owned: true }
-      : { owned: false, reason: `state-${classification.state}` };
+    // A proven managed entry is writable when it is `outdated` (a stale owned fact), or when
+    // it is the `unmanaged-entry-exact` definition {@link emplaceMcpMarker} has just
+    // re-proved — the MCP-only repair completing it with the marker line alone.
+    const writable = classification.state === MCP_STATES.outdated
+      || (classification.state === MCP_STATES.conflict && classification.reason === UNMANAGED_EXACT_REASON);
+    return writable ? { owned: true } : { owned: false, reason: `state-${classification.state}` };
   }
   if (options.allowMovedInstall !== true) return { owned: false, reason: 'script-not-provably-ours' };
   if (!(await isOtherInstallationOfThisPackage(args[0], PACKAGE_NAME))) {
@@ -1705,6 +1854,104 @@ export async function isOwnedStaleEntry(classification, desired, options = {}) {
   return classification.state === MCP_STATES.outdated || classification.state === MCP_STATES.conflict
     ? { owned: true }
     : { owned: false, reason: `state-${classification.state}` };
+}
+
+/**
+ * Stable `reason` value for an unmarked definition whose owned facts are ALREADY exactly
+ * this build's (the entry shown on the settings page, entered without its marker).
+ * @type {string}
+ */
+export const UNMANAGED_EXACT_REASON = 'unmanaged-entry-exact';
+
+/**
+ * Is an UNMARKED definition already EXACTLY the entry this build would write?
+ *
+ * Strict by construction, and the only question {@link classifyMcpEntry} asks about an
+ * unmarked entry beyond "is it somebody else's", because it decides whether a marker could
+ * be added WITHOUT changing any owned value:
+ *
+ *   * `command` equals the resolved Node executable;
+ *   * `args` is exactly ONE element, this installation's entry script;
+ *   * `tool_timeout_sec` is present and is the owned integer;
+ *   * the `env` map is exactly the owned one — every expected key with its value and no
+ *     additional key (an `env` key this plugin did not write is the operator's data).
+ *
+ * A missing field is a difference, not a default. Nothing here writes or inspects the
+ * filesystem; the filesystem proof belongs to the write gate.
+ * @param {Record<string, { type: string, text: string }>} values - assignments under the definition.
+ * @param {object} desired - value from {@link desiredMcpCommand}.
+ * @returns {boolean} true only when every owned fact already matches exactly.
+ */
+function markerlessEntryMatchesOwnedShape(values, desired) {
+  if (typeof desired?.command !== 'string' || !Array.isArray(desired?.args)) return false;
+  if (readStringValue(values.command?.text) !== desired.command) return false;
+  const args = readArrayValue(values.args?.text);
+  if (args.length !== 1 || desired.args.length !== 1 || args[0] !== desired.args[0]) return false;
+  if (readIntegerValue(values.tool_timeout_sec?.text) !== desired.toolTimeoutSec) return false;
+  const expectedEnv = desired.env ?? {};
+  const expectedKeys = Object.keys(expectedEnv).sort();
+  const recordedKeys = Object.keys(values)
+    .filter((key) => key.startsWith('env.'))
+    .map((key) => key.slice(4))
+    .sort();
+  if (!sameStrings(recordedKeys, expectedKeys)) return false;
+  return expectedKeys.every((key) => readStringValue(values[`env.${key}`]?.text) === expectedEnv[key]);
+}
+
+/**
+ * Does the document spell this server as ONE, unambiguous standard table?
+ *
+ * {@link classifyMcpEntry} builds its `values` object by merging what the parser reports, so
+ * a document the parser accepts but TOML forbids (or that means two things at once) would
+ * silently collapse into the LAST value. This check runs BEFORE that merge decision, so an
+ * ambiguous definition can never be called "already exactly ours" and can never receive the
+ * marker — the MCP-only repair must not take over an entry whose real value it cannot read.
+ *
+ * Accepted, and nothing else:
+ *
+ *   * a single `[mcp_servers.dsh-delegate]` standard header (not `[[…]]`), the shape this
+ *     plugin writes itself. The inline `dsh-delegate = { … }` spelling is NOT accepted here:
+ *     the page renders the block form, so a hand-entered inline definition is not something
+ *     this path may complete;
+ *   * assignments that sit BENEATH that header and belong to this server — one per key, so
+ *     no duplicate `command`/`args`/`tool_timeout_sec`/`env.X`, and no second spelling of
+ *     the same key through a dotted path.
+ *
+ * Refused: a duplicated key of any kind, an inline table next to (or instead of) a header, a
+ * definition that appears before its own header, a second header for the same path, an extra
+ * table under the server (`[mcp_servers.dsh-delegate.custom]`, including an empty one), an
+ * array table, and a `key = { … }` value that TOML would treat as a nested table the shape
+ * check cannot see. The plain `unmanaged-entry` refusal is the answer for all of them.
+ * @param {TomlDocument} document - parsed config.
+ * @param {string[]} serverPath - `['mcp_servers', MCP_SERVER_NAME]`.
+ * @returns {boolean} true only for the single standard table with unique keys.
+ */
+function isUnambiguousOwnedDefinition(document, serverPath) {
+  const { inline, headerIndex } = locateMcpDefinition(document);
+  if (inline !== undefined) return false;
+  if (headerIndex === -1) return false;
+  const header = document.entries[headerIndex];
+  if (header.kind !== 'table') return false;
+  // Exactly one header for this exact path, and no table at all below it.
+  const sameServer = document.entries.filter((entry) => entry.kind !== 'assignment'
+    && entry.path.length >= serverPath.length
+    && serverPath.every((segment, index) => entry.path[index] === segment));
+  if (sameServer.length !== 1) return false;
+  // Every entry that names this server from above is that one header.
+  if (document.entries.some((entry) => entry !== header && entry.path.length === serverPath.length
+    && samePath(entry.path, serverPath))) return false;
+  const seen = new Set();
+  for (const entry of document.assignmentsUnder(serverPath)) {
+    if (entry === inline) continue;
+    if (entry.path.length <= serverPath.length) return false;
+    if (entry.startLine < header.startLine) return false;
+    const key = entry.path.slice(serverPath.length).join('.');
+    if (seen.has(key)) return false;
+    seen.add(key);
+    // A nested inline table would hide keys from {@link describeEntryShape}.
+    if (tomlValueType(entry.raw) === 'table') return false;
+  }
+  return true;
 }
 
 /**
@@ -2179,6 +2426,141 @@ function renderMcpBlock(desired) {
 }
 
 /**
+ * The character offset a `{ line, column }` position names in the document's exact text.
+ *
+ * Offsets are counted in CHARACTERS (what `String#split`, `slice` and `indexOf` use), never in
+ * bytes, so a UTF-8 BOM or a non-ASCII comment shifts nothing. A position past the end of its
+ * line is clamped to that line's end rather than spilling into the next one.
+ * @param {string} text - the document text.
+ * @param {number} line - 0-based line index, as the parser reports it (lines split on `\n`).
+ * @param {number} [column] - 0-based character column.
+ * @returns {number} the offset, or -1 when the line does not exist.
+ */
+function offsetAt(text, line, column = 0) {
+  if (!Number.isInteger(line) || line < 0) return -1;
+  let cursor = 0;
+  for (let index = 0; index < line; index += 1) {
+    const next = text.indexOf('\n', cursor);
+    if (next === -1) return -1;
+    cursor = next + 1;
+  }
+  const end = text.indexOf('\n', cursor);
+  const limit = end === -1 ? text.length : end;
+  const wanted = Number.isInteger(column) && column > 0 ? column : 0;
+  return Math.min(cursor + wanted, limit);
+}
+
+/**
+ * The line ending to use for a line inserted at `offset`.
+ *
+ * A marker is one inserted LINE, so it takes the ending of the line it is placed before — the
+ * bytes immediately preceding `offset` when they are a `\n` or `\r\n`, otherwise the next
+ * `\n` in the document. This keeps a mixed or CRLF file exactly as it was instead of
+ * normalizing it, and it never depends on an "average" ending.
+ * @param {string} text - the document text.
+ * @param {number} offset - where the line is inserted.
+ * @returns {string} `'\r\n'` or `'\n'`.
+ */
+function lineEndingAt(text, offset) {
+  if (text[offset - 1] === '\n') return text[offset - 2] === '\r' ? '\r\n' : '\n';
+  const next = text.indexOf('\n', offset);
+  return next > 0 && text[next - 1] === '\r' ? '\r\n' : '\n';
+}
+
+/**
+ * Add ONLY the plugin marker line directly above the server's own definition header.
+ *
+ * Nothing is re-serialized: the marker and one line ending are spliced into the ORIGINAL
+ * text at the header line's character offset, so every existing character — a BOM, mixed CRLF
+ * and LF endings, a missing final newline, the header's own indentation, comments above it —
+ * is copied through untouched. Deleting the inserted line therefore restores the original
+ * bytes. The marker always goes above the server's own header, never above a shared
+ * `[mcp_servers]` parent, because a marker there would claim the sibling entries too.
+ * @param {TomlDocument} document - parsed config with a single standard server table.
+ * @param {number} startLine - the header's 0-based line as the parser reports it.
+ * @returns {{ text: string, offset: number } | { text: null, reason: string }} the edit.
+ */
+function insertMcpMarker(document, startLine) {
+  const text = document.text;
+  const offset = offsetAt(text, startLine, 0);
+  if (offset === -1) return { text: null, reason: 'no-definition-line' };
+  // The header line must really start there, otherwise the offset is not trustworthy.
+  if (!/^\s*\[/u.test(text.slice(offset, offset + 128))) return { text: null, reason: 'header-not-at-offset' };
+  const marker = `${MCP_MARKER}${lineEndingAt(text, offset)}`;
+  return { text: `${text.slice(0, offset)}${marker}${text.slice(offset)}`, offset };
+}
+
+/**
+ * Is `next` exactly `text` with one line inserted at `offset`, and nothing else?
+ * @param {string} text - original text.
+ * @param {string} next - edited text.
+ * @param {number} offset - insertion offset.
+ * @returns {boolean} true when removing that one line gives the original back byte for byte.
+ */
+function isSingleInsertedLine(text, next, offset) {
+  if (typeof next !== 'string' || next.length <= text.length) return false;
+  const insertedLength = next.length - text.length;
+  if (next.slice(0, offset) !== text.slice(0, offset)) return false;
+  if (next.slice(offset + insertedLength) !== text.slice(offset)) return false;
+  const inserted = next.slice(offset, offset + insertedLength);
+  return inserted === `${MCP_MARKER}${lineEndingAt(text, offset)}`;
+}
+
+/**
+ * May the marker be added to an unmarked definition, treating the entry as this plugin's?
+ *
+ * This is the write gate of the “仅修复 MCP 配置” button's marker step. It is deliberately
+ * narrower than "the classifier said conflict":
+ *
+ *   * the definition is `unmanaged-entry-exact` — every owned fact already equals what this
+ *     build writes, which is the only case where adding a marker changes no value;
+ *   * it is ONE unambiguous standard table (re-checked HERE, because the caller may have read
+ *     the document at a different moment): no duplicated key, no inline table beside a header,
+ *     no extra or empty sub-table, no unknown field;
+ *   * `args[0]` is this installation's exact script, proved on the filesystem here;
+ *   * the marker can be spliced in above the server's own header as ONE inserted line — so the
+ *     edit never re-serializes, normalizes a line ending or appends a missing final newline;
+ *   * the edited document re-classifies as `configured` and its marker is adjacent to the
+ *     server's own header, never to a shared `[mcp_servers]` parent.
+ *
+ * The uninstall boundary is the existing one: the marker is the same marker `install` writes,
+ * `remove` deletes only a range it can prove, and the operator's own comments and sibling
+ * entries are outside that range. Anything refused here leaves the file byte-identical.
+ * @param {TomlDocument} document - parsed config.
+ * @param {object} desired - value from {@link desiredMcpCommand}.
+ * @returns {Promise<{ ok: true, text: string } | { ok: false, reason: string }>} verdict.
+ */
+export async function emplaceMcpMarker(document, desired) {
+  if (desired === null || desired === undefined) return { ok: false, reason: 'no-owned-shape' };
+  const serverPath = ['mcp_servers', MCP_SERVER_NAME];
+  const classification = classifyMcpEntry(document, desired);
+  if (classification.state !== MCP_STATES.conflict || classification.reason !== UNMANAGED_EXACT_REASON) {
+    return { ok: false, reason: classification.reason ?? `state-${classification.state}` };
+  }
+  if (classification.marked === true) return { ok: false, reason: 'already-marked' };
+  if (!isUnambiguousOwnedDefinition(document, serverPath)) return { ok: false, reason: 'ambiguous-definition' };
+  const args = Array.isArray(classification.previous?.args) ? classification.previous.args : [];
+  if (args.length !== 1) return { ok: false, reason: 'args-shape-not-ours' };
+  if (!isExactInstalledScript(args[0], desired.args[0])) return { ok: false, reason: 'script-not-ours' };
+  // The same gate the managed refresh uses, argued from the values just proved identical to
+  // the owned entry (the marker is the line being ADDED, so it cannot be the premise).
+  const gate = await isOwnedStaleEntry({ ...classification, marked: true }, desired);
+  if (gate.owned !== true) return { ok: false, reason: gate.reason };
+  const { headerIndex } = locateMcpDefinition(document);
+  const edit = insertMcpMarker(document, document.entries[headerIndex].startLine);
+  if (edit.text === null) return { ok: false, reason: edit.reason };
+  if (!isSingleInsertedLine(document.text, edit.text, edit.offset)) {
+    return { ok: false, reason: 'edit-not-a-single-line' };
+  }
+  const after = new TomlDocument(edit.text);
+  if (locateMcpDefinition(after).marker !== MCP_MARKER) return { ok: false, reason: 'marker-not-adjacent' };
+  if (classifyMcpEntry(after, desired).state !== MCP_STATES.configured) {
+    return { ok: false, reason: 'result-not-configured' };
+  }
+  return { ok: true, text: edit.text };
+}
+
+/**
  * Apply the managed MCP entry to a config document, preserving everything else.
  *
  * Two edits are possible and both are minimal:
@@ -2389,7 +2771,10 @@ export async function readCodexStatus({
         : (pinned.error?.reason ?? (boundary.link === 'codex-home' ? 'codex-home-is-link' : 'agents-dir-is-link')),
       contents: null,
     }
-    : await readAgentState(agentPath, template);
+    : await readAgentState(agentPath, template, await recallRecordedTemplate(home, env));
+  // A READ never writes: this function classifies the files and records nothing. The template
+  // digest is recorded only by `install` and by the startup `refreshKnownAgentTemplate`, after
+  // those actions themselves wrote and re-proved the file.
   const script = await resolveMcpScript();
   // A host with no provable Node.js runtime is a *reported* state, not a thrown
   // failure: the status still describes the agent file and the operator needs the
@@ -2470,7 +2855,7 @@ export async function readCodexStatus({
     }
   }
 
-  return buildStatus({
+  const status = buildStatus({
     // The REAL directory every action uses, plus the selected spelling so an operator who
     // configured a junction can recognise it. `codexHome` is always the path actually
     // read and written.
@@ -2493,6 +2878,12 @@ export async function readCodexStatus({
     boundary,
     configFingerprint,
   });
+  // The environment the read was taken WITH, kept beside — never inside — the document: the
+  // write paths need it to reach the plugin's own data directory (`DSH_HOME`). A
+  // non-enumerable property cannot be serialized, spread or returned by an HTTP transport, so
+  // no environment value (and no credential in it) can ever leak through a status response.
+  Object.defineProperty(status, INTERNAL_ENV, { value: env, enumerable: false, configurable: true });
+  return status;
 }
 
 /**
@@ -2564,6 +2955,11 @@ function buildStatus({
       // re-reads the file and compares against this immediately before its rename, so
       // a file edited between the status read and the write is never replaced.
       expect: agent.contents ?? null,
+      // True when this file was recognised through the template digest recorded for THIS home
+      // rather than through the enumerated published history. It never reaches a response
+      // (`publicCodexStatus` strips it) and it never makes a state: an unproved file is still
+      // `modified`.
+      recorded: agent.recorded === true,
     },
     mcp: {
       path: configPath,
@@ -2617,7 +3013,13 @@ function buildNotes({ agent, mcp, script, configError, nodeError = null }) {
   if (agent.state === AGENT_STATES.modified) {
     notes.push({
       code: 'AGENT_USER_MODIFIED',
-      text: `已存在内容不同的 agents/${AGENT_FILENAME}，本插件不会覆盖或删除它；如需插件版本请先自行移动该文件。`,
+      text: `已存在内容不同的 agents/${AGENT_FILENAME}，本插件不会覆盖或删除它。`
+        + (agent.reason === 'edited'
+          // The bytes are one of this plugin's own templates with something changed — a
+          // single character, an added note, or only the version line. Saying WHICH keeps
+          // the operator from guessing, and never suggests deleting a file they may want.
+          ? '它与本插件发布过的某个模板只在个别字节上不同（可能只改了 version 行，或加了一处你自己的说明）；改回该发布版本的原样内容后，本插件会自动更新它，否则由你继续管理。'
+          : '它不是本插件发布过的模板，因此插件不会把它当作自己的文件；由你继续管理即可。'),
     });
   }
   if (agent.state === AGENT_STATES.conflict) {
@@ -2641,9 +3043,11 @@ function buildNotes({ agent, mcp, script, configError, nodeError = null }) {
       code: 'MCP_ENTRY_CONFLICT',
       text: mcp.reason === 'unmanaged-entry'
         ? `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，但没有本插件的托管标记注释，视为你自己写的：本插件不会更新或删除它；请自行删除或改名后再点安装。`
-        : (mcp.reason === 'args-shape-not-ours'
-          ? `config.toml 中已有的 mcp_servers.${MCP_SERVER_NAME} 条目带托管标记，但入口脚本与当前安装不同。若那是本插件的另一处真实安装，点「安装 / 更新 Codex 集成」或「仅修复 MCP 配置」会在证明后采纳；否则本插件不会替换它。`
-          : `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，但内容不是本插件写入的形态（${mcp.reason ?? 'unknown'}）。本插件不会替换它；请自行删除或改名后再点安装。`),
+        : (mcp.reason === UNMANAGED_EXACT_REASON
+          ? `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，内容与当前插件应写入的条目完全一致（命令、入口脚本、参数、超时与环境项都相同），只缺托管标记注释。点「仅修复 MCP 配置」只会补上这一行标记，不改动其他内容；「安装 / 更新 Codex 集成」不会替你接管它。`
+          : (mcp.reason === 'args-shape-not-ours'
+            ? `config.toml 中已有的 mcp_servers.${MCP_SERVER_NAME} 条目带托管标记，但入口脚本与当前安装不同。若那是本插件的另一处真实安装，点「安装 / 更新 Codex 集成」或「仅修复 MCP 配置」会在证明后采纳；否则本插件不会替换它。`
+            : `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，但内容不是本插件写入的形态（${mcp.reason ?? 'unknown'}）。本插件不会替换它；请自行删除或改名后再点安装。`)),
     });
   }
   if (mcp.state === MCP_STATES.outdated) {
@@ -2769,7 +3173,10 @@ export async function runCodexAction(action, {
     // MCP only: the agent file is not touched at all — not created, not refreshed,
     // not deleted. The returned status still reports its real (possibly `not-installed`
     // or `outdated`) state, so the page can tell the operator to run `install`.
-    await installMcpEntry(before, { changed, refused });
+    //
+    // The marker step is this button's alone: it completes an entry that is ALREADY exactly
+    // this build's definition, and touches nothing else.
+    await installMcpEntry(before, { changed, refused }, { allowMarkerEmplacement: true });
   } else {
     await installManaged(before, { changed, refused });
   }
@@ -2874,7 +3281,13 @@ export async function refreshKnownAgentTemplate(options = {}) {
   return { changed, refused, status };
 }
 
-/** Install or refresh the managed agent file without touching the MCP entry. */
+/**
+ * Install or refresh the managed agent file without touching the MCP entry.
+ *
+ * Both successful writes end with `recordAgentTemplate`, which re-reads the file and records the
+ * template digest only when those bytes are exactly what this build renders. A refused write
+ * records nothing.
+ */
 async function installManagedAgent(before, outcome) {
   const { agent } = before;
   if (agent.state === AGENT_STATES.missing || agent.state === AGENT_STATES.outdated) {
@@ -2894,6 +3307,7 @@ async function installManagedAgent(before, outcome) {
         });
         return;
       }
+      await recordAgentTemplate(before);
       outcome.changed.push('agent');
     } else {
       // A refresh replaces a byte-exact known build of our own file. Re-check right
@@ -2910,6 +3324,7 @@ async function installManagedAgent(before, outcome) {
         return;
       }
       await writeFileAtomic(agent.path, template);
+      await recordAgentTemplate(before);
       outcome.changed.push('agent');
     }
   } else if (agent.state === AGENT_STATES.modified || agent.state === AGENT_STATES.conflict) {
@@ -2930,9 +3345,11 @@ async function installManagedAgent(before, outcome) {
  * `repair` cannot create the `agents/` directory, refresh a stale agent or remove one.
  * @param {object} before - status read before the change.
  * @param {{ changed: string[], refused: object[] }} outcome - mutable outcome.
+ * @param {object} [options] - `allowMarkerEmplacement`: let an unmarked entry that is already
+ *   exactly this build's definition receive ONLY the marker line (the MCP-only repair).
  * @returns {Promise<void>} resolves after the target was attempted.
  */
-async function installMcpEntry(before, outcome) {
+async function installMcpEntry(before, outcome, { allowMarkerEmplacement = false } = {}) {
   const { mcp } = before;
   if (mcp.scriptExists !== true) {
     outcome.refused.push({
@@ -2967,25 +3384,32 @@ async function installMcpEntry(before, outcome) {
     return;
   }
   if (mcp.state === MCP_STATES.conflict) {
-    // The ONE conflict an explicit `install`/`repair` may resolve: a marked entry whose
-    // script is a DIFFERENT path that is provably another installation of this package
-    // (its root's `package.json` declares our name and its `bin` is that very file). This
-    // is the moved-installation upgrade, and it is proved here, on the spot — the bare
-    // classification never grants it, and the unattended startup path never attempts it.
+    // TWO conflicts an explicit action may resolve, both proved here, on the spot — the bare
+    // classification never grants either, and the unattended startup path attempts neither:
+    //
+    //   1. a MARKED entry whose script is a DIFFERENT path that is provably another
+    //      installation of this package (its root's `package.json` declares our name and its
+    //      `bin` is that very file): the moved-installation upgrade; and
+    //   2. for `repair` only, an UNMARKED entry that is ALREADY exactly this build's
+    //      definition: the marker line is added and no value is touched. Any other unmarked
+    //      entry stays refused, byte-identical.
     const adopted = await adoptProvedMovedInstall(before);
-    if (adopted === null) {
-      outcome.refused.push({
-        target: 'mcp',
-        code: 'MCP_ENTRY_CONFLICT',
-        message: mcp.reason === 'unmanaged-entry'
-          ? 'a same-name mcp_servers.dsh-delegate entry without the plugin marker already exists and was left untouched'
-          : 'a different mcp_servers.dsh-delegate entry already exists and was left untouched',
-        path: mcp.path,
-        reason: mcp.reason,
-      });
+    if (adopted !== null) {
+      await adoptMovedInstall(adopted, outcome, before);
       return;
     }
-    await adoptMovedInstall(adopted, outcome, before);
+    if (allowMarkerEmplacement === true && await emplaceMcpMarkerFor(before, outcome)) return;
+    outcome.refused.push({
+      target: 'mcp',
+      code: 'MCP_ENTRY_CONFLICT',
+      message: mcp.reason === 'unmanaged-entry'
+        ? 'a same-name mcp_servers.dsh-delegate entry without the plugin marker already exists and was left untouched'
+        : mcp.reason === UNMANAGED_EXACT_REASON
+          ? "a same-name mcp_servers.dsh-delegate entry matches this plugin's entry exactly but has no marker; only 仅修复 MCP 配置 may add it, and the file was left untouched"
+          : 'a different mcp_servers.dsh-delegate entry already exists and was left untouched',
+      path: mcp.path,
+      reason: mcp.reason,
+    });
     return;
   }
   if (mcp.state === MCP_STATES.configured) return;
@@ -3010,6 +3434,72 @@ async function installMcpEntry(before, outcome) {
   await mkdir(dirname(mcp.path), { recursive: true, mode: 0o700 });
   await writeFileAtomic(mcp.path, next);
   outcome.changed.push('mcp');
+}
+
+/**
+ * Complete an unmarked definition that is ALREADY exactly this build's entry, with the
+ * marker line and nothing else.
+ *
+ * This is the “仅修复 MCP 配置” button's marker step. The plan in `before` is only a hint:
+ * every fact it relies on is re-proved against the CURRENT bytes immediately before the write:
+ *
+ *   1. the boundary (`$CODEX_HOME`, `agents/`) is inspected again — a link can have appeared;
+ *   2. `config.toml` is re-read and its digest must equal the plan's `fingerprint`, so an
+ *      operator edit between the read and the write is kept instead of overwritten;
+ *   3. {@link emplaceMcpMarker} re-classifies the CURRENT document, proves `args[0]` on the
+ *      filesystem, refuses a position the operator's own comment occupies, requires the result
+ *      to classify as `configured`, and requires the edit to be exactly one inserted line.
+ *
+ * The write is one atomic replacement built from the bytes just re-read, and it carries the
+ * same one-line change. A refused step leaves the file byte-identical.
+ * @param {object} before - status read before the change.
+ * @param {{ changed: string[], refused: object[] }} outcome - mutable outcome.
+ * @returns {Promise<boolean>} true when this step handled the entry (a change or a refusal);
+ *   false when it does not apply and the caller reports its own conflict.
+ */
+async function emplaceMcpMarkerFor(before, outcome) {
+  const { mcp } = before;
+  if (mcp.state !== MCP_STATES.conflict || mcp.reason !== UNMANAGED_EXACT_REASON) return false;
+  const refuse = (reason, message) => {
+    outcome.refused.push({ target: 'mcp', code: 'MCP_ENTRY_CONFLICT', message, path: mcp.path, reason });
+  };
+  if (before.config?.readable !== true) {
+    refuse('config-unreadable', 'the Codex config could not be read, so no marker was added');
+    return true;
+  }
+  const boundary = await inspectCodexBoundary(before.codexHome);
+  if (boundary.blocked === true) {
+    outcome.refused.push(linkedBoundaryRefusal({ ...before, boundary }));
+    return true;
+  }
+  let loaded;
+  try {
+    loaded = await loadConfig(mcp.path);
+  } catch (error) {
+    refuse(
+      typeof error?.code === 'string' ? error.code : 'CODEX_CONFIG_UNREADABLE',
+      typeof error?.message === 'string' ? error.message : 'the Codex config could not be read',
+    );
+    return true;
+  }
+  if (loaded.unreadable === true) {
+    refuse('CODEX_CONFIG_UNSUPPORTED', 'the Codex config is not readable as TOML and was left untouched');
+    return true;
+  }
+  if (typeof mcp.fingerprint !== 'string' || digest(loaded.document.text) !== mcp.fingerprint) {
+    refuse('config-changed', 'config.toml changed after the entry was checked, so nothing was written');
+    return true;
+  }
+  const emplaced = await emplaceMcpMarker(loaded.document, mcp.desired);
+  if (emplaced.ok !== true) {
+    refuse(emplaced.reason,
+      "the mcp_servers.dsh-delegate entry is not exactly this plugin's own definition, so no marker was added and the file was left untouched");
+    return true;
+  }
+  await mkdir(dirname(mcp.path), { recursive: true, mode: 0o700 });
+  await writeFileAtomic(mcp.path, emplaced.text);
+  outcome.changed.push('mcp');
+  return true;
 }
 
 /**
@@ -3496,7 +3986,7 @@ async function removeManaged(before, outcome) {
  */
 export function publicCodexStatus(status) {
   if (status === null || typeof status !== 'object') return status;
-  const { expect: _ignored, ...agent } = status.agent ?? {};
+  const { expect: _ignored, recorded: _record, ...agent } = status.agent ?? {};
   // `mcp.fingerprint` is the write path's receipt for the exact config bytes it plans to
   // replace. It is a digest, not content, but it is an internal planning fact like
   // `agent.expect`, so it does not belong in a response an operator or a page reads.

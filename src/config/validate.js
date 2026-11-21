@@ -9,6 +9,7 @@
 import { posix, win32 } from 'node:path';
 
 import {
+  DEFAULT_AGENT_TEAMS_FOR_NEW_TASKS,
   DEFAULT_ISOLATION,
   EFFORT_ORDER,
   ISOLATION_MODES,
@@ -357,6 +358,26 @@ function validateIsolation(value, code, field) {
 }
 
 /**
+ * Normalize the LEGACY `worker.timeoutSeconds` value.
+ *
+ * The field is retired as a knob — the settings page no longer offers it and an
+ * ordinary run is not bounded by it — but a stored document that carries one must
+ * still open. The rule is therefore "read it, never refuse it": a whole number
+ * inside the documented bounds is preserved (so a reader can still see what the
+ * old document said), and anything else — out of range, fractional, textual, a
+ * negative number — falls back to the documented default. Nothing is clamped into
+ * a different number nobody chose, and nothing here can make a task fail to start.
+ * @param {unknown} value - stored legacy value.
+ * @returns {number} a whole number of seconds inside the documented bounds.
+ */
+export function legacyTimeoutSeconds(value) {
+  const candidate = typeof value === 'number' ? value : (typeof value === 'string' && value.trim() !== '' ? Number(value) : Number.NaN);
+  if (!Number.isSafeInteger(candidate)) return 1800;
+  if (candidate < LIMITS.timeoutSecondsMin || candidate > LIMITS.timeoutSecondsMax) return 1800;
+  return candidate;
+}
+
+/**
  * Validate the worker execution settings block.
  * @param {unknown} value - candidate worker block.
  * @param {object[]} providers - validated providers.
@@ -368,13 +389,13 @@ export function validateWorkerSettings(value, providers) {
     throw new ConfigError('WORKER_INVALID', 'worker settings must be an object', {});
   }
   const selection = validateSelection(source, providers, 'worker');
-  const timeoutSeconds = requireInt(
-    source.timeoutSeconds ?? 1800,
-    'WORKER_TIMEOUT_INVALID',
-    'worker.timeoutSeconds',
-    LIMITS.timeoutSecondsMin,
-    LIMITS.timeoutSecondsMax,
-  );
+  // `timeoutSeconds` is a LEGACY field: it is no longer offered in the settings
+  // page and no longer bounds an ordinary run, but a document written by an older
+  // build (or an older client that still sends it) must keep loading. So the value
+  // is READ AND NORMALIZED, never refused: an out-of-range, fractional or
+  // non-numeric legacy value falls back to the documented default instead of
+  // failing the whole document, and the run is not limited by it either way.
+  const timeoutSeconds = legacyTimeoutSeconds(source.timeoutSeconds);
   const maxParallelism = requireInt(
     source.maxParallelism ?? 1,
     'WORKER_PARALLELISM_INVALID',
@@ -396,55 +417,39 @@ export function validateWorkerSettings(value, providers) {
 }
 
 /**
- * Validate the additional-review block. Review is off unless explicitly enabled
- * and it owns a fully separate provider/model/effort triple.
- * @param {unknown} value - candidate review block.
- * @param {object[]} providers - validated providers.
- * @returns {object} normalized review block.
- */
-export function validateReviewSettings(value, providers) {
-  const source = value ?? {};
-  if (typeof source !== 'object' || Array.isArray(source)) {
-    throw new ConfigError('REVIEW_INVALID', 'review settings must be an object', {});
-  }
-  const enabled = requireBool(source.enabled ?? false, 'REVIEW_INVALID', 'review.enabled');
-  if (!enabled) {
-    return { enabled: false, providerId: null, model: null, reasoningEffort: null };
-  }
-  const selection = validateSelection(source, providers, 'review');
-  return {
-    enabled: true,
-    providerId: selection.providerId,
-    model: selection.model,
-    reasoningEffort: selection.reasoningEffort,
-  };
-}
-
-/**
  * Validate the activity-monitoring block.
  *
- * Two silence thresholds and one failure-count threshold:
+ * Two no-progress thresholds and one failure-count threshold. Each is INDEPENDENT and
+ * each can be switched off with `0`. There is exactly ONE time base — consecutive time
+ * without real progress — and nothing here depends on total runtime:
  *
  *  * `selfCheckSeconds` is when the engine performs ONE read-only local
  *    inspection of the executor it already holds (alive, phase, pending request,
  *    current tool) and reports it on an internal re-wait. It never starts an LLM
- *    call and never touches the task's state, budget or deadline.
- *  * `attentionSeconds` is when a wait stops keeping quiet and reports
- *    `attention` to the commander instead of `heartbeat`.
+ *    call and never touches the task's state, budget or deadline. Default 10 min.
+ *  * `attentionSeconds` is when a wait stops keeping quiet and reports ONE run
+ *    progress check to the commander — `reason: "attention"` with
+ *    `checkpoint: "progress"` — instead of `heartbeat`. It is a report, never an
+ *    action: the run is not cancelled, restarted or resubmitted. Default 40 min.
  *  * `repeatFailureThreshold` is how many CONSECUTIVE identical tool failures are
  *    reported once, or `0` to switch that reminder off. It is a count, so it is
- *    independent of the two silence thresholds: a busy run that keeps failing the
+ *    independent of the two duration thresholds: a busy run that keeps failing the
  *    same way never reaches either of them.
  *
  * A missing block is the documented default (backwards compatible: documents
  * written before this field existed keep loading, and a document that has the other
- * two but not this one gets the default rather than an error). Everything else is
- * refused rather than repaired — an unknown key (a typo such as `atentionSeconds`
- * would otherwise silently keep the default), a wrong type, a non-integer, an
- * out-of-range value, and any pair where the attention threshold is not strictly
- * greater than the self-check one. A repaired value would make the timers disagree
- * with what the operator stored, which is exactly the class of silent mismatch this
- * plugin refuses everywhere else.
+ * keys but not one of them gets that key's default rather than an error). Everything
+ * else is refused rather than repaired — an unknown key (a typo such as
+ * `atentionSeconds` would otherwise silently keep the default), a wrong type, a
+ * non-integer, an out-of-range value, and any pair where BOTH thresholds are enabled
+ * and the progress check is not strictly after the self-check. A repaired value would make
+ * the timers disagree with what the operator stored, which is exactly the class of
+ * silent mismatch this plugin refuses everywhere else.
+ *
+ * A stored document that still carries a value the earlier build offered as its own
+ * progress cadence is READ AND DROPPED rather than refused: that value was never
+ * published, it is not a second clock, and refusing the document would make an
+ * operator's settings unreadable over a field no longer shown anywhere.
  * @param {unknown} value - candidate monitoring block.
  * @returns {{ selfCheckSeconds: number, attentionSeconds: number, repeatFailureThreshold: number }} normalized block.
  */
@@ -460,6 +465,7 @@ export function validateMonitoringSettings(value) {
     throw new ConfigError('MONITORING_INVALID', 'monitoring settings must be an object', { field: 'monitoring' });
   }
   for (const key of Object.keys(value)) {
+    if (key === 'progressCheckSeconds') continue;
     if (key !== 'selfCheckSeconds' && key !== 'attentionSeconds' && key !== 'repeatFailureThreshold') {
       throw new ConfigError('MONITORING_INVALID', `monitoring setting ${key} is not supported`, {
         field: `monitoring.${key}`,
@@ -481,10 +487,12 @@ export function validateMonitoringSettings(value) {
     LIMITS.attentionSecondsMin,
     LIMITS.attentionSecondsMax,
   );
-  if (attentionSeconds <= selfCheckSeconds) {
+  // Ordering matters only when BOTH reminders are on. A disabled threshold has no
+  // instant of its own, so `0` can never be "too early" for the other one.
+  if (selfCheckSeconds > 0 && attentionSeconds > 0 && attentionSeconds <= selfCheckSeconds) {
     throw new ConfigError(
       'MONITORING_TIMING_INVALID',
-      'monitoring.attentionSeconds must be greater than monitoring.selfCheckSeconds',
+      'monitoring.attentionSeconds must be greater than monitoring.selfCheckSeconds when both are enabled',
       { field: 'monitoring.attentionSeconds', selfCheckSeconds, attentionSeconds },
     );
   }
@@ -500,8 +508,53 @@ export function validateMonitoringSettings(value) {
   return { selfCheckSeconds, attentionSeconds, repeatFailureThreshold };
 }
 
-/** Validate legacy grant TTLs kept for backwards-compatible imports. */
-export function validateAuthorizationSettings(value) {
+/**
+ * Validate the operator's execution-choice block.
+ *
+ * Today it holds exactly one decision: whether a new delegated task should have
+ * DSH Agent Teams on when its dispatcher states no per-task choice. The rules:
+ *
+ *  * the block is optional — a document written before it existed, and a host
+ *    that never served one, both load at the documented OFF default, so an
+ *    upgrade can never turn collaboration on by itself;
+ *  * the value must be a real boolean. `"false"`, `0` and `null` are REFUSED
+ *    rather than coerced: a value that reads as "off" to a reader but is not a
+ *    boolean would be stored as an intention nobody can honour;
+ *  * an unknown key is refused, not ignored (a typo such as
+ *    `agentTeamDefault` would otherwise silently keep the default).
+ *
+ * The block is a TASK default only. It is not DSH's global switch and nothing
+ * here writes a global setting.
+ * @param {unknown} value - candidate `execution` block.
+ * @returns {{ agentTeamsDefault: boolean }} normalized block.
+ */
+export function validateExecutionSettings(value) {
+  if (value === undefined || value === null) {
+    return { agentTeamsDefault: DEFAULT_AGENT_TEAMS_FOR_NEW_TASKS };
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new ConfigError('EXECUTION_SETTINGS_INVALID', 'execution settings must be an object', {
+      field: 'execution',
+    });
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== 'agentTeamsDefault') {
+      throw new ConfigError('EXECUTION_SETTINGS_INVALID', `execution setting ${key} is not supported`, {
+        field: `execution.${key}`,
+        supported: ['agentTeamsDefault'],
+      });
+    }
+  }
+  return {
+    agentTeamsDefault: requireBool(
+      value.agentTeamsDefault === undefined ? DEFAULT_AGENT_TEAMS_FOR_NEW_TASKS : value.agentTeamsDefault,
+      'EXECUTION_SETTINGS_INVALID',
+      'execution.agentTeamsDefault',
+    ),
+  };
+}
+
+/** Validate legacy grant TTLs kept for backwards-compatible imports. */export function validateAuthorizationSettings(value) {
   const source = value ?? {};
   if (typeof source !== 'object' || Array.isArray(source)) {
     throw new ConfigError('AUTHORIZATION_INVALID', 'authorization settings must be an object', {});
@@ -563,6 +616,11 @@ export function validateJobOverrides(value, providers) {
     out.reasoningEffort = null;
   }
   if (value.timeoutSeconds !== undefined) {
+    // The ONE compatibility path that still bounds a run: a caller that explicitly
+    // asks for a per-job cap gets exactly that cap. It is deliberately not offered
+    // in the settings page (a stored global value never bounds a task), so an
+    // operator can never inherit an unintended deadline — only a dispatch that
+    // names one states it.
     out.timeoutSeconds = requireInt(
       value.timeoutSeconds,
       'WORKER_TIMEOUT_INVALID',
@@ -589,7 +647,6 @@ export function validateProjectOverride(value, providers) {
   }
   const out = {};
   if (value.worker !== undefined) out.worker = validateWorkerSettings(value.worker, providers);
-  if (value.review !== undefined) out.review = validateReviewSettings(value.review, providers);
   return out;
 }
 
@@ -655,6 +712,8 @@ export function validateProjectOverrides(value, providers) {
   const seen = new Map();
   for (const [projectPath, block] of Object.entries(raw)) {
     const { key, display } = canonicalProjectKey(projectPath, 'projectOverrides key');
+    const override = validateProjectOverride(block, providers);
+    if (block.review !== undefined && override.worker === undefined) continue;
     const existing = seen.get(key);
     if (existing !== undefined) {
       throw new ConfigError('PROJECT_OVERRIDE_DUPLICATE', 'two project overrides name the same project', {
@@ -663,18 +722,17 @@ export function validateProjectOverrides(value, providers) {
       });
     }
     seen.set(key, display);
-    out[display] = validateProjectOverride(block, providers);
+    out[display] = override;
   }
   return out;
 }
 
 /**
- * Validate one named preset: a reusable, entirely non-secret worker/review
- * combination. Both blocks are validated against the same provider list as live
- * settings, so a preset can never store a combination that settings would refuse.
+ * Validate one named worker preset. Older presets that configured only the
+ * retired model review are omitted without validating their unused selection.
  * @param {unknown} value - candidate preset.
  * @param {object[]} providers - validated providers.
- * @returns {{ id: string, name: string, worker: object | null, review: object | null }} normalized preset.
+ * @returns {{ id: string, name: string, worker: object } | null} normalized preset.
  */
 export function validatePreset(value, providers) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -682,15 +740,11 @@ export function validatePreset(value, providers) {
   }
   const id = requireString(value.id, 'PRESET_INVALID', 'preset.id', { max: 40, pattern: ID_PATTERN });
   const name = requireString(value.name ?? id, 'PRESET_INVALID', 'preset.name', { max: 80 });
-  if (value.worker === undefined && value.review === undefined) {
-    throw new ConfigError('PRESET_INVALID', 'preset must contain worker or review settings', { id });
+  if (value.worker === undefined || value.worker === null) {
+    if (value.review !== undefined && value.review !== null) return null;
+    throw new ConfigError('PRESET_INVALID', 'preset must contain worker settings', { id });
   }
-  return {
-    id,
-    name,
-    worker: value.worker === undefined ? null : validateWorkerSettings(value.worker, providers),
-    review: value.review === undefined ? null : validateReviewSettings(value.review, providers),
-  };
+  return { id, name, worker: validateWorkerSettings(value.worker, providers) };
 }
 
 /**
@@ -707,7 +761,7 @@ export function validatePresets(value, providers) {
   if (raw.length > LIMITS.presets) {
     throw new ConfigError('PRESET_INVALID', `presets exceeds ${LIMITS.presets} entries`, {});
   }
-  const presets = raw.map((entry) => validatePreset(entry, providers));
+  const presets = raw.map((entry) => validatePreset(entry, providers)).filter((preset) => preset !== null);
   const seen = new Set();
   for (const preset of presets) {
     if (seen.has(preset.id)) throw new ConfigError('PRESET_DUPLICATE', `duplicate preset id ${preset.id}`, { id: preset.id });
@@ -724,8 +778,6 @@ export function validatePresets(value, providers) {
 function isUnconfiguredSelection(value) {
   if (value === null || value === undefined) return true;
   if (typeof value !== 'object' || Array.isArray(value)) return false;
-  const enabled = value.enabled;
-  if (enabled === true) return false;
   return (value.providerId ?? null) === null;
 }
 
@@ -752,13 +804,14 @@ export function validateSettings(value, options = {}) {
   // fresh install can add its first provider before choosing a worker. It is
   // never legal to RUN: resolveEffectiveConfig refuses it, which keeps the
   // refusal at the job boundary instead of at every settings edit.
+  //
+  // The default block is used as the BASE, not as a replacement: a legacy document
+  // that still carries `worker.timeoutSeconds` must keep that value verbatim even
+  // before a provider is chosen, or a settings save would silently rewrite a field
+  // nobody touched.
   const worker = isUnconfiguredSelection(value.worker)
-    ? defaultSettings().worker
+    ? { ...defaultSettings().worker, timeoutSeconds: legacyTimeoutSeconds(value.worker?.timeoutSeconds) }
     : validateWorkerSettings(value.worker ?? {}, providers);
-  const review = isUnconfiguredSelection(value.review)
-    ? defaultSettings().review
-    : validateReviewSettings(value.review ?? {}, providers);
-
   if (options.requireProviders === true && providers.length === 0) {
     throw new ConfigError('SETTINGS_NO_PROVIDERS', 'no provider profile is configured', {});
   }
@@ -768,8 +821,10 @@ export function validateSettings(value, options = {}) {
     delegationEnabled: requireBool(value.delegationEnabled ?? false, 'SETTINGS_INVALID', 'delegationEnabled'),
     providers,
     worker,
-    review,
     authorization: validateAuthorizationSettings(value.authorization),
+    // The operator's default for NEW tasks. An absent block is the documented
+    // OFF default, which is also what an upgraded document loads as.
+    execution: validateExecutionSettings(value.execution),
     monitoring: validateMonitoringSettings(value.monitoring),
     projectOverrides: validateProjectOverrides(value.projectOverrides, providers),
     presets: validatePresets(value.presets, providers),

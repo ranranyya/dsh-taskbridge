@@ -59,8 +59,12 @@ function materializeBundle() {
 
   const require = (specifier) => {
     requests.push(specifier);
-    // A namespace stub is enough: the bundle only dereferences React while
-    // rendering, which this test never does.
+    // The module body runs at materialization, and this bundle now creates a React
+    // context at that point, so the stub has to carry the few React functions the
+    // module scope calls. Rendering is still never performed here.
+    if (specifier === 'react') {
+      return { createContext: () => ({ Provider: null, Consumer: null }), useContext: () => null };
+    }
     if (PLATFORM_SEED.has(specifier)) return {};
     throw new Error(`require("${specifier}") is not a platform module`);
   };
@@ -149,32 +153,50 @@ test('registerBundleConfiguration occupies plugins.bundle.config, keyed by dsh-d
   assert.equal(component, MODULE.exports.DelegateConfigPage);
 });
 
-test('apply wires the stylesheet, store, bundle page and the native navigation — and nothing else', () => {
+test('apply wires the stylesheet, store, bundle page and the native row marker — and nothing else', () => {
   const ctx = fakeClientContext();
   MODULE.exports.apply(ctx);
 
-  // Two effects for setup (stylesheet, registration) plus one for store disposal and
-  // one for the sidebar entry.
+  // Two effects for setup (stylesheet, registration) plus one for store disposal and one for
+  // the native session-row marker.
   assert.ok(ctx.effects.length >= 3, 'apply must register its effects');
   for (const effect of ctx.effects) {
     assert.equal(typeof effect.label, 'string');
     assert.doesNotMatch(effect.label, /settings section|settings\.section/u);
   }
 
-  // Three slot injections, and exactly these: the Plugins-manager page (G08 adds the
-  // content panel on `main` and its icon on `sidebar.panellist`). `sidebar.workspaces`
-  // is deliberately absent — two public sibling plugins own or replace it.
+  // EXACTLY two slot injections: the Plugins-manager page and the PUBLISHED per-session child
+  // slot of the host's workspace browser.
+  //
+  // The task-record sidebar entry is deliberately absent: `registerTasksNavigation` registers
+  // `main` AND `sidebar.panellist` in one call, so the operator-visible 「TaskBridge 任务」 row
+  // cannot be removed while any half of it stays mounted. Task records are reached from the
+  // plugin's own settings page instead. The parent region (`sidebar.workspaces`) is never
+  // registered: its rows, names, order, search and menus stay the host's.
   assert.deepEqual(
     ctx.injections.map((injection) => injection.name),
-    ['plugins.bundle.config', 'main', 'sidebar.panellist'],
-    'apply must inject the page and the two optional sidebar slots, nothing else',
+    ['plugins.bundle.config', 'sidebar.workspaces.session.row.action'],
+    'apply injects the settings page and the host\'s per-session child slot, nothing else',
   );
-  assert.equal(ctx.injections[0].name, 'plugins.bundle.config');
+  assert.equal(ctx.injections.find((injection) => injection.name === 'plugins.bundle.config').name,
+    'plugins.bundle.config');
+  assert.equal(ctx.injections.find((injection) => injection.name === 'sidebar.workspaces'), undefined,
+    'the host\'s workspace region itself is never registered on');
+  assert.equal(ctx.injections.find((injection) => injection.name === 'sidebar.panellist'), undefined,
+    'and no standalone sidebar row is registered');
+  assert.equal(ctx.injections.find((injection) => injection.name === 'main'), undefined,
+    'nor an orphan content panel');
+  const marker = ctx.injections.find((injection) => injection.name === 'sidebar.workspaces.session.row.action');
+  assert.notEqual(marker, undefined, 'the per-session child slot is used');
+  marker.callback();
+  const registered = ctx.unused.find((entry) => entry.options?.name === 'sidebar.workspaces.session.row.action');
+  assert.notEqual(registered, undefined, 'and it registers a list entry there');
+  assert.equal(typeof registered.options.id, 'string');
+  assert.ok(registered.options.order > 200, 'ordered after the host\'s own row actions');
 
   // No duplicate Settings page in the shipped registration.
   assert.doesNotMatch(BUNDLE_TEXT, /settings\.section/u);
   assert.doesNotMatch(BUNDLE_TEXT, /registerSettingsSection/u);
-  assert.doesNotMatch(BUNDLE_TEXT, /['"]sidebar\.workspaces['"]/u, 'the sibling plugins keep that slot');
 });
 
 test('the page store exposes no task-submit action', () => {
@@ -183,8 +205,12 @@ test('the page store exposes no task-submit action', () => {
   // be a second, unauthorized path.
   const ctx = fakeClientContext();
   MODULE.exports.apply(ctx);
-  ctx.injections[0].callback();
-  const store = ctx.unused[0].options.inject().store;
+  // The configuration page is the injection whose NAME is the bundle key slot, not
+  // whichever cell happens to be first.
+  const page = ctx.injections.find((injection) => injection.name === 'plugins.bundle.config');
+  assert.ok(page !== undefined, 'the configuration page must be registered');
+  page.callback();
+  const store = ctx.unused.find((entry) => entry.options?.name === 'plugins.bundle.config').options.inject().store;
 
   const names = Object.keys(store);
   assert.ok(names.length > 0, 'the store must expose actions');

@@ -518,7 +518,75 @@ test('an ordinary silence report carries no failure block, so a client can tell 
   const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
   assert.equal(body.reason, 'attention');
   assert.equal(body.failure, undefined, 'silence is not a failure reminder');
-  assert.match(body.instruction, /No activity has been observed/iu);
+  // An engine that predates the discriminator still classifies correctly: an
+  // `attention` with no failure block IS the run progress check.
+  assert.equal(body.checkpoint, 'progress', 'the answer says which reminder this is');
+  assert.match(body.instruction, /Run progress check/iu);
+  // The wording states what is really measured: nothing new was RETURNED, not "no activity".
+  assert.match(body.instruction, /nothing new has been returned/iu);
+  assert.match(body.instruction, /reading the local self-check is not itself a result/iu);
+});
+
+test('the run progress check is distinguishable and keeps the host on the same task', async () => {
+  const progress = {
+    kind: 'progress',
+    thresholdMs: 2_400_000,
+    thresholdSeconds: 2400,
+    noDeliveryMs: 2_400_000,
+    noDeliveryMinutes: 40,
+    runElapsedMs: 7_200_000,
+    state: 'running',
+    phase: 'execute',
+    lastActivityAt: 1_760_000_000_000,
+    lastDeliveryAt: 1_760_000_000_000,
+    deliveries: 0,
+    idleForMs: 2_400_000,
+    currentTool: null,
+    waitingOn: 'idle',
+    activity: { kind: 'model-working', currentTool: null },
+    activityEvents: 120,
+    events: 200,
+    selfCheckVerdict: 'executor-alive-silent',
+    permissionPending: false,
+    runContinues: true,
+  };
+  const { server } = waitFixture([observation('attention', {
+    task: summary({ state: 'running' }),
+    checkpoint: 'progress',
+    progress,
+  })]);
+  const { body, text } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
+  assert.equal(body.reason, 'attention');
+  assert.equal(body.checkpoint, 'progress');
+  assert.deepEqual(body.progress, progress, 'the bounded diagnostic travels whole');
+  assert.equal(body.actionable, true);
+  assert.equal(body.terminal, false, 'a reminder never means the run ended');
+  assert.equal(body.failure, undefined, 'a progress check is not a failure reminder');
+  // The instruction tells the host the default answer is to KEEP WAITING, that the interval is
+  // measured from the last real delivery, and that the total runtime is not what triggered it.
+  assert.match(body.instruction, /Run progress check/iu);
+  assert.match(body.instruction, /nothing new has been returned for about 40 minutes/iu);
+  assert.match(body.instruction, /NOT a verdict on the run's total duration/iu);
+  assert.match(body.instruction, /KEEP WAITING on the\s+SAME taskId/iu);
+  assert.match(body.instruction, /this interval will not be reported again/iu);
+  assert.equal(text.includes('SECRET'), false);
+});
+
+test('a checkpoint is never carried on any other reason', async () => {
+  // The classification is CLOSED: only `attention` describes a reminder. A fixture (or
+  // an engine) that leaked a checkpoint onto another reason must not make this answer
+  // claim one — a terminal outcome or a pending decision is not a checkpoint.
+  for (const reason of ['permission', 'ready', 'failed', 'cancelled', 'interrupted']) {
+    const { server } = waitFixture([observation(reason, {
+      task: summary({ state: reason === 'ready' ? 'awaiting-host-review' : 'running' }),
+      checkpoint: 'progress',
+      progress: { kind: 'progress', interval: 1 },
+    })]);
+    const { body } = await callWait(server, { taskId: 'task-wait-1', waitSeconds: 60 });
+    assert.equal(body.reason, reason, 'the fixture answered with the reason under test');
+    assert.equal(body.checkpoint, undefined, `${reason} must not carry a checkpoint`);
+    assert.equal(body.progress, undefined, `${reason} must not carry a progress block`);
+  }
 });
 
 test('a host ackFailureEventId is forwarded to the internal observation and never reaches another route', async () => {

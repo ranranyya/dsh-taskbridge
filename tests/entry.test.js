@@ -1,46 +1,3 @@
-test('a replaced preset registry retires the composition the plugin registered in the old one', async () => {
-  // `apply` observes `agentPresets` on every review, because the service can be
-  // replaced after load. The composition already registered in the previous
-  // registry must be retired at the swap: forgetting it would leave a live
-  // plugin-owned preset in a registry nothing talks to any more.
-  const { nativePresetRegistry, cleanup } = await import('./helpers/fakes.js');
-  const first = nativePresetRegistry();
-  first.mounts = [];
-  first.mount = async (mountCtx, id) => {
-    first.mounts.push({ ctx: mountCtx, id });
-    return { id: id ?? first.defaultId };
-  };
-  const { published, directory, ctx } = await applyWithRecorder({
-    agentPresets: first,
-    reviewPresetImporter: async () => ({ apply() {} }),
-  });
-  try {
-    const firstId = await published.deps.reviewPresets.preparation({});
-    assert.equal(first.definitions.size, 1);
-
-    // The registry service is replaced under the plugin.
-    const second = nativePresetRegistry();
-    second.mounts = [];
-    second.mount = async (mountCtx, id) => {
-      second.mounts.push({ ctx: mountCtx, id });
-      return { id: id ?? second.defaultId };
-    };
-    ctx.get = (serviceName) => (serviceName === 'agentPresets' ? second : null);
-
-    const secondId = await published.deps.reviewPresets.preparation({});
-    assert.match(secondId, /^dsh-delegate-review-[0-9a-f]{12}$/);
-    assert.equal(secondId, firstId, 'the instance keeps the id it owns across a swap');
-    assert.equal(first.definitions.size, 0, 'the composition in the old registry is retired');
-    assert.equal(second.definitions.size, 1, 'the new registry gets its own registration');
-    assert.equal(published.deps.reviewPresets.owns(secondId), true);
-
-    await published.reviewPreset.dispose();
-    assert.equal(second.definitions.size, 0);
-    assert.equal(published.deps.reviewPresets.owns(secondId), false);
-  } finally {
-    await cleanup(directory);
-  }
-});
 // Native plugin entry contract.
 //
 // This file exists because of a concrete install blocker, not for symmetry: the
@@ -246,7 +203,6 @@ async function applyWithRealRuntime(options = {}) {
   try {
     await entry.apply(ctx, {
       dataDir: directory,
-      ...(options.reviewPresetImporter === undefined ? {} : { reviewPresetImporter: options.reviewPresetImporter }),
     });
   } finally {
     process.env.DSH_HOME = previousHome;
@@ -261,10 +217,6 @@ async function applyWithRealRuntime(options = {}) {
  * Drive the real `apply` with a preset registry present, and hand back the
  * published face plus a runner that invokes the plugin's own composed unload.
  *
- * `apply`'s disposers are collected by the context stub, but the Cordis-style
- * teardown order only matters for the review preset, so the test calls the
- * published composer's own `dispose` inside a full unload instead of guessing at
- * ordering from the disposer array.
  * @param {object} [options] - `agentPresets`, forwarded to the context.
  * @returns {Promise<object>} the same handle as {@link applyWithRealRuntime}.
  */
@@ -272,6 +224,124 @@ async function applyWithRecorder(options = {}) {
   const handle = await applyWithRealRuntime(options);
   return handle;
 }
+
+/**
+ * Register the managed TaskBridge root through the REAL `apply` composition.
+ *
+ * `apply` hands the published face a `registerWorktreeWorkspace()` closure. This drives
+ * that closure with a recording Workspace controller, so what is asserted is the
+ * production path a fresh install takes — not a stub of it.
+ *
+ * The controller is served from `apply`'s OWN accessor (`ctx.get(name, false)`), so the
+ * recording one is installed on the context and the strictness of that accessor is
+ * exercised rather than bypassed.
+ * @param {object} options - `workspaces` controller, or `null` for a host without one.
+ * @returns {Promise<object>} `{ handle, created, renamed, titled, result }` facts.
+ */
+async function registerRoot(options = {}) {
+  const handle = await applyWithRealRuntime();
+  const created = [];
+  const renamed = [];
+  const record = { created, renamed };
+  const controller = options.workspaces === null ? null : {
+    async create(request) {
+      created.push(request);
+      return { created: true, workspace: { workspaceId: 'ws-root', path: request.path, title: null } };
+    },
+    async rename(request) {
+      renamed.push(request);
+      return { workspace: { workspaceId: request.workspaceId, title: request.title } };
+    },
+  };
+  const base = handle.ctx.get;
+  handle.ctx.get = (name, strict = true) => (name === 'workspaceController' ? controller : base(name, strict));
+  const result = await handle.published.deps.registerWorktreeWorkspace();
+  return { handle, created, renamed, record, result };
+}
+
+test('the managed TaskBridge root is registered under the plugin data directory, created if missing', async () => {
+  const { existsSync, statSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { cleanup } = await import('./helpers/fakes.js');
+  const { handle, created, result } = await registerRoot();
+  try {
+    const root = join(handle.directory, 'dsh-delegate', 'worktrees');
+    assert.equal(result.registered, true, `the root registration reports success (${JSON.stringify(result)})`);
+    assert.equal(created.length, 1, 'exactly one Workspace create');
+    // The real directory the managed worktrees live in: nothing is moved or invented.
+    assert.equal(created[0].path, root);
+    assert.ok(existsSync(root), 'a fresh install creates the root inside the managed data directory');
+    assert.ok(statSync(root).isDirectory());
+    // A second activation is a no-op: one create, no duplicate Workspace.
+    await handle.published.deps.registerWorktreeWorkspace();
+    assert.equal(created.length, 1, 'registration is idempotent');
+  } finally {
+    await cleanup(handle.directory);
+  }
+});
+
+test('a created root Workspace is titled once, and a host without the controller stays loadable', async () => {
+  const { cleanup } = await import('./helpers/fakes.js');
+  const titled = await registerRoot();
+  try {
+    assert.equal(titled.result.registered, true);
+    assert.equal(titled.result.workspaceId, 'ws-root', 'the created Workspace identity is reported back');
+    assert.deepEqual(titled.renamed, [{ workspaceId: 'ws-root', title: 'TaskBridge' }],
+      'the created root is named TaskBridge, so the native tree labels the group');
+  } finally {
+    await cleanup(titled.handle.directory);
+  }
+
+  // No `workspaceController` at all: the plugin must still be loaded and usable.
+  const bare = await registerRoot({ workspaces: null });
+  try {
+    assert.equal(bare.result.registered, false);
+    assert.equal(bare.result.reason, 'WORKSPACES_UNAVAILABLE', 'the refusal is stated, not thrown');
+    assert.ok(bare.handle.published?.deps, 'the plugin published its face regardless');
+    assert.ok([...bare.handle.routes.keys()].length > 0, 'and its HTTP plane is still registered');
+  } finally {
+    await cleanup(bare.handle.directory);
+  }
+});
+
+test('the sidebar integration uses only the host\'s published child slot, never the region itself', async () => {
+  const { readFileSync } = await import('node:fs');
+  const taskEntry = readFileSync(new URL('../src/client/sidebar.jsx', import.meta.url), 'utf8');
+  // The task entry's registration calls are its own: `main` and `sidebar.panellist` only.
+  assert.doesNotMatch(taskEntry, /inject\(\s*['"]sidebar\.workspaces['"]/u,
+    'the task entry must not inject the workspace region');
+  assert.doesNotMatch(taskEntry, /dshdg-ws-/u, 'the task entry must not carry the workspace grouping');
+  // The module that talks to the workspace region does so through the PUBLISHED CHILD slot and
+  // never registers on the parent, so the native rows/names/order/search/menus stay the host's.
+  const view = readFileSync(new URL('../src/client/workspaces-browser.jsx', import.meta.url), 'utf8');
+  assert.match(view, /slots\.inject\(SESSION_ROW_ACTION_SLOT/u, 'it injects the published child slot');
+  assert.doesNotMatch(view, /slots\.inject\(\s*(?:'|")?WORKSPACES_SLOT/u,
+    'and never injects the region itself');
+  assert.doesNotMatch(view, /name:\s*(?:'|")?WORKSPACES_SLOT/u,
+    'nor registers a replacing entry there');
+  // No DOM patching, no host package, no React private field.
+  assert.doesNotMatch(view, /dangerouslySetInnerHTML|innerHTML|__reactFiber|__reactInternalInstance|\._owner/u);
+  assert.doesNotMatch(view, /from\s+'@deepseek-ai\//u, 'no host package is imported');
+  // The applied bundle names the child slot, and does not register the parent.
+  const bundle = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.match(bundle, /sidebar\.workspaces\.session\.row\.action/u, 'the shipped bundle uses the child slot');
+});
+
+test('apply wires only the record entry: no workspace-region view, and the managed root stays registrable', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { cleanup } = await import('./helpers/fakes.js');
+  const handle = await applyWithRealRuntime();
+  try {
+    // The published face still exposes the managed-root registration the tree depends on.
+    assert.equal(typeof handle.published.deps.registerWorktreeWorkspace, 'function');
+    // And nothing in the entry composes a view for the shell's workspace region.
+    const source = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /sidebar\.workspaces/u);
+    assert.match(source, /registerWorktreeWorkspace\(\)/u, 'the root is registered at activation');
+  } finally {
+    await cleanup(handle.directory);
+  }
+});
 
 test('plugin startup refreshes exact shipped Codex agents and leaves unknown files alone', async () => {
   const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import('node:fs');
@@ -306,91 +376,6 @@ test('plugin startup refreshes exact shipped Codex agents and leaves unknown fil
       if (handle !== undefined) await cleanup(handle.directory);
       rmSync(codexHome, { recursive: true, force: true });
     }
-  }
-});
-
-test('apply wires a lazy review composition and registers nothing at activation', async () => {
-  const { nativePresetRegistry } = await import('./helpers/fakes.js');
-  const registry = nativePresetRegistry();
-  registry.mounts = [];
-  registry.mount = async (ctx, id) => {
-    registry.mounts.push({ ctx, id });
-    return { id: id ?? registry.defaultId };
-  };
-  const { published, directory } = await applyWithRecorder({
-    agentPresets: registry,
-    // The real composition mounts native packages this repository does not
-    // depend on; the entry accepts a solver seam so the LIFECYCLE can be tested
-    // without them (see the note in `src/index.js`).
-    reviewPresetImporter: async () => ({ apply() {} }),
-  });
-  const { cleanup } = await import('./helpers/fakes.js');
-  try {
-    assert.notEqual(published, null);
-    // The composition is a request-time concern: registering it during the
-    // plugin's own row activation would sit inside the Host Loader's settle gate.
-    assert.equal(registry.registerCalls, 0, 'no preset may be registered by activation');
-    assert.equal(published.reviewPreset.createdId, null);
-    assert.equal(published.deps.reviewPresets.id, null);
-    assert.equal(published.deps.reviewPresets.owns('anything'), false);
-
-    // The facade prepares over the registry it can currently see, and reports the
-    // namespaced id it created.
-    const id = await published.deps.reviewPresets.preparation({});
-    assert.match(id, /^dsh-delegate-review-[0-9a-f]{12}$/);
-    assert.equal(registry.registerCalls, 1);
-    assert.equal(published.deps.reviewPresets.owns(id), true);
-    // No deployment preset may ever be claimed by this plugin.
-    assert.equal(published.deps.reviewPresets.owns('standard'), false);
-    assert.equal(published.deps.describeRuntime().reviewPreset, id);
-    // The configured default is untouched: a worker run still joins it.
-    assert.equal(registry.defaultId, 'standard');
-    assert.equal(registry.definitions.has('standard'), false);
-    // Only the two filesystem rows were declared.
-    assert.deepEqual(
-      registry.definitions.get(id).config.plugins.map((row) => row.name),
-      ['@deepseek-ai/dsh-tool-fs', '@deepseek-ai/dsh-tool-fs-search'],
-    );
-
-    // Unload releases the composition.
-    await published.reviewPreset.dispose();
-    assert.equal(registry.definitions.has(id), false);
-    assert.equal(published.deps.describeRuntime().reviewPreset, 'not-registered');
-  } finally {
-    await cleanup(directory);
-  }
-});
-
-test('without a preset registry the review composition reports itself unavailable', async () => {
-  const { published, directory, ctx } = await applyWithRecorder({
-    reviewPresetImporter: async () => ({ apply() {} }),
-  });
-  const { cleanup, nativePresetRegistry } = await import('./helpers/fakes.js');
-  try {
-    assert.notEqual(published, null);
-    assert.equal(published.deps.agentPresets, null);
-    assert.equal(published.deps.describeRuntime().presetRegistry, 'unavailable');
-    await assert.rejects(
-      () => published.deps.reviewPresets.preparation({}),
-      (error) => error.code === 'REVIEW_PRESET_UNSUPPORTED',
-    );
-
-    // The facade reads the registry lazily, so a service that appears AFTER the
-    // plugin loaded is still usable �?the composition is not frozen at startup.
-    const late = nativePresetRegistry();
-    late.mounts = [];
-    late.mount = async (mountCtx, id) => {
-      late.mounts.push({ ctx: mountCtx, id });
-      return { id: id ?? late.defaultId };
-    };
-    ctx.get = (name) => (name === 'agentPresets' ? late : null);
-    const id = await published.deps.reviewPresets.preparation({});
-    assert.match(id, /^dsh-delegate-review-[0-9a-f]{12}$/);
-    assert.equal(late.registerCalls, 1);
-    await published.reviewPreset.dispose();
-    assert.equal(late.definitions.size, 0);
-  } finally {
-    await cleanup(directory);
   }
 });
 

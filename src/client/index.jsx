@@ -47,7 +47,7 @@
 // beyond `@deepseek-ai/*` platform modules, which is why the native loader can
 // resolve every external against its frozen platform table.
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 import {
   CONNECTIVITY_LAYERS,
@@ -86,17 +86,21 @@ import {
   grantState,
   isAwaitingPermission,
   isCancellable,
+  executionOf,
+  AGENT_TEAMS_ORIGIN_LABELS,
   hasLiveTasks,
   formatDuration,
   hostReviewLine,
   RECORD_REFRESH_INTERVAL_MS,
   recordRefreshPlan,
+  startRecordsReadLoop,
   reviewNotePreview,
   hasChangingRecords,
   isLiveTask,
   minutesToSeconds,
   monitoringDraftOf,
   monitoringOf,
+  monitoringText,
   pendingPermission,
   permissionSummary,
   planCreateRequest,
@@ -114,8 +118,21 @@ import {
   WAIT_REASON_LABELS,
 } from './api.js';
 import { injectStyles } from './styles.js';
-import { registerTasksNavigation, resolveUiWorkspace, resolveWorkspaces } from './sidebar.jsx';
+import {
+  locateSession, resolveService, resolveUiWorkspace, resolveWorkspaces, taskSessionId,
+} from './sidebar.jsx';
+import { registerSessionRowMarker } from './workspaces-browser.jsx';
+import {
+  cleanupCandidates,
+  cleanupProjection,
+  cleanupSelectionSummary,
+  cleanupWarningText,
+  toggleCleanupSelection,
+  withSelectionState,
+} from './task-cleanup.js';
 import { projectTaskView } from './task-view.js';
+import { TaskRecordsTable } from './task-records-table.jsx';
+import { registerWorkspacesBrowser } from './workspaces-browser.jsx';
 
 /** Plugins-manager config slot this page occupies. */
 export const PLUGIN_CONFIG_SLOT = 'plugins.bundle.config';
@@ -130,6 +147,8 @@ export const PLUGIN_BUNDLE_KEY = 'dsh-taskbridge';
 /** Required client services: slot registration only. */
 export const inject = ['slots'];
 
+const SessionNavigation = createContext(null);
+
 /**
  * Register the bundle configuration page on a client context.
  *
@@ -141,8 +160,8 @@ export const inject = ['slots'];
  * @returns {Function} disposer releasing the registration.
  */
 export function registerBundleConfiguration(ctx, options) {
-  const store = options.store;
-  const injectFace = () => ({ store });
+  const { store, uiWorkspace, workspaces } = options;
+  const injectFace = () => ({ store, uiWorkspace, workspaces });
   return ctx.slots.inject(PLUGIN_CONFIG_SLOT, () => ctx.slots.register({
     name: PLUGIN_CONFIG_SLOT,
     key: PLUGIN_BUNDLE_KEY,
@@ -156,14 +175,55 @@ export function registerBundleConfiguration(ctx, options) {
  */
 export function apply(ctx) {
   ctx.effect(() => injectStyles(globalThis.document), 'dsh-delegate: settings styles');
-  const store = createStore({ api: createApi() });
+  const store = createStore({ api: createApi(), cleanup: cleanupProjection() });
   ctx.effect(() => () => store.dispose(), 'dsh-delegate: settings store');
-  ctx.effect(() => registerBundleConfiguration(ctx, { store }), 'dsh-delegate: bundle configuration');
-  ctx.effect(() => registerTasksNavigation(ctx, {
+  const navigation = {
     store,
     uiWorkspace: () => resolveUiWorkspace(ctx),
     workspaces: () => resolveWorkspaces(ctx),
-  }), 'dsh-delegate: sidebar navigation');
+  };
+  ctx.effect(() => registerBundleConfiguration(ctx, navigation), 'dsh-delegate: bundle configuration');
+  // NO standalone sidebar row for task records.
+  //
+  // `registerTasksNavigation` registers TWO entries at once — the content panel on `main` AND the
+  // row on `sidebar.panellist` — so the row cannot be removed while the panel is kept by any
+  // smaller change. Both are therefore not mounted: the operator reaches the task records through
+  // the plugin's own settings page (`plugins.bundle.config` → 「任务记录」tab), which is the
+  // single, already-shipped entry point, and the sidebar keeps ONLY the host's native workspace
+  // tree (工作区 → TaskBridge → 隔离任务工作区 → 对话). The module stays exported and tested, so a
+  // later host that wants the row back needs one line, not a rewrite.
+  // The TaskBridge sidebar integration. The shell's workspace region stays the HOST's: this
+  // registers only the published per-row child slot (`sidebar.workspaces.session.row.action`), so
+  // every native row, name, order, search box, menu and action is exactly as shipped, and a
+  // dispatched conversation gains one quiet marker inside its own native row.
+  ctx.effect(() => registerSessionRowMarker(ctx, { store }), 'dsh-delegate: dispatched session marker');
+}
+
+/**
+ * The host's own `sidebar.workspaces` entry, when this build can reach it.
+ *
+ * The shell keeps the shipped registration in its slot ledger, and a lower-priority entry can
+ * render that component itself instead of re-implementing (or replacing) it. What is reachable
+ * depends on the host: the shipped entry exposes no component through a published contract, so
+ * this returns `null` unless a host offers one. `null` is the honest answer — the section is then
+ * drawn alone, and the host browser is not claimed.
+ * @param {object} ctx - client context.
+ * @returns {Function | null} the shipped component, or null.
+ */
+export function resolveNativeWorkspaceEntry(ctx) {
+  const get = ctx !== null && typeof ctx === 'object' ? ctx.get : null;
+  if (typeof get !== 'function') return null;
+  for (const name of ['uiWorkspace', 'workspaces']) {
+    let service = null;
+    try {
+      service = get.call(ctx, name);
+    } catch {
+      service = null;
+    }
+    const entry = service?.nativeEntry ?? service?.WorkspaceBrowser ?? null;
+    if (typeof entry === 'function') return entry;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -669,9 +729,7 @@ function ProviderEditor({ provider, store, snapshot, index }) {
                 const target = draft.providers.find((entry) => entry.id === providerId);
                 if (target === undefined) return;
                 target.id = nextId;
-                for (const block of [draft.worker, draft.review]) {
-                  if (block?.providerId === providerId) block.providerId = nextId;
-                }
+                if (draft.worker?.providerId === providerId) draft.worker.providerId = nextId;
               });
             }}
           />
@@ -846,13 +904,10 @@ function ProviderEditor({ provider, store, snapshot, index }) {
                     // A selection pointing at the removed model would be
                     // unroutable; clear it here so the operator sees the
                     // consequence instead of saving an invalid pair.
-                    if (removed !== undefined) {
-                      for (const block of [draft.worker, draft.review]) {
-                        if (block?.providerId === providerId && block?.model === removed.id) {
-                          block.model = null;
-                          block.reasoningEffort = null;
-                        }
-                      }
+                    if (removed !== undefined && draft.worker?.providerId === providerId
+                      && draft.worker.model === removed.id) {
+                      draft.worker.model = null;
+                      draft.worker.reasoningEffort = null;
                     }
                   });
                 }}
@@ -959,9 +1014,9 @@ function ProvidersPanel({ store, snapshot }) {
 
   function isUsed(id) {
     const draft = snapshot.draft ?? {};
-    const selections = [draft.worker, draft.review, ...(draft.presets ?? []).flatMap((preset) => [preset.worker, preset.review])];
+    const selections = [draft.worker, ...(draft.presets ?? []).map((preset) => preset.worker)];
     for (const block of Object.values(draft.projectOverrides ?? {})) {
-      selections.push(block?.worker, block?.review);
+      selections.push(block?.worker);
     }
     return selections.some((selection) => selection?.providerId === id);
   }
@@ -1127,7 +1182,6 @@ function LegacyProvidersPanel({ store, snapshot }) {
  */
 function EffectiveSummary({ label, effective, note }) {
   const worker = effective?.worker ?? {};
-  const review = effective?.review ?? {};
   return (
     <div className="dshdg-card">
       <h4>{label}</h4>
@@ -1138,25 +1192,26 @@ function EffectiveSummary({ label, effective, note }) {
         <dd className="dshdg-mono">{worker.model ?? '（未配置）'}</dd>
         <dt>执行推理强度</dt>
         <dd className="dshdg-mono">{worker.reasoningEffort ?? '（不指定）'}</dd>
-        <dt>超时</dt>
-        <dd>{worker.timeoutSeconds === undefined ? '—' : `${worker.timeoutSeconds} 秒`}</dd>
+        <dt>执行时长</dt>
+        <dd>
+          {effective?.worker?.executionTimeoutSeconds === null || effective?.worker?.executionTimeoutSeconds === undefined
+            ? '不设上限（只由你主动取消）'
+            : `本任务显式上限 ${formatDuration(effective.worker.executionTimeoutSeconds * 1000)}`}
+        </dd>
         <dt>最大并发</dt>
         <dd>{worker.maxParallelism ?? '—'}</dd>
         <dt>工作区隔离</dt>
         <dd>{ISOLATION_LABELS[worker.isolation] ?? worker.isolation ?? '—'}</dd>
         <dt>对话</dt>
         <dd>{CONVERSATION_POLICY_LABEL}</dd>
-        <dt>附加审查</dt>
-        <dd>
-          {review.enabled === true
-            ? `开启 · ${review.providerId ?? '（未配置）'} / ${review.model ?? '（未配置）'} / ${review.reasoningEffort ?? '不指定'}`
-            : '关闭'}
-        </dd>
         <dt>静默监控</dt>
         <dd>
           {effective?.monitoring === null || effective?.monitoring === undefined
             ? '未采集到'
-            : `自检 ${formatDuration(effective.monitoring.selfCheckSeconds * 1000)} · 提醒 ${formatDuration(effective.monitoring.attentionSeconds * 1000)}`}
+            : [
+              `自检 ${monitoringText(effective.monitoring.selfCheckSeconds)}`,
+              `运行进度检查 ${monitoringText(effective.monitoring.attentionSeconds)}`,
+            ].join(' · ')}
         </dd>
       </dl>
       {note === undefined ? null : <p className="dshdg-hint">{note}</p>}
@@ -1189,7 +1244,7 @@ function PresetsCard({ store, snapshot }) {
     <div className="dshdg-card">
       <h4>预设、导出与项目覆盖</h4>
       <p className="dshdg-hint">
-        预设只包含执行/审查组合；导出内容全部是非敏感配置，任何密钥都不会出现（密钥只存在宿主的凭据存储里）。
+        预设保存执行设置，导出的配置不含密钥。
         正在运行的任务保留它自己的生效快照，之后的修改不会改写历史。
       </p>
 
@@ -1215,18 +1270,15 @@ function PresetsCard({ store, snapshot }) {
             store.editDraft((current) => {
               const existing = current.presets.find((entry) => entry.id === presetId);
               const snapshotWorker = clone(current.worker);
-              const snapshotReview = current.review?.enabled === true ? clone(current.review) : null;
               if (existing === undefined) {
                 current.presets.push({
                   id: presetId,
                   name: presetName === '' ? presetId : presetName,
                   worker: snapshotWorker,
-                  ...(snapshotReview === null ? {} : { review: snapshotReview }),
                 });
               } else {
                 existing.name = presetName === '' ? existing.name : presetName;
                 existing.worker = snapshotWorker;
-                existing.review = snapshotReview;
               }
             });
             setPresetId('');
@@ -1250,7 +1302,6 @@ function PresetsCard({ store, snapshot }) {
                   onClick={() => {
                     store.editDraft((current) => {
                       if (preset.worker !== null && preset.worker !== undefined) current.worker = { ...preset.worker };
-                      if (preset.review !== null && preset.review !== undefined) current.review = { ...preset.review };
                     });
                   }}
                 >
@@ -1329,7 +1380,6 @@ function PresetsCard({ store, snapshot }) {
               store.editDraft((current) => {
                 current.providers = next.providers;
                 current.worker = next.worker;
-                current.review = next.review;
                 current.authorization = next.authorization;
                 current.projectOverrides = next.projectOverrides;
                 current.presets = next.presets;
@@ -1400,9 +1450,9 @@ function PresetsCard({ store, snapshot }) {
         />
       </Field>
       <Field
-        label={`覆盖内容（JSON，仅允许 worker / review）`}
+        label="执行覆盖内容（JSON）"
         htmlFor="dshdg-override-json"
-        hint={'例如 {"worker":{"model":"deepseek-chat","reasoningEffort":"high"},"review":{"enabled":false}}'}
+        hint={'例如 {"worker":{"model":"deepseek-chat","reasoningEffort":"high"}}'}
       >
         <textarea
           id="dshdg-override-json"
@@ -1423,7 +1473,7 @@ function PresetsCard({ store, snapshot }) {
               setOverrideError(`无法解析：${String(error?.message ?? error).slice(0, 160)}`);
               return;
             }
-            const unknown = Object.keys(parsed).filter((key) => key !== 'worker' && key !== 'review');
+            const unknown = Object.keys(parsed).filter((key) => key !== 'worker');
             if (unknown.length > 0) {
               setOverrideError(`不支持的字段：${unknown.join('、')}`);
               return;
@@ -1455,18 +1505,24 @@ function PresetsCard({ store, snapshot }) {
 }
 
 /**
- * Advanced monitoring controls for a running task's silence.
+ * Monitoring controls: the two no-progress reminders and the repeated-failure reminder.
+ *
+ * There is exactly ONE time base — consecutive time without real progress — and TWO
+ * duration controls on it: the local self-check (default 10 minutes) and the run progress
+ * check reported to the dispatcher (default 40 minutes). A task that keeps working never
+ * reaches either, whatever its total runtime; a run's length is never itself a reminder.
  *
  * What this card deliberately does NOT do: it does not submit work, does not read a
- * task, does not call a model, and does not create a monitoring process of its own.
- * It edits two numbers and, on the operator's click, sends them to the one narrow
- * authenticated route. Everything it says about the behaviour is a statement about
- * the engine, not a control here.
+ * task, does not call a model, and does not create a monitoring process of its own. It
+ * edits numbers that ride the ordinary settings draft, and everything it says about the
+ * behaviour is a statement about the engine, not a control here. Neither reminder can
+ * cancel, restart or resubmit a task.
  *
  * Units: the operator thinks in minutes, the document stores whole seconds. Each
- * field converts on the way in and out (`minutesToSeconds` / `secondsToMinutes`), so a
- * stored value of 300 s shows as 5 and a value of 90 s shows as 1.5 rather than being
- * rounded into a different setting.
+ * duration field converts on the way in and out (`minutesToSeconds` / `secondsToMinutes`),
+ * so a stored value of 600 s shows as 10 and a value of 90 s shows as 1.5 rather than
+ * being rounded into a different setting. `0` is a real, expressible decision — "this
+ * reminder is off" — and is both displayed and written as `0`.
  * @param {object} props - `store`, `snapshot`.
  * @returns {object} the monitoring card.
  */
@@ -1483,11 +1539,10 @@ function MonitoringCard({ store, snapshot }) {
     || raw.repeatFailureThreshold !== saved.repeatFailureThreshold;
 
   /**
-   * Write one field, converting minutes back to the stored unit.
-   *
-   * The block is spread from the RAW draft, not from `monitoringOf`: normalizing here
-   * would rewrite the operator's other half-typed fields (for example a cleared count)
-   * back to their defaults on every keystroke.
+   * Write one field, converting minutes back to the stored unit. The block is spread
+   * from the RAW draft, not from `monitoringOf`: normalizing here would rewrite the
+   * operator's other half-typed fields (for example a cleared count) back to their
+   * defaults on every keystroke.
    * @param {'selfCheckSeconds' | 'attentionSeconds'} field - target field.
    * @param {unknown} rawMinutes - operator input, in minutes.
    * @returns {void}
@@ -1513,52 +1568,73 @@ function MonitoringCard({ store, snapshot }) {
     });
   };
 
+  /**
+   * One duration control, in minutes, with `0` meaning "off".
+   *
+   * Extracted so the two durations cannot drift apart in units, bounds or wording.
+   * @param {object} props - `id`, `label`, `field`, `value`, `min`, `max`, `hint`.
+   * @returns {object} the field.
+   */
+  const DurationField = ({ id, label, field, value, min, max, hint }) => {
+    const minutes = Number.isFinite(secondsToMinutes(value)) ? secondsToMinutes(value) : '';
+    return (
+      <Field
+        label={label}
+        htmlFor={id}
+        hint={`${min / 60}–${max / 60} 分钟，填 0 表示关闭；存成整秒（当前 ${value === '' ? '未填' : (Number(value) === 0 ? '已关闭' : `${value} 秒`) }）${hint === undefined ? '' : `；${hint}`}`}
+      >
+        <input
+          id={id}
+          type="number"
+          inputMode="decimal"
+          min={0}
+          max={max / 60}
+          step={0.5}
+          value={String(minutes)}
+          onChange={(event) => {
+            const next = event.target.value;
+            // A blank field stays blank (the precheck reports it) instead of becoming
+            // the default or an accidental zero.
+            edit(field, next === '' ? '' : next);
+          }}
+        />
+      </Field>
+    );
+  };
+
   return (
     <div className="dshdg-card" data-dshdg-monitoring="">
-      <h4>进阶：静默监控间隔</h4>
+      <h4>进度与静默监控</h4>
       <p className="dshdg-hint">
-        任务长时间没有新输出时，插件自己会看一眼执行器还在不在（程序自检），再过一段时间才提醒你。
-        <strong>这些检查完全在本机进行，不会调用任何大模型，也不消耗 token。</strong>
+        这两个时长量的是<strong>两件不同的事</strong>。
+        <strong>程序自检</strong>从 DSH <strong>真正开始执行</strong>算起：排队、创建会话、请求受理都不算；
+        模型和工具再活跃也不会推迟它，整个运行只自检一次。
+        <strong>运行进度检查</strong>从<strong>最近一次真正回传给派工方的新成果</strong>算起（第一段基准是运行开始），
+        不是"没有进展"，也不是运行总时长：DSH 内部的模型输出、思考步骤、工具调用与结果，心跳、空轮询、页面刷新、
+        等待授权或等待问题答复、重复失败提醒、检查本身，以及本机自检的结论，<strong>都不算新成果</strong>。
+        当前等待通道只在任务结束时交付成果，所以运行一开始就长时间没有新交付的任务，会在约 40 分钟时被提醒一次。
+        <strong>这些检查完全在本机进行，不会调用任何大模型，也不消耗 token；提醒只是提示，绝不取消、重启或重新提交任务。</strong>
+        任一间隔填 <strong>0</strong> 即关闭对应提醒，两项可以分别关闭。
       </p>
       <div className="dshdg-grid">
-        <Field
+        <DurationField
+          id="dshdg-monitoring-selfcheck"
           label="程序自检间隔（分钟）"
-          htmlFor="dshdg-monitoring-selfcheck"
-          hint={`${LIMITS.selfCheckSecondsMin / 60}–${LIMITS.selfCheckSecondsMax / 60} 分钟；存成整秒（当前 ${raw.selfCheckSeconds === '' ? '未填' : `${raw.selfCheckSeconds} 秒`}）`}
-        >
-          <input
-            id="dshdg-monitoring-selfcheck"
-            type="number"
-            inputMode="decimal"
-            min={LIMITS.selfCheckSecondsMin / 60}
-            max={LIMITS.selfCheckSecondsMax / 60}
-            step={0.5}
-            value={String(Number.isFinite(secondsToMinutes(raw.selfCheckSeconds)) ? secondsToMinutes(raw.selfCheckSeconds) : '')}
-            onChange={(event) => {
-              const value = event.target.value;
-              edit('selfCheckSeconds', value === '' ? '' : value);
-            }}
-          />
-        </Field>
-        <Field
-          label="提醒你的间隔（分钟）"
-          htmlFor="dshdg-monitoring-attention"
-          hint={`${LIMITS.attentionSecondsMin / 60}–${LIMITS.attentionSecondsMax / 60} 分钟，且必须大于自检间隔；存成整秒（当前 ${raw.attentionSeconds === '' ? '未填' : `${raw.attentionSeconds} 秒`}）`}
-        >
-          <input
-            id="dshdg-monitoring-attention"
-            type="number"
-            inputMode="decimal"
-            min={LIMITS.attentionSecondsMin / 60}
-            max={LIMITS.attentionSecondsMax / 60}
-            step={0.5}
-            value={String(Number.isFinite(secondsToMinutes(raw.attentionSeconds)) ? secondsToMinutes(raw.attentionSeconds) : '')}
-            onChange={(event) => {
-              const value = event.target.value;
-              edit('attentionSeconds', value === '' ? '' : value);
-            }}
-          />
-        </Field>
+          field="selfCheckSeconds"
+          value={raw.selfCheckSeconds}
+          min={LIMITS.selfCheckSecondsMin}
+          max={LIMITS.selfCheckSecondsMax}
+          hint="DSH 开始执行后满这么久，本机只读检查一次，不需要你在看页面"
+        />
+        <DurationField
+          id="dshdg-monitoring-attention"
+          label="运行进度检查（分钟）"
+          field="attentionSeconds"
+          value={raw.attentionSeconds}
+          min={LIMITS.attentionSecondsMin}
+          max={LIMITS.attentionSecondsMax}
+          hint="从最近一次真实回传的新成果起算；两项都开启时必须大于自检间隔"
+        />
         <Field
           label="重复失败提醒（次）"
           htmlFor="dshdg-monitoring-repeat"
@@ -1578,22 +1654,110 @@ function MonitoringCard({ store, snapshot }) {
       </div>
       {problems.length === 0 ? null : <p className="dshdg-fail">{problems.join('；')}</p>}
       <ul className="dshdg-hint">
-        <li>「没有新进展」本身不等于失败：插件不会因为安静、也不会因为单个工具跑得久就判定任务失败。</li>
-        <li>只有确实没有进展、并且超过「提醒你的间隔」之后，才会把这件事报告给派工方。</li>
-        <li>重复失败提醒与上面两个间隔<strong>互相独立</strong>：它数的是同一操作连续失败了几次，而不是安静了多久，所以正在忙碌地反复失败也会被提醒。它只提醒一次，不会自动取消任务、更换模型或改动超时。</li>
+        <li>「没有新成果回传」本身不等于失败：插件不会因为安静、也不会因为单个工具跑得久就判定任务失败。</li>
+        <li>只有<strong>连续</strong>没有新成果回传、并且超过「运行进度检查」之后，才会把这件事报告给派工方核对一次目标；同一段间隔最多报告一次，真实回传新成果后会重新计时。</li>
+        <li>提醒不依赖任务总运行时长：跑上几小时但一直在回传新成果，就不会有提醒；也没有「总执行超时」这种按总时长中止的设置。</li>
+        <li>重复失败提醒与上面两个间隔<strong>互相独立</strong>：它数的是同一操作连续失败了几次，而不是多久没有回传，所以正在忙碌地反复失败也会被提醒。它只提醒一次，不会自动取消任务或更换模型。</li>
         <li>修改只影响<strong>之后新提交</strong>的任务；已经运行的任务保留它开始时的那份间隔快照。</li>
-        <li>程序自检只读取本机已有的事实（任务是否还在、当前阶段、有没有待决定的调用、正在跑哪个工具），不读取代码差异，也不会读取你的文件内容。</li>
+        <li>程序自检只读取本机已有的事实（任务是否还在、当前阶段、有没有待决定的调用、正在跑哪个工具，以及"未回传多久"和"DSH 正在做什么"），不读取代码差异，也不会读取你的文件内容；即使没有人正在等待，任务详情也能看到它已做的自检。读到自检结论只是读诊断，不会重置运行进度检查的计时。</li>
       </ul>
       <div className="dshdg-row" data-dshdg-monitoring-status="">
         <span className="dshdg-hint" role="status" aria-live="polite">
           {dirty
             ? '与已保存的值不同，正在自动保存（与整份设置走同一个串行保存队列）。'
-            : `已保存：自检 ${saved.selfCheckSeconds} 秒，提醒 ${saved.attentionSeconds} 秒。`}
+            : `已保存：自检 ${saved.selfCheckSeconds} 秒，运行进度检查 ${saved.attentionSeconds} 秒。`}
         </span>
       </div>
       <p className="dshdg-hint">
         这几项也是整份设置文档的一部分，随其它设置一起自动保存；没有单独的保存按钮。
       </p>
+    </div>
+  );
+}
+
+/**
+ * The operator's control over the Agent Teams default for NEW tasks.
+ *
+ * This is NOT DSH's global switch and it does not pretend to be: it decides only what a
+ * NEW delegated task does when its dispatcher stated no per-task choice. Three facts the
+ * card states, because each one is a place an operator could otherwise be surprised:
+ *
+ *  1. a per-task choice from the dispatcher always wins over this default;
+ *  2. a follow-up (`continueFromTaskId`) keeps the mode of the task it continues, so this
+ *     default never flips a chain mid-way;
+ *  3. it changes only later submissions — a task that already started keeps the decision
+ *     it froze at admission.
+ *
+ * A choice that CANNOT be applied (an older DSH without the service) is refused before
+ * the worker is prompted, and the task detail says why; the card says so instead of
+ * implying that "on" always means "on".
+ * @param {object} props - `store`, `snapshot`.
+ * @returns {object} the agent-teams card.
+ */
+function AgentTeamsCard({ store, snapshot }) {
+  const draft = snapshot.draft;
+  const raw = executionOf(draft).agentTeamsDefault;
+  const saved = executionOf(snapshot.settings).agentTeamsDefault;
+  const dirty = raw !== saved;
+  const enabled = raw === true;
+  /**
+   * Write the switch as a discrete decision.
+   *
+   * A checkbox is one decision, not typing, so the draft edit is saved immediately
+   * instead of waiting out the text debounce. The shared save queue keeps it serialized
+   * with any other pending edit.
+   * @param {boolean} next - the new default.
+   * @returns {void}
+   */
+  const edit = (next) => {
+    store.editDraft((current) => {
+      current.execution = { ...executionOf(current), agentTeamsDefault: next };
+    }, { immediate: true });
+  };
+  return (
+    <div className="dshdg-card" data-dshdg-agent-teams="">
+      <h4>智能体协作（Agent Teams）</h4>
+      <p className="dshdg-hint">
+        这一项只决定<strong>新派工在看不出单次选择时</strong>用哪种协作方式，不是 DSH 的全局开关：
+        插件只写这条任务自己的会话，不会打开 DSH 的全局「默认开启」，也不会影响你在 DSH 里手动改过设置的会话。
+      </p>
+      <label className="dshdg-row" htmlFor="dshdg-agent-teams-default">
+        <input
+          id="dshdg-agent-teams-default"
+          type="checkbox"
+          checked={enabled}
+          onChange={(event) => { edit(event.target.checked); }}
+        />
+        <span>新任务默认开启智能体协作</span>
+      </label>
+      <p className="dshdg-hint">
+        当前已保存：<strong>{saved ? '新任务默认开启' : '新任务默认关闭'}</strong>。
+        升级安装和首次安装都是<strong>关闭</strong>，插件不会替你打开。
+      </p>
+      <ul className="dshdg-hint">
+        <li>派工方在单次派工里明确开/关时，<strong>以单次选择为准</strong>，这里的默认不生效。</li>
+        <li>只影响<strong>之后新提交</strong>的任务；已经开始的任务保留它开始时冻结的选择，改这里不会改动它。</li>
+        <li>
+          续接已有任务（<code>continueFromTaskId</code>）且没有新的单次选择时：
+          原任务记录过协作选择就<strong>沿用那条记录</strong>；
+          原任务没有记录过（旧记录），插件<strong>不套用这里的默认、也不写入任何协作值</strong>，
+          那条原生会话当前的选择保持不变。
+        </li>
+        <li>
+          当前 DSH 没有智能体协作能力时，<strong>明确的开/关都会在发送提示词之前被拒绝并写明原因</strong>，
+          不会悄悄按会话原有模式跑起来。只有「默认隐式关闭」这一种情况会继续执行，
+          并如实报告<strong>未应用</strong>（不是「已关闭」），这样旧版本的普通派工仍然可用。
+        </li>
+        <li>一个外层任务始终只占<strong>一个会话和一个并发名额</strong>：子智能体由 DSH 大会话内部管理，不会额外占用本插件的名额。</li>
+        <li>取消任务照常可用：随时可以取消运行中的任务，协作选择不影响取消。</li>
+      </ul>
+      <div className="dshdg-row" data-dshdg-agent-teams-status="">
+        <span className="dshdg-hint" role="status" aria-live="polite">
+          {dirty
+            ? '与已保存的值不同，正在自动保存（与整份设置走同一个串行保存队列）。'
+            : `已保存：新任务默认${saved ? '开启' : '关闭'}智能体协作。`}
+        </span>
+      </div>
     </div>
   );
 }
@@ -1629,23 +1793,12 @@ function ExecutionPanel({ store, snapshot }) {
       />
       <div className="dshdg-grid">
         <IntegerField
-          id="dshdg-worker-timeout"
-          label="超时（秒）"
-          value={worker.timeoutSeconds}
-          min={LIMITS.timeoutSecondsMin}
-          max={LIMITS.timeoutSecondsMax}
-          hint={`${LIMITS.timeoutSecondsMin}–${LIMITS.timeoutSecondsMax}`}
-          onChange={(value) => {
-            store.editDraft((current) => { current.worker.timeoutSeconds = value; });
-          }}
-        />
-        <IntegerField
           id="dshdg-worker-parallelism"
           label="最大并发"
           value={worker.maxParallelism}
           min={LIMITS.maxParallelismMin}
           max={LIMITS.maxParallelismMax}
-          hint={`${LIMITS.maxParallelismMin}–${LIMITS.maxParallelismMax}，超出会被拒绝而不是自动调整`}
+          hint={`${LIMITS.maxParallelismMin}–${LIMITS.maxParallelismMax}，超出会被拒绝而不是自动调整。限制的是本插件同时接纳的派工数：按到达顺序争取名额，超出会被拒绝而不是排队；准备中、运行中和等待授权的任务都算占用，执行器确认结束后才让位。每个独立工作包各占一个名额；同一来源的隔离任务可开成独立会话并行，共享目录一次只跑一个；智能体协作的子智能体只在会话内部，不计入名额。`}
           onChange={(value) => {
             store.editDraft((current) => { current.worker.maxParallelism = value; });
           }}
@@ -1676,6 +1829,11 @@ function ExecutionPanel({ store, snapshot }) {
         </Field>
       </div>
       <p className="dshdg-hint">
+        任务<strong>没有总执行时长上限</strong>：不会因为跑得久被自动中止，只有你主动取消才会停止。
+        长时间没有进展由下面的「进度与静默监控」提醒你判断，提醒本身不会取消、重启或重新提交任务。
+        旧版本存下的「超时」值仍会被读取，但不再限制新任务。
+      </p>
+      <p className="dshdg-hint">
         不会自动回退到别的模型，也不会隐式使用 Harness 默认模型：选中的组合不可路由时任务直接拒绝。
       </p>
       <p className="dshdg-hint">
@@ -1693,6 +1851,7 @@ function ExecutionPanel({ store, snapshot }) {
         />
       )}
       <MonitoringCard store={store} snapshot={snapshot} />
+      <AgentTeamsCard store={store} snapshot={snapshot} />
       {served === null ? (
         <p className="dshdg-faint">宿主尚未回报实际生效值（模型目录不可用或尚未加载）。</p>
       ) : (
@@ -1708,77 +1867,52 @@ function ExecutionPanel({ store, snapshot }) {
 }
 
 // ---------------------------------------------------------------------------
-// Additional review
-// ---------------------------------------------------------------------------
-
-/** @param {object} props @returns {object} the review panel. */
-function ReviewPanel({ store, snapshot }) {
-  const draft = snapshot.draft;
-  const providers = draft?.providers ?? [];
-  const review = draft?.review ?? { enabled: false };
-  const enabled = review.enabled === true;
-  const worker = draft?.worker ?? {};
-  const sameRoute = enabled
-    && review.providerId === (worker.providerId ?? null)
-    && review.model === (worker.model ?? null);
-  if (draft === null) return <p className="dshdg-faint">正在读取设置…</p>;
-  return (
-    <div className="dshdg-panel">
-      <div className="dshdg-card">
-        <div className="dshdg-row">
-          <label htmlFor="dshdg-review-enabled">
-            <input
-              id="dshdg-review-enabled"
-              type="checkbox"
-              checked={enabled}
-              onChange={(event) => {
-                // A SWITCH is one discrete decision: save it at once.
-                store.editDraft((current) => { current.review.enabled = event.target.checked; }, { immediate: true });
-              }}
-            />
-            {' '}启用附加模型审查（默认关闭）
-          </label>
-          <span className="dshdg-spacer" />
-          <Badge tone={enabled ? 'on' : 'off'}>{enabled ? '已启用' : '关闭'}</Badge>
-        </div>
-        <p className="dshdg-muted">
-          附加审查是独立的只读检查：它读交付的 diff 与证据，给出建议，但<strong>不能</strong>代替宿主验收、不能修改文件、
-          也不会触发自动修复循环。它和本机调用开关相互独立。
-        </p>
-        {sameRoute ? (
-          <p className="dshdg-fail">
-            审查与执行的提供方/模型相同，独立性问题无法保证；建议换一个模型。宿主可能会拒绝这种组合。
-          </p>
-        ) : null}
-      </div>
-      {enabled ? (
-        <SelectionFields
-          providers={providers}
-          idPrefix="dshdg-review"
-          value={{
-            providerId: review.providerId ?? null,
-            model: review.model ?? null,
-            reasoningEffort: review.reasoningEffort ?? null,
-          }}
-          onChange={(next) => {
-            // Review provider/model/effort are SELECTS: saved at once.
-            store.editDraft((current) => {
-              current.review.providerId = next.providerId;
-              current.review.model = next.model;
-              if ('reasoningEffort' in next) current.review.reasoningEffort = next.reasoningEffort;
-            }, { immediate: true });
-          }}
-        />
-      ) : (
-        <p className="dshdg-faint">关闭时不创建审查代理，也不发出任何审查请求。</p>
-      )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Task records
 // ---------------------------------------------------------------------------
+
+/**
+ * One readable sentence about a task's Agent Teams decision, for the detail panel.
+ *
+ * The THREE facts are kept apart here on purpose, because collapsing them is how a
+ * record starts lying about what happened:
+ *
+ *  * the CHOICE that was frozen on the task (`agentTeams`) and where it came from
+ *    (`agentTeamsOrigin`) — a per-task request, an inherited chain, or the operator's
+ *    new-task default;
+ *  * what DSH actually CONFIRMED (`team.applied` / `team.enabled`);
+ *  * why it could not be applied (`team.reason`), which is a refusal, not a downgrade.
+ *
+ * A record written before the origin existed has no origin and is reported as such
+ * rather than being attributed to anybody.
+ * @param {object} task - task view.
+ * @returns {string} the line.
+ */
+function teamLine(task) {
+  const requested = typeof task?.agentTeams === 'boolean' ? task.agentTeams : null;
+  if (requested === null) {
+    // The honest "nothing was decided here" answer. It is what a continuation of a task
+    // that recorded no choice looks like: the plugin applied nothing, so the native
+    // Session keeps whatever mode it already had. Saying "off" would be a claim nobody
+    // observed.
+    return '本次未指定协作方式：原任务没有记录过选择，插件没有写入任何协作值，该会话保持它当前的选择。';
+  }
+  const origin = AGENT_TEAMS_ORIGIN_LABELS[task.agentTeamsOrigin] ?? '来源未记录';
+  const choice = `选择「${requested ? '开启' : '关闭'}」· ${origin}`;
+  const team = task.team;
+  if (team === null || team === undefined) {
+    return `${choice}；本次运行尚未回报实际生效结果。`;
+  }
+  if (team.applied === true) {
+    return `${choice}；DSH 已确认本次会话实际为「${team.enabled === true ? '开启' : '关闭'}」。`;
+  }
+  if (team.reason === 'service-absent-default-off') {
+    // The one case that proceeds without the capability: the operator's implicit off
+    // default on a host that has no agent-teams service. It must NOT read as "off".
+    return `${choice}；当前 DSH 没有智能体协作能力，未应用（也没有声称该会话已关闭），任务照常执行。`;
+  }
+  const reason = typeof team.reason === 'string' && team.reason !== '' ? team.reason : '未说明原因';
+  return `${choice}；未能生效（${reason}），该任务不会在旧模式下继续执行。`;
+}
 
 /**
  * The full recorded review note of one task, expandable and copyable.
@@ -1859,6 +1993,40 @@ function ReviewNoteDetail({ task, store }) {
   );
 }
 
+function OpenTaskSession({ store, taskId }) {
+  const navigation = useContext(SessionNavigation);
+  const [opening, setOpening] = useState(false);
+  const [feedback, setFeedback] = useState(null);
+  // The list can restore a legacy record's session through its saved identity.
+  const recorded = store.getSnapshot().tasks?.find((row) => row.taskId === taskId);
+  const sessionId = taskSessionId(recorded);
+  if (navigation === null) return null;
+
+  async function open() {
+    setOpening(true);
+    setFeedback(null);
+    try {
+      const outcome = await locateSession(
+        resolveService(navigation.uiWorkspace), sessionId, resolveService(navigation.workspaces),
+      );
+      if (!outcome.ok) setFeedback(outcome.message);
+    } finally {
+      setOpening(false);
+    }
+  }
+
+  return (
+    <div className="dshdg-row">
+      <button type="button" data-dshdg-open-session={taskId} disabled={opening || sessionId === null}
+        onClick={() => { void open(); }}>
+        打开会话
+      </button>
+      {sessionId === null ? <span className="dshdg-hint">这条记录没有可定位的会话。</span> : null}
+      {feedback === null ? null : <span className="dshdg-warn" role="status">{feedback}</span>}
+    </div>
+  );
+}
+
 /**
  * One task's details: effective config, diff, evidence, usage, review outcome.
  * @param {object} props - `store`, `task`.
@@ -1875,8 +2043,11 @@ function TaskDetail({ store, task }) {
   // `view()` freezes the configuration that actually ran; a later settings edit
   // does not retroactively change what a finished task reports.
   const worker = task.effective?.worker ?? {};
-  const review = task.review ?? null;
-  const reviewState = review === null ? 'not_run' : (review.state ?? 'not_run');
+  const legacyReview = task.review;
+  const legacyReviewState = legacyReview?.state;
+  const legacyVerdict = typeof legacyReview?.verdict === 'string' ? legacyReview.verdict : legacyReview?.verdict?.verdict;
+  const showLegacyReview = legacyReviewState === 'completed' || legacyReviewState === 'failed'
+    || legacyReviewState === 'cancelled';
   const diff = task.diff ?? null;
   const execution = task.execution ?? null;
   const error = task.error ?? execution?.error ?? null;
@@ -1905,6 +2076,7 @@ function TaskDetail({ store, task }) {
         </button>
       </div>
       <p className="dshdg-muted">{outcome.note}</p>
+      <OpenTaskSession key={task.taskId} store={store} taskId={task.taskId} />
 
       <div className="dshdg-card" data-dshdg-task-progress="">
         <h4>进展</h4>
@@ -1966,19 +2138,16 @@ function TaskDetail({ store, task }) {
         </dd>
         <dt>重复失败提醒</dt>
         <dd>{repeatFailureLine(activity)}</dd>
+        <dt>智能体协作</dt>
+        <dd data-dshdg-task-team="">
+          {teamLine(task)}
+        </dd>
         <dt>创建</dt>
         <dd>{formatTime(task.createdAt)}</dd>
         <dt>结束</dt>
         <dd>{formatTime(task.endedAt)}</dd>
         <dt>用量</dt>
         <dd>{execution?.usage === null || execution?.usage === undefined ? '不可用' : boundedText(execution.usage, 600)}</dd>
-        <dt>附加审查</dt>
-        <dd>
-          {REVIEW_STATE_LABELS[reviewState] ?? reviewState}
-          {review?.verdict === null || review?.verdict === undefined
-            ? ''
-            : ` · ${REVIEW_VERDICT_LABELS[review.verdict] ?? review.verdict}`}
-        </dd>
         <dt>宿主验收</dt>
         <dd>{hostReviewLine(task, formatTime)}</dd>
         <dt>完整审查意见</dt>
@@ -2007,12 +2176,13 @@ function TaskDetail({ store, task }) {
         </>
       )}
 
-      {review?.text === undefined || review?.text === null || review.text === '' ? null : (
-        <>
-          <h4>审查发现</h4>
-          <pre className="dshdg-pre">{boundedText(review.text, 8000)}</pre>
-        </>
-      )}
+      {showLegacyReview ? (
+        <details>
+          <summary>历史模型复审 · {REVIEW_STATE_LABELS[legacyReviewState] ?? legacyReviewState}</summary>
+          {legacyVerdict ? <p>{REVIEW_VERDICT_LABELS[legacyVerdict] ?? legacyVerdict}</p> : null}
+          {legacyReview.text ? <pre className="dshdg-pre">{boundedText(legacyReview.text, 8000)}</pre> : null}
+        </details>
+      ) : null}
 
       <h4>本次调用授权</h4>
       <p className={isAwaitingPermission(task) ? 'dshdg-hint' : 'dshdg-faint'}>{permission.note}</p>
@@ -2062,102 +2232,32 @@ function TaskDetail({ store, task }) {
 }
 
 /** @param {object} props @returns {object} the task records panel. */
-/**
- * Bounded, program-driven task refresh.
- *
- * Every condition here exists to keep a *visible page* from doing work on its own:
- *
- *  * it runs ONLY while the tasks tab is mounted (the effect lives in `TasksPanel`),
- *    so switching tabs or unmounting clears the timer;
- *  * it runs while any RECORD may still change — a running task, a task awaiting host
- *    review, or a review that is still being written — not only while something is
- *    executing. A finished run's conclusion is written by the commander, and a page that
- *    stopped polling when execution ended would never show it;
- *  * it stops once every visible record is settled (the conclusion is durable);
- *  * it skips a hidden document and registers a `visibilitychange` listener so returning
- *    to the tab reads immediately instead of waiting out the interval;
- *  * it never overlaps: a refresh in flight suppresses the next tick;
- *  * it is a pure read of the task list — no model call, no task action, no settings
- *    write — so it cannot disturb an unsaved draft or the selected task;
- *  * a failed refresh keeps the records already shown and states the failure.
- * @param {object} props - `store`, `snapshot`, `intervalMs`.
- * @returns {object | null} nothing (side effects only).
- */
-function useTaskAutoRefresh({ store, snapshot, intervalMs = RECORD_REFRESH_INTERVAL_MS }) {
-  const plan = recordRefreshPlan({
+/** Refresh the task list while this panel is mounted and the document is visible. */
+function useTaskAutoRefresh({ store, snapshot }) {
+  const plan = recordRefreshPlan({ tasks: snapshot.tasks, selectedTask: snapshot.taskDetail });
+  const latest = useRef({
     tasks: snapshot.tasks,
     selectedTask: snapshot.taskDetail,
-    visible: globalThis.document?.hidden !== true,
     loading: snapshot.loading?.tasks === true,
+    hydrated: snapshot.tasksLoaded === true,
   });
-  const changing = hasChangingRecords([
-    ...(Array.isArray(snapshot.tasks) ? snapshot.tasks : []),
-    ...(snapshot.taskDetail === null || snapshot.taskDetail === undefined ? [] : [snapshot.taskDetail]),
-  ]);
-  // Read through a ref so the effect does not restart on every store revision: a
-  // restarted effect would reset the timer constantly and effectively poll far
-  // faster than the interval.
-  const changingRef = useRef(changing);
-  changingRef.current = changing;
+  latest.current = {
+    tasks: snapshot.tasks,
+    selectedTask: snapshot.taskDetail,
+    loading: snapshot.loading?.tasks === true,
+    hydrated: snapshot.tasksLoaded === true,
+  };
   const [refreshError, setRefreshError] = useState(null);
 
   useEffect(() => {
-    if (!changing) return undefined;
-    let timer = null;
-    let disposed = false;
-    let inFlight = false;
-
-    const schedule = () => {
-      if (disposed) return;
-      if (timer !== null) clearTimeout(timer);
-      timer = setTimeout(tick, intervalMs);
-      timer.unref?.();
-    };
-
-    const read = () => {
-      if (inFlight) return;
-      inFlight = true;
-      setRefreshError(null);
-      void store.refreshTasks('auto').then((result) => {
-        // A failed read keeps the records already shown (the store does not clear them) and
-        // is stated as a refresh problem — never as a lost task or a failed execution.
-        if (result?.ok === false) setRefreshError(describeError(result.error));
-      }).finally(() => {
-        inFlight = false;
-        schedule();
-      });
-    };
-
-    const tick = () => {
-      timer = null;
-      if (disposed) return;
-      // A hidden tab is not watching anything: skip the read entirely, and let the
-      // visibility listener below schedule the next one when it comes back.
-      if (globalThis.document?.hidden === true) return;
-      if (!changingRef.current) return;
-      read();
-    };
-
-    const onVisibility = () => {
-      if (globalThis.document?.hidden === true) return;
-      if (!changingRef.current) return;
-      if (timer !== null) clearTimeout(timer);
-      timer = null;
-      // Coming back to the page reads once IMMEDIATELY: the operator must not wait out
-      // an interval to see what changed while the tab was hidden.
-      read();
-    };
-
-    schedule();
-    const doc = globalThis.document;
-    doc?.addEventListener?.('visibilitychange', onVisibility);
-    return () => {
-      disposed = true;
-      if (timer !== null) clearTimeout(timer);
-      timer = null;
-      doc?.removeEventListener?.('visibilitychange', onVisibility);
-    };
-  }, [store, changing, intervalMs]);
+    // The SAME loop the sidebar view uses: one policy for every surface showing the
+    // shared task records, so neither can miss a task dispatched from outside.
+    return startRecordsReadLoop({
+      store,
+      readState: () => latest.current,
+      onError: (error) => { setRefreshError(error === null ? null : describeError(error)); },
+    });
+  }, [store]);
   return { ...plan, refreshError };
 }
 
@@ -2242,6 +2342,12 @@ function TaskListNote({ task, onOpen }) {
 // EXISTING store actions and the EXISTING `TaskDetail` panel. Every click carries a
 // stable `taskId`, so a later background refresh (which replaces the whole tree)
 // cannot re-point a button at a different task.
+//
+// "清理记录" adds ONE more: selection mode. While it is on, every execution chain
+// of the tree gets a checkbox whose state comes from the host's own `cleanup` block
+// (`eligible` + `blockers`). The selection holds the chain's EXACT task ids, the bar
+// counts them before anything is sent, and only a confirmed batch is written. Cancel
+// sends nothing, and the panel never deletes on render, on refresh or on open.
 
 /** How many rounds of one chain are listed without expanding that chain further. */
 const CHAIN_ROUNDS_VISIBLE = 3;
@@ -2295,17 +2401,56 @@ function chainsOfTreeNode(node) {
   return node.chain ? [node.chain] : [];
 }
 
-function ChainRounds({ chain, store, snapshot, onOpen, expanded, onToggle }) {
-  const rounds = chain.rounds ?? [];
+/**
+ * One execution chain: its rounds, plus — in selection mode — its cleanup checkbox.
+ *
+ * The checkbox is the ONLY control that changes the cleanup selection, and it is
+ * driven entirely by the host's `cleanup` block on this chain: a chain the host says
+ * is ineligible is drawn disabled with the reason, so a refusal can never be produced
+ * by a row the page offered as removable.
+ * @param {object} props - `chain`, `store`, `snapshot`, `onOpen`, `expanded`, `onToggle`,
+ *   `cleanup` (`{ active, selection, candidates, onToggle }` or null), `forceExpanded`,
+ *   `newestFirst` (draw the last round, i.e. the one carrying the live session, first).
+ * @returns {object} the chain block.
+ */
+function ChainRounds({ chain, store, snapshot, onOpen, expanded, onToggle, cleanup, forceExpanded, newestFirst = false }) {
+  const ordered = chain.rounds ?? [];
+  // The NEWEST round is the only one that can still own a live native session, so the
+  // 最近任务 detail lists it first; the PROJECT TREE keeps the recorded order (first
+  // round, then rectification rounds), which is what the operator reads there.
+  const rounds = newestFirst ? [...ordered].reverse() : ordered;
+  const roundOf = (task) => (ordered.findIndex((entry) => entry.taskId === task.taskId) + 1);
+  const candidate = cleanup?.candidates?.find((entry) => entry.chainId === chain.chainId) ?? null;
+  const checked = candidate !== null
+    && Array.isArray(cleanup?.selection?.[chain.chainId]);
   return (
     <div className="dshdg-tree-execution" data-dshdg-chain={chain.chainId}>
+      {cleanup?.active === true && candidate !== null ? (
+        <div className="dshdg-cleanup-row" data-dshdg-cleanup-row={chain.chainId}>
+          <label className="dshdg-cleanup-check">
+            <input
+              type="checkbox"
+              data-dshdg-cleanup-check={chain.chainId}
+              checked={checked}
+              disabled={!candidate.selectable || snapshot.loading?.cleanup === true}
+              onChange={() => cleanup.onToggle(candidate)}
+            />
+            {`勾选整条执行链（${candidate.taskIds.length} 轮）`}
+          </label>
+          {candidate.selectable ? null : (
+            <span className="dshdg-faint" data-dshdg-cleanup-blocked={chain.chainId}>{candidate.reason}</span>
+          )}
+        </div>
+      ) : null}
       <ul className="dshdg-tree-rounds">
-        {rounds.map((task, index) => expanded || index >= rounds.length - CHAIN_ROUNDS_VISIBLE || task.taskId === snapshot.taskDetail?.taskId ? (
-          <ChainRoundRow key={task.taskId} store={store} round={{ task, round: index + 1,
-            position: index === 0 ? 'first' : 'rectification' }} snapshot={snapshot} onOpen={onOpen} />
-        ) : null)}
+        {rounds.map((task, index) => (newestFirst
+          || expanded || forceExpanded || index >= rounds.length - CHAIN_ROUNDS_VISIBLE
+          || task.taskId === snapshot.taskDetail?.taskId ? (
+            <ChainRoundRow key={task.taskId} store={store} round={{ task, round: roundOf(task),
+              position: roundOf(task) === 1 ? 'first' : 'rectification' }} snapshot={snapshot} onOpen={onOpen} />
+          ) : null))}
       </ul>
-      {rounds.length > CHAIN_ROUNDS_VISIBLE ? <button type="button" data-dshdg-chain-more={chain.chainId}
+      {!forceExpanded && !newestFirst && rounds.length > CHAIN_ROUNDS_VISIBLE ? <button type="button" data-dshdg-chain-more={chain.chainId}
         onClick={onToggle} aria-expanded={expanded}>
         {expanded ? '只看最近三轮' : '显示全部 ' + rounds.length + ' 轮'}
       </button> : null}
@@ -2400,7 +2545,7 @@ function ChainRoundRow({ store, round, snapshot, onOpen }) {
  *   `expandedRounds`, `setExpandedRounds`, `onOpen`.
  * @returns {object} the node.
  */
-function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expandedRounds, setExpandedRounds, onOpen, onArchive, forceOpen }) {
+function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expandedRounds, setExpandedRounds, onOpen, onArchive, forceOpen, cleanup }) {
   const children = Array.isArray(node.children) ? node.children : [];
   const key = node.nodeId;
   const open = forceOpen || !collapsed.has(key);
@@ -2458,7 +2603,8 @@ function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expanded
           {goal === null ? null : <p className="dshdg-hint">{`目标：${boundedText(goal, 400)}`}</p>}
           {completion === null ? null : <p className="dshdg-hint">{`已完成：${boundedText(completion, 400)}`}</p>}
           {chains.map((chain) => <ChainRounds key={chain.chainId} chain={chain} store={store} snapshot={snapshot}
-            onOpen={onOpen} expanded={expandedRounds.has(chain.chainId)} onToggle={() => setExpandedRounds((old) => {
+            onOpen={onOpen} expanded={expandedRounds.has(chain.chainId)} forceExpanded={forceOpen}
+            cleanup={cleanup} onToggle={() => setExpandedRounds((old) => {
               const next = new Set(old);
               if (next.has(chain.chainId)) next.delete(chain.chainId);
               else next.add(chain.chainId);
@@ -2479,6 +2625,7 @@ function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expanded
                   onOpen={onOpen}
                   onArchive={onArchive}
                   forceOpen={forceOpen}
+                  cleanup={cleanup}
                 />
               ))}
             </ul>
@@ -2491,12 +2638,21 @@ function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expanded
 
 function TaskTreePanel({ store, snapshot, onOpen }) {
   const view = snapshot.tree ?? null;
+  const [recordView, setRecordView] = useState('recent');
   const [collapsed, setCollapsed] = useState(() => new Set());
   const [expandedRounds, setExpandedRounds] = useState(() => new Set());
   const [projectKey, setProjectKey] = useState('');
   const [filter, setFilter] = useState('all');
   const [search, setSearch] = useState('');
+  const [fromDay, setFromDay] = useState('');
+  const [toDay, setToDay] = useState('');
   const [archiveError, setArchiveError] = useState(null);
+  // Selection mode. `cleanupSelection` maps a chain id to the EXACT task ids that
+  // were ticked; `cleanupConfirm` opens the confirmation, which is the only place a
+  // batch is sent. Leaving the mode (or cancelling) clears both.
+  const [cleanupMode, setCleanupMode] = useState(false);
+  const [cleanupSelection, setCleanupSelection] = useState({});
+  const [cleanupConfirm, setCleanupConfirm] = useState(false);
   if (view === null) {
     return <p className="dshdg-faint" data-dshdg-tree-unavailable="">
       {snapshot.tasksError ? '任务树读取失败，下面显示已有记录。' : '当前宿主按列表显示任务。'}
@@ -2504,43 +2660,213 @@ function TaskTreePanel({ store, snapshot, onOpen }) {
   }
   const counts = view.counts ?? {};
   const canArchive = view.displayArchiveAvailable === true;
-  const { groups, archiveCount } = projectTaskView(view, {
+  const dateRange = { from: fromDay, to: toDay };
+  const { groups, recent, archiveCount, dateError, dateRangeText } = projectTaskView(view, {
     projectKey, filter: canArchive ? filter : (filter === 'archive' ? 'all' : filter), search,
     selectedTaskId: snapshot.taskDetail?.taskId ?? null,
+    dateRange,
   });
+  // A reversed range is stated and NOT applied: the page keeps showing what it
+  // showed before rather than answering a different question than the one asked.
+  // The projection has already applied exactly the same rule to the same values.
+  const rangeActive = dateError === null && (dateRange.from !== '' || dateRange.to !== '');
+  const roots = recordView === 'recent'
+    ? recent.map(({ chain, node }) => ({ nodeId: node.nodeId, kind: node.kind, chain }))
+    : groups.flatMap((group) => group.roots);
+  const candidates = cleanupCandidates({ roots });
+  const canCleanup = view.cleanupAvailable === true && (view.counts?.taskChains ?? 0) > 0;
+  const cleanupActive = cleanupMode && canCleanup;
+  const cleanupBusy = snapshot.loading?.cleanup === true;
+  const summary = cleanupSelectionSummary(cleanupSelection, candidates);
+  const mayDelete = dateError === null && !cleanupBusy && summary.executable;
+  function clearSelection() {
+    setCleanupSelection({});
+    setCleanupConfirm(false);
+  }
+  const updateFilter = (setter) => (event) => {
+    setter(event.target.value);
+    clearSelection();
+    store.closeTask();
+  };
+  const clearDays = () => {
+    setFromDay('');
+    setToDay('');
+    clearSelection();
+    store.closeTask();
+  };
   async function archive(node, archived) {
     setArchiveError(null);
     const result = await store.setDisplayArchive(node.nodeId, archived);
     if (!result.ok) setArchiveError(describeError(result.error));
     else if (archived && snapshot.taskDetail) store.closeTask();
   }
+  function leaveCleanup() {
+    setCleanupMode(false);
+    clearSelection();
+  }
+  function onToggleChain(candidate) {
+    setCleanupSelection((old) => toggleCleanupSelection(old, withSelectionState(candidate, old[candidate.chainId])));
+    setCleanupConfirm(false);
+  }
+  async function confirmCleanup() {
+    if (!mayDelete) return;
+    const result = await store.cleanupTasks(cleanupSelection);
+    if (result.ok) leaveCleanup();
+    setCleanupConfirm(false);
+  }
+  const cleanup = cleanupActive ? { active: true, selection: cleanupSelection, candidates, onToggle: onToggleChain } : null;
+  function changeView(next) {
+    if (recordView === next) return;
+    setRecordView(next);
+    clearSelection();
+    store.closeTask();
+  }
+  /**
+   * A 最近任务 row was just expanded: read ITS most recent round through the same
+   * `store.openTask` every other 详情 entry uses, so the row's detail block shows the
+   * existing `TaskDetail` — including the existing 打开会话 control and the rounds a
+   * continuation chain has. A collapsed row reads nothing.
+   * @param {object} chain - the row's execution chain.
+   * @returns {void}
+   */
+  function openRecentDetail(chain) {
+    const rounds = Array.isArray(chain?.rounds) ? chain.rounds : [];
+    const latest = rounds[rounds.length - 1];
+    const taskId = latest?.taskId;
+    if (typeof taskId === 'string' && taskId !== '') void store.openTask(taskId);
+  }
+  function renderRecordDetails({ chain, node, archiveInherited }) {
+    const mayArchive = canArchive && node.kind === 'task' && !archiveInherited
+      && (node.displayArchived || chain.nodeStatus === 'accepted');
+    return (
+      <div className="dshdg-record-detail">
+        {chain.goalDescription ? <p className="dshdg-hint">{'目标：' + boundedText(chain.goalDescription, 400)}</p> : null}
+        {chain.completionSummary ? <p className="dshdg-hint">{'已完成：' + boundedText(chain.completionSummary, 400)}</p> : null}
+        {/* The chain's rounds, newest LAST round first so 打开会话 is in reach without
+            scrolling past every older round; the row above already shows the count. */}
+        <ChainRounds chain={chain} store={store} snapshot={snapshot} onOpen={onOpen} forceExpanded newestFirst />
+        {mayArchive ? (
+          <button type="button" disabled={snapshot.loading?.displayArchive === true}
+            onClick={() => { void archive(node, !node.displayArchived); }}>
+            {node.displayArchived ? '恢复显示' : '归档'}
+          </button>
+        ) : null}
+      </div>
+    );
+  }
   return (
     <section className="dshdg-card" aria-labelledby="dshdg-tree-title" data-dshdg-task-tree="">
       <div className="dshdg-row">
-        <h3 id="dshdg-tree-title">任务树</h3>
+        <h3 id="dshdg-tree-title">任务记录</h3>
         <span className="dshdg-spacer" />
-        <span className="dshdg-hint" data-dshdg-tree-counts="">
-          {`规划节点 ${counts.planNodes ?? 0} · 执行链 ${counts.taskChains ?? 0} · 顶层 ${counts.roots ?? view.roots.length}`}
-        </span>
+        <div className="dshdg-record-views" role="group" aria-label="显示方式">
+          <button type="button" aria-pressed={recordView === 'recent'} onClick={() => changeView('recent')} data-dshdg-record-view="recent">
+            最近任务
+          </button>
+          <button type="button" aria-pressed={recordView === 'tree'} onClick={() => changeView('tree')} data-dshdg-record-view="tree">
+            项目树
+          </button>
+        </div>
+        {canCleanup ? (
+          <button
+            type="button"
+            className={cleanupActive ? 'dshdg-danger' : undefined}
+            data-dshdg-cleanup-toggle=""
+            aria-pressed={cleanupActive}
+            disabled={cleanupBusy || (!cleanupActive && dateError !== null)}
+            onClick={() => {
+              if (cleanupActive) leaveCleanup();
+              else {
+                setCleanupMode(true);
+                setCleanupConfirm(false);
+              }
+            }}
+          >
+            {cleanupActive ? '退出清理' : '清理记录'}
+          </button>
+        ) : null}
       </div>
       <div className="dshdg-tree-filters">
-        <label>项目<select value={projectKey} onChange={(event) => { setProjectKey(event.target.value); store.closeTask(); }}>
+        <label>项目<select value={projectKey} onChange={updateFilter(setProjectKey)}>
           <option value="">所有项目</option>
           {view.projects.map((p) => <option key={p.projectKey} value={p.projectKey}>{p.shortPath ? `${p.name} · ${p.shortPath}` : p.name}</option>)}
         </select></label>
-        <label>状态<select value={filter} onChange={(event) => { setFilter(event.target.value); store.closeTask(); }}>
+        <label>状态<select value={filter} onChange={updateFilter(setFilter)}>
           <option value="all">全部</option>
           <option value="attention">需要处理</option>
           <option value="active">执行中</option>
           <option value="done">已完成</option>
           {canArchive ? <option value="archive">{`已归档（${archiveCount}）`}</option> : null}
         </select></label>
-        <label>搜索<input type="search" value={search} onChange={(event) => { setSearch(event.target.value); store.closeTask(); }} placeholder="项目、标题或任务编号" /></label>
+        <label>搜索<input type="search" value={search} onChange={updateFilter(setSearch)} placeholder="项目、标题或任务编号" /></label>
+        <label>创建日期（起）<input type="date" value={fromDay} data-dshdg-tree-day-from="" max={toDay === '' ? undefined : toDay}
+          aria-invalid={dateError !== null} onChange={updateFilter(setFromDay)} /></label>
+        <label>创建日期（止）<input type="date" value={toDay} data-dshdg-tree-day-to="" min={fromDay === '' ? undefined : fromDay}
+          aria-invalid={dateError !== null} onChange={updateFilter(setToDay)} /></label>
+        <span className="dshdg-tree-day-actions">
+          <button type="button" data-dshdg-tree-day-clear="" disabled={!rangeActive && dateError === null}
+            onClick={clearDays}>清除日期</button>
+        </span>
       </div>
+      <p className="dshdg-hint" data-dshdg-tree-day-hint="">
+        {rangeActive
+          ? `按创建日期筛选：${dateRangeText.from ?? '不限'} 至 ${dateRangeText.to ?? '不限'}（两端都含当天；任一整改轮次创建于该范围时保留整条链）`
+          : '按创建日期筛选：可只填开始或结束日期。两端相同时查询当天。'}
+      </p>
+      {dateError === null ? null : <p className="dshdg-warn" role="alert" data-dshdg-tree-day-error="">{`${dateError}。日期筛选未生效，任务树仍按其它条件显示。`}</p>}
       {filter === 'archive' ? <p className="dshdg-hint">归档只影响任务的显示。会话和历史仍按原规则保留。</p> : null}
       {view.displayArchiveError ? <p className="dshdg-warn" role="alert">归档记录暂不可读，已显示全部任务。</p> : null}
       {archiveError ? <p className="dshdg-warn" role="alert">{`更新归档失败。${archiveError}`}</p> : null}
-      {groups.length === 0 ? (
+      {view.cleanupError && view.cleanupError !== 'CLEANUP_UNAVAILABLE' ? (
+        <p className="dshdg-warn" role="alert">清理状态暂不可用，任务树照常显示。</p>
+      ) : null}
+      {cleanupActive ? (
+        <div className="dshdg-cleanup-bar" data-dshdg-cleanup-bar="">
+          <p className="dshdg-hint" data-dshdg-cleanup-counts="">
+            {`已选 ${summary.chains} 条执行链 / 共 ${summary.rounds} 轮`}
+          </p>
+          {cleanupConfirm ? null : <p className="dshdg-warn">{cleanupWarningText()}</p>}
+          {Object.keys(cleanupSelection).length === 0 ? null : summary.problems.map((problem) => (
+            <p className="dshdg-warn" role="alert" key={problem} data-dshdg-cleanup-problem="">{problem}</p>
+          ))}
+          {cleanupConfirm ? (
+            <div className="dshdg-row" data-dshdg-cleanup-confirm-dialog="" role="alertdialog" aria-label="确认永久删除记录">
+              <span>
+                {`确认永久删除 ${summary.chains} 条执行链、共 ${summary.rounds} 轮的任务记录及审查意见？删除后无法按任务编号查询或续接。DSH 会话、工作区与源文件不会被删除。`}
+              </span>
+              <button
+                type="button"
+                className="dshdg-danger"
+                data-dshdg-cleanup-confirm=""
+                disabled={!mayDelete}
+                onClick={() => { void confirmCleanup(); }}
+              >
+                {snapshot.loading?.cleanup === true ? '正在删除…' : '确认删除'}
+              </button>
+              <button type="button" data-dshdg-cleanup-cancel="" disabled={cleanupBusy} onClick={() => setCleanupConfirm(false)}>取消</button>
+            </div>
+          ) : (
+            <div className="dshdg-row">
+              <button
+                type="button"
+                className="dshdg-danger"
+                data-dshdg-cleanup-review=""
+                disabled={!mayDelete}
+                onClick={() => setCleanupConfirm(true)}
+              >
+                下一步：确认删除
+              </button>
+              <button type="button" data-dshdg-cleanup-reset="" onClick={clearSelection}>
+                清空选择
+              </button>
+            </div>
+          )}
+        </div>
+      ) : null}
+      {recordView === 'recent' ? (
+        <TaskRecordsTable records={recent} hasPlans={counts.planNodes > 0} hasRecords={counts.taskChains > 0}
+          cleanup={cleanup} cleanupBusy={cleanupBusy} renderDetails={renderRecordDetails} onToggleExpand={openRecentDetail} />
+      ) : groups.length === 0 ? (
         <p className="dshdg-faint" data-dshdg-tree-empty="">{view.roots.length === 0 ? '还没有规划节点或执行记录。' : '没有符合当前条件的任务。'}</p>
       ) : groups.map((group) => (
         <section className="dshdg-tree-project" key={group.projectKey} data-dshdg-project={group.projectKey}>
@@ -2549,7 +2875,9 @@ function TaskTreePanel({ store, snapshot, onOpen }) {
           <ul className="dshdg-tree-roots">
             {group.roots.map((node) => <TaskTreeItem key={node.nodeId} node={node} store={store} snapshot={snapshot}
               collapsed={collapsed} setCollapsed={setCollapsed} expandedRounds={expandedRounds} setExpandedRounds={setExpandedRounds}
-              onOpen={onOpen} onArchive={canArchive ? archive : null} forceOpen={search.trim() !== '' || filter !== 'all'} />)}
+              onOpen={onOpen} onArchive={canArchive ? archive : null}
+              forceOpen={search.trim() !== '' || filter !== 'all' || rangeActive || cleanupActive}
+              cleanup={cleanup} />)}
           </ul>
         </section>
       ))}
@@ -2886,9 +3214,9 @@ function TasksPanel({ store, snapshot }) {
       <div className="dshdg-row">
         <p className="dshdg-muted">这里只记录执行事实。执行完成不等于被接受：“等待宿主审查”要由宿主（例如 Codex）单独给出结论。</p>
         <span className="dshdg-spacer" />
-        <span className="dshdg-hint">
+        <span className="dshdg-hint" data-dshdg-refresh-hint="">
           {changing !== true
-            ? '当前没有会变化的记录，不会自动刷新。'
+            ? '当前没有会变化的记录。页面打开且可见时，每 15 秒只读检查一次，新派发的任务会自动出现；切回本页会立即刷新。'
             : `${liveCount > 0 ? `有 ${liveCount} 个进行中的任务；` : ''}有记录可能变化（待审或结论保存中），页面可见时每 5 秒只读刷新一次（不调用模型）。`}
         </span>
         <button type="button" disabled={snapshot.loading?.tasks === true} onClick={() => { void store.refreshTasks('manual'); }}>
@@ -3125,7 +3453,6 @@ function CodexPanel({ store, snapshot }) {
 const TABS = Object.freeze([
   { key: 'providers', label: '接口管理' },
   { key: 'execution', label: '执行设置' },
-  { key: 'review', label: '附加审查' },
   { key: 'tasks', label: '任务记录' },
   { key: 'codex', label: 'Codex 集成' },
 ]);
@@ -3208,8 +3535,11 @@ export function DelegateConfigPage(props) {
       >
         {tab === 'providers' ? <ProvidersPanel store={store} snapshot={snapshot} /> : null}
         {tab === 'execution' ? <ExecutionPanel store={store} snapshot={snapshot} /> : null}
-        {tab === 'review' ? <ReviewPanel store={store} snapshot={snapshot} /> : null}
-        {tab === 'tasks' ? <TasksPanel store={store} snapshot={snapshot} /> : null}
+        {tab === 'tasks' ? (
+          <SessionNavigation.Provider value={props.uiWorkspace || props.workspaces ? props : null}>
+            <TasksPanel store={store} snapshot={snapshot} />
+          </SessionNavigation.Provider>
+        ) : null}
         {tab === 'codex' ? <CodexPanel store={store} snapshot={snapshot} /> : null}
       </div>
 
@@ -3237,10 +3567,31 @@ export function DelegateConfigPage(props) {
 /** Re-exported so the documented contract and tests share one name for the body document. */
 export { documentFromDraft, describeError, exportDocument, planCreateRequest };
 
+export {
+  MAX_CLEANUP_CHAINS,
+  cleanupBlockerLabel,
+  cleanupCandidates,
+  cleanupOutcome,
+  cleanupProjection,
+  cleanupRequest,
+  cleanupSelectionKey,
+  cleanupSelectionSummary,
+  cleanupWarningText,
+  describeCleanupOutcome,
+  pruneCleanupSelection,
+  toggleCleanupSelection,
+  withSelectionState,
+} from './task-cleanup.js';
+
 
 /**
- * Re-exported so a consumer (and `lib/client.d.ts`) reaches the native navigation
- * through the one module the bundle exports, rather than a second module identity.
+ * Re-exported so a consumer (and `lib/client.d.ts`) reaches the native navigation through the
+ * one module the bundle exports, rather than a second module identity.
+ *
+ * `registerTasksNavigation` is kept even though `apply` no longer mounts it: it is a published
+ * helper of this bundle (and `lib/client.d.ts` declares it), and a host or a future build may
+ * still mount the record panel itself. The task records are reached from the plugin's own
+ * settings page (`plugins.bundle.config` → 「任务记录」), not from a sidebar row.
  */
 export {
   MAIN_SLOT,
@@ -3264,3 +3615,44 @@ export {
   TaskbridgeNavPanel,
   TaskbridgeSidebarIcon,
 } from './sidebar.jsx';
+
+/**
+ * The TaskBridge sidebar integration and its pure view model.
+ *
+ * Re-exported for the same reason as the navigation above: one module identity, so a consumer
+ * and `lib/client.d.ts` reach the same functions. `registerSessionRowMarker` is the ONLY thing
+ * this bundle registers inside the shell's workspace area — a per-row marker in the host's own
+ * published child slot. The parent slot stays the host's.
+ */
+export {
+  DispatchedSessionMarker,
+  SESSION_ROW_ACTION_ID,
+  SESSION_ROW_ACTION_ORDER,
+  SESSION_ROW_ACTION_SLOT,
+  TaskbridgeGrouping,
+  WORKSPACES_PRIORITY,
+  WORKSPACES_SLOT,
+  WORKSPACE_VIEWS,
+  askConfirm,
+  askText,
+  dispatchProof,
+  hostService,
+  loadSessionMap,
+  registerSessionRowMarker,
+  registerWorkspacesBrowser,
+  shortId,
+  stableSnapshot,
+  workspacesViewMode,
+} from './workspaces-browser.jsx';
+export {
+  GROUP_KINDS,
+  identityRows,
+  isManagedRootPath,
+  projectNameOf,
+  readWorkspacesSnapshot,
+  sessionIndex,
+  sessionTitles,
+  sourcePathKey,
+  workspaceGroups,
+  workspaceItems,
+} from './workspace-groups.js';

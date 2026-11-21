@@ -5,11 +5,34 @@
 // actually produces: `nodeStatus`, `orphan`, `children` and each chain's `rounds`
 // are the projection's own values. Renaming or adding a field here would therefore
 // paper over a client bug instead of revealing it.
+//
+// Each chain also carries the `cleanup` block the user plane attaches to the tree
+// (`eligible` + `blockers`), computed here from the SAME inputs the server would use:
+// a chain is removable when every round is a finished, durable record and nothing
+// else still depends on it. `task-ui-twin` is running, so it is the ineligible case.
 
 import { buildTaskTree } from '../../src/jobs/task-tree.js';
 import { pathDigest } from '../../src/jobs/continuation-identity.js';
 
 const ACCEPTED = Object.freeze({ accepted: true, state: 'accepted', decision: 'accepted', acceptedAt: 1_763_200_900_000, by: 'commander', note: '已验收' });
+
+function cleanupOf(chain) {
+  const running = chain.rounds.some((round) => round.state === 'running' || round.state === 'pending');
+  return { eligible: !running, blockers: running ? ['CLEANUP_CHAIN_LIVE'] : [] };
+}
+
+/** Attach the cleanup block to every chain of a projected tree. */
+function withCleanup(tree) {
+  const walk = (node) => {
+    const chains = node?.kind === 'plan' ? (node.executions ?? []) : (node?.chain ? [node.chain] : []);
+    for (const chain of chains) chain.cleanup = cleanupOf(chain);
+    for (const child of Array.isArray(node?.children) ? node.children : []) walk(child);
+  };
+  for (const root of tree.roots) walk(root);
+  tree.cleanupAvailable = true;
+  tree.cleanupError = null;
+  return tree;
+}
 
 /**
  * A three-level plan whose `ui` leaf carries a THREE-round chain, plus an
@@ -134,7 +157,7 @@ export function threeLevelProjection() {
  */
 export function tasksBody() {
   const { tasks, planNodes } = threeLevelProjection();
-  const tree = buildTaskTree({ planNodes, tasks });
+  const tree = withCleanup(buildTaskTree({ planNodes, tasks }));
   return {
     ok: true,
     tasks,
@@ -155,6 +178,10 @@ export function tasksBodyWithoutTree() {
 
 /**
  * The flat-only tree shape (what the execution plane's `/plans list` publishes).
+ *
+ * The flat shape carries no chain detail, so it deliberately publishes NO cleanup
+ * block: the page must hide the removal action rather than offer a checkbox the host
+ * would refuse.
  * @returns {object} a `/tasks` body whose `tree` carries `flatNodes` and no `roots`.
  */
 export function tasksBodyFlatTree() {

@@ -174,6 +174,14 @@ function statusForCode(code) {
     return 400;
   }
   if (code.startsWith('PLAN_')) return 409;
+  // Task-record cleanup. A batch that cannot be honoured is a state conflict (the
+  // operator re-reads and retries), an unusable request is the caller's mistake, a
+  // capability the host does not have is 503 and a failed document write is 502.
+  if (code === 'CLEANUP_CHAIN_NOT_FOUND') return 404;
+  if (code === 'CLEANUP_INVALID') return 400;
+  if (code === 'CLEANUP_UNAVAILABLE') return 503;
+  if (code === 'CLEANUP_FAILED') return 502;
+  if (code.startsWith('CLEANUP_')) return 409;
   if (code.startsWith('JOB_')) return 409;
   // The credential seam is a separate service. "It is not installed here" is a
   // capability gap (503), "the backend refused the write" is an upstream failure

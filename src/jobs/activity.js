@@ -69,6 +69,14 @@ const MAX_IDENTIFIER_CHARS = 200;
 const MAX_TRACKED_CALL_IDS = 64;
 
 /**
+ * Stage-result identities remembered for per-event deduplication.
+ *
+ * An id is remembered only after a stage result really advanced the clock, so the bound costs
+ * nothing but memory: past it, the oldest identity is forgotten and would count once more.
+ */
+const MAX_TRACKED_STAGE_EVENTS = 64;
+
+/**
  * Session event types that are PROGRESS, keyed to the evidence they carry.
  *
  * These are `SessionEventMap` members of `@deepseek-ai/dsh-session` (and, for the
@@ -765,6 +773,22 @@ function randomHex16() {
 /** Why one observation wait ended. */
 export const OBSERVE_REASONS = Object.freeze({
   heartbeat: 'heartbeat',
+  /**
+   * The run needs the commander.
+   *
+   * Two DIFFERENT reminders share this reason because they all mean "look at it".
+   * `checkpoint` says which one it is:
+   *  * `checkpoint: 'progress'` — the run has produced no real progress for the
+   *    configured interval (default 40 minutes) while its executor is still alive. The
+   *    host is asked to check the run's progress, and the default answer is to keep
+   *    waiting on the same task.
+   *  * `checkpoint: 'failure'` — the repeated-tool-failure reminder (`failure` block;
+   *    older hosts read only that block, so they keep working unchanged).
+   *
+   * Both are measured on ONE clock for the progress report: consecutive time WITHOUT
+   * real progress, reset only by real progress. Total runtime is never a reminder.
+   * Nothing is ever cancelled, restarted, resubmitted or re-queued by one.
+   */
   attention: 'attention',
   permission: 'permission',
   // The worker asked a human an ordinary question. It is its own reason because answering
@@ -774,6 +798,25 @@ export const OBSERVE_REASONS = Object.freeze({
   failed: 'failed',
   cancelled: 'cancelled',
   interrupted: 'interrupted',
+});
+
+/**
+ * The closed vocabulary of `attention` checkpoints.
+ *
+ * A host that reads only `reason` keeps the previous behaviour; a host that reads
+ * `checkpoint` can tell "the run made no real progress for the interval" from "the
+ * worker kept failing the same call" without parsing prose.
+ *
+ * There are exactly TWO reminders: `progress` (the run progress check on the one
+ * no-progress clock) and `failure` (the repeated-tool-failure reminder). `stall` is
+ * accepted ONLY as a legacy label — a host or a fixture written by the earlier candidate
+ * may still send it — and this monitor never emits it: there is no second duration to
+ * report a shorter threshold under.
+ */
+export const CHECKPOINTS = Object.freeze({
+  progress: 'progress',
+  stall: 'stall',
+  failure: 'failure',
 });
 
 /**
@@ -819,7 +862,8 @@ const PHASE_AWAITING_PERMISSION = 'awaiting-permission';
  *
  * What it must never do, and does not: run an LLM, read a diff or a workspace
  * file, mutate the task, restart/cancel/resubmit a run, or extend a deadline. The
- * self-check is a read of facts the engine already holds.
+ * self-check and the progress checkpoint are reads of facts the engine already
+ * holds; a checkpoint is a report to the commander, never a control action.
  */
 export class TaskMonitor {
   /**
@@ -827,8 +871,11 @@ export class TaskMonitor {
    * @param {object} [options] - seams and thresholds.
    * @param {() => number} [options.now] - clock.
    * @param {(ms: number) => Promise<void>} [options.wait] - bounded sleep.
-   * @param {number} [options.selfCheckSeconds] - idle span for the self-check.
-   * @param {number} [options.attentionSeconds] - idle span for `attention`.
+   * @param {number} [options.selfCheckSeconds] - no-progress span for the self-check, or 0 to disable it.
+   * @param {number} [options.attentionSeconds] - no-progress span for the run progress
+   *   check (default 40 minutes), or 0 to disable it. This is the ONLY notification
+   *   clock: a run that keeps producing real progress never reaches it, whatever its
+   *   total duration.
    * @param {number} [options.repeatFailureThreshold] - consecutive identical tool
    *   failures reported once, or 0 to disable that reminder.
    * @param {number} [options.waitSliceMs] - internal polling slice.
@@ -838,12 +885,27 @@ export class TaskMonitor {
     this.task = task;
     this.now = typeof options.now === 'function' ? options.now : Date.now;
     this.wait = typeof options.wait === 'function' ? options.wait : sleep;
-    this.selfCheckMs = secondsToMs(options.selfCheckSeconds, 300);
-    this.attentionMs = secondsToMs(options.attentionSeconds, 600);
+    // `0` is a DECISION ("this reminder is off"), not a missing value. Only a value
+    // that is not a usable threshold at all falls back to the documented default.
+    //
+    // TWO independent clocks, which is the whole difference between the two:
+    //  * the self-check is armed from the moment DSH actually STARTED running this task
+    //    (see {@link TaskMonitor#runOrigin}) — a run whose model keeps streaming and
+    //    whose tools keep answering is still inspected once at ten minutes, because the
+    //    product asks for that one local look rather than for "time without progress";
+    //  * the run progress check is armed from the last genuine DELIVERY back to the
+    //    commander (see {@link TaskMonitor#progressOrigin}) — internal model steps,
+    //    text deltas, tool activity, heartbeats and the check itself never move it.
+    this.selfCheckMs = thresholdToMs(options.selfCheckSeconds, 10 * 60);
+    this.attentionMs = thresholdToMs(options.attentionSeconds, 40 * 60);
     this.waitSliceMs = Number.isSafeInteger(options.waitSliceMs) && options.waitSliceMs > 0
       ? options.waitSliceMs
       : 1000;
     this.log = typeof options.log === 'function' ? options.log : null;
+    // Timers. `setTimeout`/`clearTimeout` are injectable so a test can drive the
+    // scheduled self-check deterministically instead of sleeping for ten minutes.
+    this.setTimer = typeof options.setTimeout === 'function' ? options.setTimeout : setTimeout;
+    this.clearTimer = typeof options.clearTimeout === 'function' ? options.clearTimeout : clearTimeout;
     this.activity = new TaskActivity({ now: this.now });
     /**
      * The repeated-failure detector. It is a SEPARATE clock from the two silence
@@ -871,21 +933,105 @@ export class TaskMonitor {
     this.ackedEventId = null;
     /** Episode identity: bumped whenever genuine activity ends the idle episode. */
     this.episode = 0;
+    /**
+     * The fixed origin used when the task's recorded start cannot be compared with this
+     * monitor's clock, or null while the recorded start is usable.
+     * @type {number | null}
+     */
+    this.originFallback = null;
     /** The episode the self-check already ran for, or null. */
     this.checkedEpisode = null;
-    /** The last self-check diagnostic, published on every summary. */
-    this.selfCheck = { episode: null, checkedAt: null, verdict: null, detail: null };
     /**
-     * When the most recent attention report was DELIVERED, and for which idle
-     * episode.
+     * The one ON-DEMAND self-check timer, or null.
      *
-     * Exactly one pair, never a growing collection: the cooldown is a property of
-     * the current silence, and an idle origin only moves forward, so an older entry
-     * could never be reached again. `null` means "no attention has been delivered
-     * for this episode yet".
-     * @type {{ episode: number, origin: number, at: number } | null}
+     * A run must be inspected even when NO observer is waiting (a commander that is not
+     * polling, or no client at all). So the monitor arms exactly ONE timer, at
+     * `runOrigin + selfCheckMs` — the instant the run really started plus the interval,
+     * whether or not the run is busy in between. It is cleared on disable, terminal
+     * state, cancellation and disposal. It is a SCHEDULER, not a clock: the instant it
+     * fires at comes from the same `runOrigin`/`selfCheckMs` the observation loop uses,
+     * and the latch that makes it run once per run is the same `checkedEpisode`.
+     * @type {{ id: unknown, at: number, episode: number } | null}
+     */
+    this.selfCheckTimer = null;
+    /** The last self-check diagnostic, published on every summary. */
+    this.selfCheck = {
+      episode: null,
+      checkedAt: null,
+      verdict: null,
+      detail: null,
+      sinceStartMs: null,
+      noDeliveryMs: null,
+    };
+    /**
+     * The most recent REAL delivery of this task's progress to the commander: the interval it
+     * opened, and when.
+     *
+     * This is the ONLY thing that advances the run progress check's clock (see
+     * {@link progressOrigin}). It is not "the last time an observation returned": a
+     * heartbeat, a `wait-limit`, a permission or question wait, a page refresh, the
+     * self-check and the 40-minute check itself are all REPORTED without being deliveries of
+     * progress, so they never move it.
+     * @type {{ delivery: number, origin: number, at: number } | null}
      */
     this.attentionDelivered = null;
+    /**
+     * Whether the run progress check has already been REPORTED for the current delivery
+     * interval.
+     *
+     * A latch, not a counter: the check fires at most once per interval, and a genuine
+     * delivery (or the run's own start) opens the next one and clears it. It is deliberately
+     * SEPARATE state from {@link attentionDelivered}: a report is not a delivery, and keeping
+     * them apart is what lets the monitor tell "this interval was already reported" from "a
+     * new interval opened".
+     * @type {{ origin: number, at: number } | null}
+     */
+    this.progressReported = null;
+    /**
+     * The origin of the interval the last delivery opened, or null.
+     *
+     * One latch shared by every way a delivery can arrive — the run's terminal outcome through
+     * {@link delivery}, and a real stage result through {@link noteStageResult} — so two
+     * confirmations for ONE interval advance the clock ONCE. Without it, a duplicate would be a
+     * second reset.
+     * @type {number | null}
+     */
+    this.deliveryCountedInterval = null;
+    /**
+     * When this run's scheduled self-check performed its inspection, or null.
+     *
+     * Kept apart from `selfCheck.checkedAt` because the two answer different questions:
+     * `checkedAt` is "which inspection is the latest" (a diagnostic), while this is "when
+     * the one timer fired" (a fact the check itself must be able to state). A diagnostic
+     * published by an observation says nothing about whether the timer was allowed to run.
+     * @type {number | null}
+     */
+    this.scheduledSelfCheckAt = null;
+    /**
+     * The instant the delivery interval was frozen at, or null while it is still measured.
+     *
+     * Set once when the run reaches a terminal state, to the run's recorded end. A finished
+     * run can deliver nothing more, so "nothing returned for N" stops growing there instead
+     * of describing a wait nobody could have shortened.
+     * @type {number | null}
+     */
+    this.deliveredAtMs = null;
+    /**
+     * Every genuine delivery this monitor observed, as bounded evidence.
+     *
+     * A count plus the last interval/instant: never text, never a payload. This is what
+     * lets the published state say "no delivery for 41 minutes" honestly instead of
+     * inferring it from internal model activity.
+     */
+    this.deliveries = 0;
+    /**
+     * The identities of the stage results already counted, bounded.
+     *
+     * Only event ids, never content. It is what makes a stage result count AT MOST ONCE: a
+     * retried or replayed confirmation with the same event id is a duplicate and moves nothing.
+     * @type {Set<string>}
+     */
+    this.stageEvents = new Set();
     /**
      * Every observation currently waiting, so each one owns its own controller and
      * one observer can never cancel another. Bounded by the number of callers; an
@@ -927,7 +1073,14 @@ export class TaskMonitor {
       // makes "once per episode" true for the self-check and the attention latch:
       // without it, a run that goes quiet, wakes, and goes quiet again would be
       // treated as the SAME silence and could never alert a second time.
-      if (active) this.episode += 1;
+      if (active) {
+        this.episode += 1;
+        // The self-check clock reads the run's start, not this event, so nothing is
+        // re-armed here: `scheduleSelfCheck` is a pure recompute and the engine calls it
+        // once the run is really started. The episode identity is what keeps the
+        // "already inspected" latch and the progress-report latch coherent across a run
+        // that wakes and sleeps many times.
+      }
       return active;
     } catch {
       return false;
@@ -1026,43 +1179,227 @@ export class TaskMonitor {
    * Before the executor has produced anything, the episode begins when its run
    * began — a model that never streams a token is silent from the start, and
    * measuring from "never" would hide it.
+   *
+   * This is the EXECUTOR's silence measure. It describes the run ("quiet for 90 s", the
+   * idle tool span) and it no longer arms anything: the ten-minute self-check runs from
+   * {@link runOrigin} and the forty-minute check from {@link progressOrigin}, because
+   * neither may be postponed by internal model activity.
    * @returns {number} epoch milliseconds.
    */
   idleOrigin() {
     if (this.activity.lastActivityAt !== null) return this.activity.lastActivityAt;
-    if (Number.isFinite(this.task?.startedAt)) return this.task.startedAt;
-    if (Number.isFinite(this.task?.createdAt)) return this.task.createdAt;
-    return this.now();
+    const now = this.now();
+    // A run whose recorded start was already inconsistent with this monitor's clock gets
+    // ONE fixed origin — the instant that was first ruled unusable. Re-deriving it on
+    // every read would slide the origin forward with the clock, and a sliding origin can
+    // never become old enough for the threshold.
+    if (this.originFallback !== null) return this.originFallback;
+    // Before any real progress has been observed, the silence is measured from the run's
+    // recorded start — but ONLY if that start is usable by THIS monitor's clock. The
+    // engine stamps `startedAt`/`createdAt` from the wall clock, while this monitor reads
+    // its injected `now`; a start in the future (a frozen or offset clock) or one so far
+    // in the past that the threshold would look long spent must not be taken literally,
+    // or a silence span would be invented. In production the two clocks agree and the
+    // recorded start is used verbatim.
+    for (const candidate of [this.task?.startedAt, this.task?.createdAt]) {
+      if (!Number.isFinite(candidate) || candidate <= 0) continue;
+      if (candidate > now || now - candidate > MAX_PLAUSIBLE_IDLE_MS) {
+        this.originFallback = now;
+        return this.originFallback;
+      }
+      return candidate;
+    }
+    return now;
   }
 
   /**
-   * Whether the current inactivity episode has reached the self-check threshold.
+   * Whether this run's ONE self-check is due.
+   *
+   * Measured from the instant DSH demonstrably STARTED running the task
+   * ({@link runOrigin}), NOT from the last output. The product asks for one local look
+   * ten minutes into a real run, whatever the run is doing: a model that never stops
+   * streaming and tools that keep answering still get that look. Queueing, creating a
+   * Session and a mere request acknowledgement are not the start, so a task that has
+   * not reached execution is never due.
+   *
+   * A disabled self-check (`selfCheckSeconds: 0`) is never due, which is the whole
+   * point of the switch: the operator asked for no local inspection at all.
    * @param {number} [at] - reference time.
    * @returns {boolean} true when one read-only inspection is due.
    */
   selfCheckDue(at = this.now()) {
-    return at - this.idleOrigin() >= this.selfCheckMs;
+    if (!enabled(this.selfCheckMs)) return false;
+    const origin = this.runOrigin();
+    if (origin === null) return false;
+    return at - origin >= this.selfCheckMs;
   }
 
   /**
-   * Perform the 5-minute read-only inspection, at most once per idle episode.
+   * Perform the read-only inspection, at most once per run.
    *
    * The inspection reads only what the engine itself already holds: whether the
    * task is alive, whether its executor settled, the phase, whether a permission
-   * request is pending, and which tool call is outstanding. It performs no model
-   * call, reads no diff or workspace file, changes no task state, and does not
-   * touch the deadline.
+   * request is pending, and which tool call is outstanding — plus the two facts the
+   * commander needs when it is reminded: how long nothing was delivered and what the
+   * run is currently doing. It performs no model call, reads no diff or workspace
+   * file, changes no task state, and does not touch the deadline. Disabled means
+   * disabled: it returns null immediately.
+   *
+   * The same method serves both entry points — the observation loop and the scheduled
+   * timer — so `checkedEpisode` is the ONE latch: whichever runs first makes the check,
+   * and the other finds nothing to do for this run.
    * @param {number} [at] - reference time.
    * @returns {object | null} the diagnostic, or null when none was due.
    */
   runSelfCheck(at = this.now()) {
     if (this.disposed) return null;
+    if (!enabled(this.selfCheckMs)) return null;
     if (!this.selfCheckDue(at)) return null;
     const episode = this.episode;
     if (this.checkedEpisode === episode) return null;
+    if (terminalReason(this.task) !== null) return null;
     this.checkedEpisode = episode;
     this.selfCheck = this.inspect(at, episode);
+    // This run's inspection is done, so its timer has nothing left to do.
+    this.clearSelfCheckTimer();
     return this.selfCheck;
+  }
+
+  // -------------------------------------------------------------------------
+  // The scheduled self-check: a read-only inspection with NO observer
+  // -------------------------------------------------------------------------
+  //
+  // WHY a timer at all: the product requires that a run is inspected ONCE when it has
+  // really been running for `selfCheckSeconds`, even when no Codex/MCP caller is
+  // waiting — a commander that is not polling, or a closed client, must not leave a run
+  // uninspected. It is a SCHEDULER, not a third clock:
+  //
+  //   * the instant is computed from the SAME `runOrigin`/`selfCheckMs` the loop uses;
+  //   * it is measured from the real start of execution, so a busy run (model steps,
+  //     text deltas and tool receipts the whole way) is inspected all the same, and a
+  //     run that has not started yet is never inspected;
+  //   * `0` (disabled), a terminal state, cancellation and disposal leave NO timer;
+  //   * it is `unref`'d, so it can never keep the process alive;
+  //   * an EPOCH-DOMAIN monitor (the engine's) hands the real timer the exact epoch instant
+  //     the run's start and threshold produce, with the DELAY computed against this clock;
+  //   * it calls `runSelfCheck` — the same read-only inspection, no I/O, no model call,
+  //     no task action — and shares the `checkedEpisode` latch, so one run is
+  //     inspected ONCE whichever entry point got there first.
+
+  /**
+   * (Re-)arm the one self-check timer for this run, or clear it.
+   *
+   * Safe to call at any time and as often as the caller likes: it is a pure recompute of
+   * "should a timer exist, and when should it fire". Idempotent when the target instant
+   * has not moved, so a burst of events costs at most one `setTimeout`.
+   * @returns {void}
+   */
+  scheduleSelfCheck() {
+    if (this.disposed) return this.clearSelfCheckTimer();
+    // Off, already inspected for this run, or over: nothing may be scheduled.
+    if (!enabled(this.selfCheckMs) || this.checkedEpisode === this.episode) return this.clearSelfCheckTimer();
+    if (terminalReason(this.task) !== null) return this.clearSelfCheckTimer();
+    const origin = this.runOrigin();
+    // The run never really started (queueing, an unacknowledged request): no instant to
+    // arm for. The next evidence of execution re-arms it, because the engine calls this
+    // again whenever the run's real start becomes known.
+    if (origin === null) return this.clearSelfCheckTimer();
+    const dueAt = origin + this.selfCheckMs;
+    const armed = this.selfCheckTimer;
+    if (armed !== null && armed.at === dueAt && armed.episode === this.episode) return undefined;
+    this.clearSelfCheckTimer();
+    this.armSelfCheckTimer(dueAt, this.episode);
+    return undefined;
+  }
+
+  /**
+   * Arm the one timer that owes this run's self-check at `dueAt`.
+   *
+   * The callback owns its slot: it records which slot it was armed for and CLEARS that
+   * slot before doing anything else. That is what makes a timer which fires a moment too
+   * early work instead of wedging — the next `scheduleSelfCheck()` then sees an empty slot
+   * and arms a fresh timer for the same instant, instead of deduplicating against a slot
+   * whose timer has already fired and can never run again.
+   * @param {number} dueAt - the instant the check is owed.
+   * @param {number} [episode] - the episode identity; defaults to the current one.
+   * @returns {void}
+   */
+  armSelfCheckTimer(dueAt, episode = this.episode) {
+    const now = this.now();
+    // `setTimeout` cannot be trusted past its platform maximum (a delay beyond it fires
+    // at once, in a tight loop). A threshold that is further away than a timer can express
+    // therefore uses a SHORT poll: each one re-reads `now` and re-arms for the distance
+    // that is really left, so it fires exactly when the threshold is reached. This is the
+    // only case that repeats, and it still calls the same `runSelfCheck` with the same
+    // latch — it is a scheduler, never a second clock.
+    const remaining = dueAt - now;
+    // A clock that is already past the threshold gets one tick, never a negative delay.
+    const delay = remaining > MAX_TIMER_DELAY_MS
+      ? SELF_CHECK_POLL_MS
+      : Math.max(0, remaining);
+    const slot = { id: null, at: dueAt, episode };
+    // The epoch-domain instant this slot fires at, for a real platform timer: a timer armed
+    // with a small delay can fire LATE, but the check belongs at the instant the threshold
+    // was reached, so it is recorded there — bounded by this monitor's clock so an injected
+    // (non-epoch) time base can never record a check at an invented future instant.
+    const dueEpoch = Number.isFinite(dueAt) && Math.abs(dueAt - now) <= MAX_EPOCH_DOMAIN_MS ? dueAt : null;
+    const handle = this.setTimer(() => {
+      // Consume THIS slot first, whoever owns it now. A stale timer (its slot was replaced
+      // or cleared) leaves the current slot alone.
+      if (this.selfCheckTimer === slot) this.selfCheckTimer = null;
+      else this.clearTimerOf(slot);
+      // A disposed monitor, or a finished run, owes nothing.
+      if (this.disposed) return;
+      if (terminalReason(this.task) !== null) return;
+      try {
+        // A pure read of what the engine already holds: no I/O, no model, no task change.
+        const checked = this.runSelfCheck(dueEpoch ?? this.now());
+        if (checked !== null) {
+          // Recorded on its own field: this is the one timer having fired, which is a
+          // different fact from "which diagnostic is the latest".
+          this.scheduledSelfCheckAt = checked.checkedAt;
+          return;
+        }
+      } catch {
+        // A diagnostic must never disturb the run that produced it.
+      }
+      // Not due yet by the clock's own reading (a timer that fired a moment early, or a
+      // clock that moved): the run still owes a check, so re-arm for the SAME instant —
+      // and only once this slot is already consumed.
+      if (this.disposed) return;
+      if (terminalReason(this.task) !== null) return;
+      if (!enabled(this.selfCheckMs) || this.checkedEpisode === this.episode) return;
+      this.scheduleSelfCheck();
+    }, delay);
+    // `unref` where the platform supports it: a pending self-check must not be a reason
+    // for the process to stay alive.
+    if (handle !== null && typeof handle === 'object' && typeof handle.unref === 'function') handle.unref();
+    slot.id = handle;
+    this.selfCheckTimer = slot;
+  }
+
+  /**
+   * Clear one specific timer handle, ignoring a failure.
+   * @param {{ id: unknown }} slot - the slot whose timer should be cancelled.
+   * @returns {void}
+   */
+  clearTimerOf(slot) {
+    try {
+      this.clearTimer(slot.id);
+    } catch {
+      // A timer that cannot be cleared is already gone; the slot is what matters.
+    }
+  }
+
+  /**
+   * Clear the scheduled self-check, if any. Idempotent.
+   * @returns {void}
+   */
+  clearSelfCheckTimer() {
+    const armed = this.selfCheckTimer;
+    if (armed === null) return;
+    this.selfCheckTimer = null;
+    this.clearTimerOf(armed);
   }
 
   /**
@@ -1075,6 +1412,16 @@ export class TaskMonitor {
 
   /**
    * Build the read-only diagnostic for the current episode.
+   *
+   * It states the TWO facts a reminder must keep apart, and never merges them:
+   *
+   *  1. `noDeliveryForMs` / `noDeliveryMinutes` — how long NOTHING new was delivered back
+   *     to the commander. Internal model output, tool receipts and heartbeats do not move
+   *     this clock; only a real delivery to the commander does.
+   *  2. `detail.activity` — what DSH is doing right now, from the same bounded activity
+   *     facts the task page uses (phase, open tool, counters). "I am working" and "I have
+   *     told the commander nothing for 41 minutes" are both true at once, and an operator
+   *     needs both sentences rather than one blended one.
    * @param {number} at - reference time.
    * @param {number} episode - episode identity.
    * @returns {object} bounded diagnostic.
@@ -1083,9 +1430,12 @@ export class TaskMonitor {
     const task = this.task ?? {};
     const pending = task.permission?.pending ?? null;
     const span = this.activity.toolSpan(at);
-    const idleMs = Math.max(0, at - this.idleOrigin());
     const nativeStarted = task.native?.started === true;
     const nativeSettled = task.native?.settled === true;
+    // Both origins are bounded instants (see `runOrigin` / `progressOrigin`), so neither
+    // can produce a nonsense duration from a host clock that disagrees with this one.
+    const sinceStartMs = Math.max(0, at - this.runOrigin());
+    const noDeliveryMs = Math.max(0, at - this.progressOrigin());
     let verdict;
     if (task.state === 'pending' || task.state === 'running') {
       if (pending !== null) verdict = 'waiting-for-permission';
@@ -1099,7 +1449,9 @@ export class TaskMonitor {
     return {
       episode,
       checkedAt: at,
-      idleMs,
+      sinceStartMs,
+      noDeliveryMs,
+      noDeliveryMinutes: Math.floor(noDeliveryMs / 60_000),
       verdict,
       detail: {
         state: typeof task.state === 'string' ? task.state : null,
@@ -1113,55 +1465,407 @@ export class TaskMonitor {
         lastActivityAt: this.activity.lastActivityAt,
         activityEvents: this.activity.activityEvents(),
         events: this.activity.totalEvents(),
+        // The independent "what is DSH doing" field. A closed vocabulary plus the open
+        // tool name, so it cannot become a transcript.
+        activity: this.runActivity(at),
+        // The independent "how long has nothing been returned" field, restated here so
+        // the diagnostic can be read on its own.
+        noDeliveryForMs: noDeliveryMs,
       },
     };
   }
 
   /**
-   * Whether the current silence is old enough for an attention report, ignoring the
-   * cooldown of an earlier delivery.
+   * What the run is currently doing, in a closed vocabulary.
+   *
+   * It describes the EXECUTOR, not the delivery: a run can be `model-working` while the
+   * commander has heard nothing for an hour. Nothing here reads output, arguments or
+   * files.
    * @param {number} [at] - reference time.
-   * @returns {boolean} true when the idle span has reached the threshold.
+   * @returns {{ kind: string, currentTool: object | null }} bounded activity description.
    */
-  attentionDue(at = this.now()) {
-    return at - this.idleOrigin() >= this.attentionMs;
+  runActivity(at = this.now()) {
+    const task = this.task ?? {};
+    const span = this.activity.toolSpan(at);
+    let kind;
+    if (task.state === 'pending') kind = 'queued';
+    else if (task.state !== 'running') kind = 'settled';
+    else if (task.permission?.pending !== null && task.permission?.pending !== undefined) kind = 'waiting-for-permission';
+    else if (task.question?.pending !== null && task.question?.pending !== undefined) kind = 'waiting-for-answer';
+    else if (span !== null) kind = 'tool-running';
+    else if (this.activity.lastActivityAt !== null) kind = 'model-working';
+    else kind = 'not-started';
+    return {
+      kind,
+      currentTool: span === null ? null : { name: span.name, callId: span.callId, elapsedMs: span.elapsedMs },
+    };
   }
 
   /**
-   * The instant the next attention report may be delivered, or `Infinity` while the
-   * thresholds have not been reached at all.
+   * Whether the current delivery interval is old enough for an attention report, ignoring
+   * whether this interval was already reported.
+   * @param {number} [at] - reference time.
+   * @returns {boolean} true when the no-delivery span has reached the threshold.
+   */
+  attentionDue(at = this.now()) {
+    return at - this.progressOrigin() >= this.attentionMs;
+  }
+
+  /**
+   * The instant the run progress check is due, or `Infinity` while it is impossible.
    *
-   * The rule is a cooldown, not a one-shot latch: the FIRST report is due at
-   * `idleOrigin + attentionSeconds`, and every later report for the same silence
-   * needs a FURTHER `attentionSeconds` since the previous delivery. Genuine
-   * activity resets both the origin and the delivery record, so a run that goes
-   * quiet again can alert again.
+   * A disabled interval is never due. Otherwise it is `progressOrigin + attentionSeconds`;
+   * once this interval has been reported, the value is `Infinity` (the recorded delivery
+   * is kept for the view) and the loop never wakes for an instant that can no longer
+   * produce an answer.
    * @returns {number} the next deliverable instant.
    */
   nextAttentionAt() {
-    const origin = this.idleOrigin();
-    const delivered = this.attentionDelivered;
-    let next = origin + this.attentionMs;
-    if (delivered !== null && delivered.episode === this.episode && delivered.origin === origin) {
-      next = Math.max(next, delivered.at + this.attentionMs);
+    if (!enabled(this.attentionMs)) return Number.POSITIVE_INFINITY;
+    const origin = this.progressOrigin();
+    // Once THIS interval has been reported, no instant can produce a second answer for it. A
+    // real delivery opens a NEW interval (a new origin), and that interval's instant is
+    // reachable again.
+    if (this.progressReported !== null && this.progressReported.origin === origin) {
+      return Number.POSITIVE_INFINITY;
     }
-    return next;
+    return origin + this.attentionMs;
   }
 
   /**
-   * Whether an attention report may be delivered at `at`, and atomically claims it
+   * Whether the run progress check may be delivered at `at`, and atomically claims it
    * if so.
    *
    * The claim happens in the same synchronous step as the test, so two observers
    * reaching the threshold together cannot both return `attention`: the first
-   * claims, the second observes the fresh delivery record and keeps waiting.
+   * claims, the second observes the fresh interval record and keeps waiting.
+   *
+   * ONE report per DELIVERY INTERVAL. The interval is the consecutive time with nothing
+   * delivered back to the commander, measured from its origin — so a run that keeps
+   * producing internal work while the commander hears nothing still reaches it, and one
+   * interval can never be reported twice. The record this claim writes is the report itself,
+   * never a delivery: it does not move {@link progressOrigin}, and the next interval begins
+   * only when a genuine delivery arrives.
    * @param {number} [at] - delivery instant.
    * @returns {boolean} true for the observer that won the claim.
    */
   claimAttention(at = this.now()) {
-    if (at < this.nextAttentionAt()) return false;
-    this.attentionDelivered = { episode: this.episode, origin: this.idleOrigin(), at };
+    if (!enabled(this.attentionMs)) return false;
+    const origin = this.progressOrigin();
+    // Already reported for THIS interval: nothing new to say.
+    if (this.progressReported !== null && this.progressReported.origin === origin) return false;
+    if (at - origin < this.attentionMs) return false;
+    return this.claimAttentionAt(origin, at);
+  }
+
+  // -------------------------------------------------------------------------
+  // The two reminders: two SEPARATE clocks, each a REPORT worth acting on
+  // -------------------------------------------------------------------------
+  //
+  // They are measured differently on purpose, and neither is gated on the run's total
+  // duration:
+  //
+  //   * `selfCheckSeconds` (default 10 min) — ONE read-only local inspection, armed from
+  //     the instant DSH really started running the task (`runOrigin`). A busy run is
+  //     inspected too: the product asks for that look, not for a long silence.
+  //   * `attentionSeconds` (default 40 min) — ONE notification to the commander asking it
+  //     to check the run's progress, armed from the last genuine DELIVERY to the
+  //     commander (`progressOrigin`).
+  //
+  // What moves the 40-minute clock: ONLY a new, effective result that TaskBridge actually
+  // handed back to the commander. What does NOT move it — exhaustively, because each of
+  // these was a way to hide a stuck delivery:
+  //
+  //   * the run's own START — it opens the FIRST interval (the baseline), it is not a return;
+  //   * the LOCAL self-check diagnostic, on any answer, including a plain heartbeat: reading
+  //     facts the plugin already holds is not work returned to anyone, and letting it reset
+  //     the clock would let the run's own inspection hide the stall it exists to notice;
+  //   * DSH-internal model steps, streamed text, reasoning, tool calls and tool results
+  //     (they keep `idleOrigin`, the "how silent is the executor" measure, separate);
+  //   * heartbeats, empty polls, `wait-limit`, page refreshes and a plain state read;
+  //   * permission and ordinary-question waits;
+  //   * the repeated-failure reminder, and the 40-minute check itself.
+  //
+  // The protocol has to be honest about one limitation: there is no mid-run stage result in
+  // it. {@link observe} delivers the run's result when the task ENDS; nothing in between is
+  // handed to the commander. So this build advances the clock only on the terminal outcome,
+  // plus one reserved, INTERNAL, event-deduplicated entry point for a real stage result that
+  // a future producer could confirm ({@link noteStageResult}, unused by this build and
+  // covered by its own test). Neither invents a delivery, and no tool, assistant text or
+  // diagnostic is ever passed off as one.
+
+  /**
+   * The instant DSH demonstrably STARTED running this task, or `null` when it has not.
+   *
+   * `runStartedAt` is the engine's own stamp at the one place it starts driving the run —
+   * expressed in the clock this monitor reads — and it is preferred. `startedAt` is the
+   * wall-clock fallback for a record built without that stamp (a fixture, or a record
+   * restored before the engine drove it).
+   *
+   * Waiting in a queue, creating the DSH Session and having the request acknowledged are
+   * all BEFORE that instant, so none of them can arm the ten-minute inspection.
+   *
+   * The value is only usable if THIS monitor's clock can compare with it: a start in the
+   * future (a frozen or offset clock) or one so old that the threshold looks long spent is
+   * not a real elapsed time, and `null` is the honest answer — nothing is scheduled or
+   * reported until real evidence of execution arrives.
+   * @returns {number | null} epoch milliseconds, or null.
+   */
+  runOrigin() {
+    const now = this.now();
+    for (const candidate of [this.task?.runStartedAt, this.task?.startedAt]) {
+      if (!Number.isFinite(candidate) || candidate <= 0) continue;
+      if (candidate > now || now - candidate > MAX_PLAUSIBLE_IDLE_MS) return null;
+      return candidate;
+    }
+    return null;
+  }
+
+  /**
+   * The instant the current delivery interval began.
+   *
+   * That is the last genuine delivery to the commander, or the run's own start when
+   * nothing has been delivered yet — a run that never delivered anything is "not returned
+   * for" its whole life, which is exactly what the commander must be told. Before the run
+   * has started, `now` is used so the interval is a zero-length fact rather than a
+   * measurement of the queue.
+   *
+   * A finished run freezes it at the recorded end (`deliveredAtMs`), exactly like every
+   * other elapsed value: "nothing returned for 40 minutes" must not keep growing after the
+   * run stopped and nobody could have been told anything.
+   * @returns {number} epoch milliseconds.
+   */
+  progressOrigin() {
+    if (this.deliveredAtMs !== null) return this.deliveredAtMs;
+    // A terminal run cannot deliver anything more, so its interval is frozen at the recorded
+    // end. This is read from the RECORD rather than only from `dispose`, so the values are
+    // frozen the moment the run ends — before any persist, view or wait reads them.
+    if (terminalReason(this.task) !== null) {
+      const endedAt = this.task?.endedAt;
+      if (Number.isFinite(endedAt)) {
+        this.freezeDelivery(endedAt);
+        return this.deliveredAtMs;
+      }
+    }
+    const delivered = this.attentionDelivered;
+    if (delivered !== null) return delivered.delivery;
+    // Before the run has started there is no interval to measure, and the RUN'S START is where
+    // the FIRST interval begins — so a monitor that did not see the start (it may be created
+    // by an observation while the task is still `pending`) adopts that same origin as soon as
+    // it can read it.
+    //
+    // Every instant a caller passes to a delivery entry point is measured on THIS monitor's
+    // clock, so the origin always belongs to the same time base. That is what lets the first
+    // real delivery open a genuinely new interval instead of being refused as "already passed".
+    return this.runOrigin() ?? this.now();
+  }
+
+  /**
+   * Whether the run progress check has already been reported for the current interval.
+   * @returns {boolean} true when this interval's one report is spent.
+   */
+  progressReported() {
+    return this.progressReported !== null && this.progressReported.origin === this.progressOrigin();
+  }
+
+  /**
+   * Claim one interval's progress check AT a specific instant, without recursing.
+   *
+   * The claim is bound to the interval's ORIGIN, so the same interval can never be reported
+   * twice however often this is called, and a later interval (opened by a real delivery) is
+   * unaffected. It writes the report latch only — never the delivery record: a report is not
+   * a delivery, and a delivery is not a report.
+   * @param {number} origin - the interval origin.
+   * @param {number} at - the instant to judge at.
+   * @returns {boolean} whether the check was claimed.
+   */
+  claimAttentionAt(origin, at = this.now()) {
+    if (!enabled(this.attentionMs)) return false;
+    if (this.progressReported !== null && this.progressReported.origin === origin) return false;
+    if (at - origin < this.attentionMs) return false;
+    this.progressReported = { origin, at };
     return true;
+  }
+
+  /**
+   * Count one REAL delivery to the commander and open the next interval.
+   *
+   * A delivery is a result the commander did not have before. In THIS protocol that means the
+   * run's terminal outcome (and, once a producer exists, a stage result through
+   * {@link noteStageResult}). A local self-check diagnostic, internal model/tool activity, a
+   * heartbeat, an empty poll, an approval or question wait, the progress check itself and the
+   * run's own start are NOT deliveries: if any of them opened a new interval, polling or the
+   * run's own inspection would postpone the reminder it exists to raise.
+   *
+   * Three rules keep the clock honest:
+   *
+   *  * an instant that does not move past the current interval's origin (including the run's
+   *    start, which opens the FIRST interval) is refused as `opening-interval`/`stale`;
+   *  * a `stale` confirmation is refused explicitly and changes nothing;
+   *  * the result is IDEMPOTENT per interval: two confirmations between the same two
+   *    deliveries advance the clock ONCE.
+   * @param {number} [at] - the delivery instant.
+   * @param {object} [options] - `stale` for a confirmation known to be superseded.
+   * @returns {{ counted: boolean, delivery: number, reason: string | null }} result.
+   */
+  noteDelivery(at = this.now(), options = {}) {
+    const current = this.progressOrigin();
+    if (options.stale === true) {
+      return { counted: false, delivery: current, reason: 'stale' };
+    }
+    const instant = Number.isFinite(at) ? at : this.now();
+    // A delivery must be dated AFTER the interval it opens. This check comes first, so every
+    // refusal states the real reason (`opening-interval` / `stale`) instead of hiding behind the
+    // per-interval duplicate below: an instant at or before the origin is not inside this
+    // interval at all, it is the interval's own starting point.
+    if (instant < current || (this.attentionDelivered === null && instant <= current)) {
+      return {
+        counted: false,
+        delivery: current,
+        reason: this.attentionDelivered === null ? 'opening-interval' : 'stale',
+      };
+    }
+    // IDEMPOTENT per interval: a second confirmation for the SAME interval must not advance the
+    // clock again. "Same interval" means the origin the last delivery opened is still the current
+    // origin AND the confirmation is not dated later than that delivery — i.e. it describes the
+    // interval that is already open. A confirmation dated after it belongs to the next interval
+    // and must be able to open it.
+    const opened = this.attentionDelivered;
+    if (opened !== null && this.deliveryCountedInterval === current && instant <= opened.delivery) {
+      return { counted: false, delivery: current, reason: null };
+    }
+    this.attentionDelivered = { delivery: instant, origin: instant, at: instant };
+    this.deliveryCountedInterval = instant;
+    this.deliveries += 1;
+    // A new interval begins HERE, so its one report is unspent. The latch is keyed by the
+    // interval origin, so it already reads as unspent — clearing it explicitly keeps the two
+    // records impossible to contradict.
+    this.progressReported = null;
+    return { counted: true, delivery: instant, reason: null };
+  }
+
+  /**
+   * The INTERNAL entry point for a stage result that was really handed to the commander.
+   *
+   * This is the only way a mid-run result can advance the clock, and it is deliberately
+   * minimal and closed:
+   *
+   *  * it reads an opaque `eventId` and a `deliveredAt` instant, and NOTHING else — no content,
+   *    no prose, no diagnostics, so no transcript can travel through it;
+   *  * a stage result is counted AT MOST ONCE BY ITS EVENT: replaying the same `eventId` is a
+   *    duplicate and moves nothing, whatever instant the replay carries;
+   *  * it is accepted only for an event that already happened (`deliveredAt`); a missing or
+   *    unusable value is refused, because an unconfirmed result is not news anyone received;
+   *  * it is NOT an MCP argument, a tool schema, a settings field or a client route — no
+   *    public interface is widened by it.
+   *
+   * Nothing in this build produces such a stage result: the wait channel delivers the run's
+   * result when the task ENDS. A caller that later has one (a real host-side delivery) may
+   * confirm it here; tests drive this seam directly, which is what proves the rule.
+   * @param {{ eventId?: unknown, deliveredAt?: unknown } | null} stage - the delivered stage result.
+   * @returns {{ counted: boolean, delivery: number | null, reason: string | null }} result.
+   */
+  noteStageResult(stage) {
+    if (stage === null || typeof stage !== 'object' || Array.isArray(stage)) {
+      return { counted: false, delivery: null, reason: 'stage-required' };
+    }
+    const eventId = typeof stage.eventId === 'string' && stage.eventId !== '' ? stage.eventId : null;
+    if (eventId === null) {
+      return { counted: false, delivery: null, reason: 'event-id-required' };
+    }
+    const at = stage.deliveredAt;
+    if (!Number.isFinite(at) || at <= 0) {
+      return { counted: false, delivery: null, reason: 'delivery-instant-required' };
+    }
+    // Per-event deduplication: ONE stage result advances the clock once, however often it is
+    // replayed or retried. The set is bounded, and only event identities are kept.
+    if (this.stageEvents.has(eventId)) {
+      return { counted: false, delivery: this.progressOrigin(), reason: 'duplicate' };
+    }
+    const result = this.noteDelivery(at);
+    if (result.counted === true) {
+      this.stageEvents.add(eventId);
+      while (this.stageEvents.size > MAX_TRACKED_STAGE_EVENTS) {
+        const oldest = this.stageEvents.values().next();
+        if (oldest.done === true) break;
+        this.stageEvents.delete(oldest.value);
+      }
+    }
+    // The refusal reason is passed through, so a caller can tell "counted", "duplicate" and
+    // "stale instant" apart instead of reading `counted: false` blindly.
+    return { counted: result.counted, delivery: result.delivery, reason: result.reason };
+  }
+
+  /**
+   * Build the bounded diagnostic carried by the run progress check.
+   *
+   * Everything here is a fact the engine already holds: how long nothing was delivered to
+   * the commander, what the run is doing, how long it has existed, the phase, the open tool
+   * (if any) and the self-check verdict. There is no model text, no diff, no file content
+   * and no review prose, so a check can never become a second, larger wait answer.
+   * @param {number} at - reference time.
+   * @returns {object} bounded diagnostic.
+   */
+  progressCheckpoint(at = this.now()) {
+    const noDeliveryMs = Math.max(0, at - this.progressOrigin());
+    return {
+      kind: CHECKPOINTS.progress,
+      thresholdMs: this.attentionMs,
+      thresholdSeconds: Math.round(this.attentionMs / 1000),
+      // Field one: how long NOTHING new reached the commander.
+      noDeliveryMs,
+      noDeliveryMinutes: Math.floor(noDeliveryMs / 60_000),
+      lastDeliveryAt: this.attentionDelivered === null ? null : this.attentionDelivered.at,
+      deliveries: this.deliveries,
+      // Context only: a long run is not a reminder on its own.
+      runElapsedMs: Math.max(0, at - (this.runOrigin() ?? at)),
+      ...this.checkpointFacts(at),
+      // Stated once, machine-readably, so a host never has to infer from prose that
+      // this reminder did not touch the run.
+      runContinues: true,
+    };
+  }
+
+  /**
+   * The bounded facts a checkpoint reports, shared by every level of the view.
+   *
+   * At the instant a checkpoint fires no self-check has necessarily run yet (a busy run
+   * reaches the delivery threshold long after its ten-minute inspection, and a disabled
+   * self-check never runs at all), so the failure a reader would otherwise take for "we
+   * inspected and found nothing" is avoided by publishing the verdict verbatim — `null`
+   * means "not inspected", which is the honest answer.
+   *
+   * Two field groups are kept apart on purpose: `noDeliveryForMs` says how long nothing
+   * reached the commander, and `activity` says what DSH is doing. A run that is actively
+   * working has BOTH a long `noDeliveryForMs` and `activity.kind: "model-working"`, and an
+   * operator must see both rather than one blended sentence.
+   * @param {number} at - reference time.
+   * @returns {object} bounded facts.
+   */
+  checkpointFacts(at = this.now()) {
+    const task = this.task ?? {};
+    const pending = task.permission?.pending ?? null;
+    const span = this.activity.toolSpan(at);
+    return {
+      state: typeof task.state === 'string' ? task.state : null,
+      phase: typeof task.phase === 'string' ? task.phase : null,
+      // Field one, at the top level, so no reader has to know where to look. Measured
+      // against the reference instant this view was asked for, and never at the wall clock,
+      // so a settled run reports the frozen span its reader asked about.
+      noDeliveryForMs: Math.max(0, at - this.progressOrigin()),
+      // Field two: what the run is doing right now, in a closed vocabulary.
+      activity: this.runActivity(at),
+      // The executor-side measure, kept separate from the delivery clock: a long tool
+      // call is described as an open call, not as idleness.
+      lastActivityAt: this.activity.lastActivityAt,
+      idleForMs: this.activity.idleForMs(at),
+      currentTool: span === null ? null : { name: span.name, callId: span.callId, elapsedMs: span.elapsedMs },
+      waitingOn: span === null ? 'idle' : 'tool',
+      activityEvents: this.activity.activityEvents(),
+      events: this.activity.totalEvents(),
+      selfCheckVerdict: this.selfCheck.verdict,
+      permissionPending: pending !== null,
+    };
   }
 
   /**
@@ -1175,17 +1879,46 @@ export class TaskMonitor {
    */
   snapshot({ at = this.now(), toolActive = false } = {}) {
     const summary = this.activity.summary({ at, toolActive });
+    const noDeliveryMs = Math.max(0, at - this.progressOrigin());
     return {
       ...summary,
       // Stated so a reader never has to derive the thresholds from a settings
-      // document that may have changed since this task froze its own.
+      // document that may have changed since this task froze its own. `0` means the
+      // reminder is switched off for this run. `attentionSeconds` is the run progress
+      // check: the ONE notification interval this product has.
       selfCheckSeconds: Math.round(this.selfCheckMs / 1000),
       attentionSeconds: Math.round(this.attentionMs / 1000),
+      // The self-check, described exactly as the timer arms it: measured from the real
+      // start of execution, ONCE per run, and never due before the run started. When the
+      // record carries a start this monitor's clock cannot compare with, the instant is
+      // stated as `null` — "no usable start" is the honest answer, and it is checked
+      // BEFORE adding, so `NaN` can never leak into a view.
+      selfCheckDueAt: enabled(this.selfCheckMs) && this.runOrigin() !== null
+        ? this.runOrigin() + this.selfCheckMs
+        : null,
+      // The run progress check, described in the same bounded terms the reminder itself
+      // uses, so the task page and a wait answer agree without either reading a settings
+      // document. There is no separate cadence and no total-runtime clock.
+      progressCheck: {
+        thresholdSeconds: Math.round(this.attentionMs / 1000),
+        // Field one: consecutive time with NOTHING delivered to the commander.
+        noDeliveryForMs: noDeliveryMs,
+        noDeliveryMinutes: Math.floor(noDeliveryMs / 60_000),
+        lastActivityAt: this.activity.lastActivityAt,
+        lastDeliveryAt: this.attentionDelivered === null ? null : this.attentionDelivered.at,
+        deliveries: this.deliveries,
+        reportedThisEpisode: this.progressReported !== null && this.progressReported.origin === this.progressOrigin() && enabled(this.attentionMs),
+        nextDueAt: Number.isFinite(this.nextAttentionAt()) ? this.nextAttentionAt() : null,
+        ...this.checkpointFacts(at),
+      },
       idleForMs: this.activity.idleForMs(at),
       selfCheck: {
         episode: this.selfCheck.episode,
         checkedAt: this.selfCheck.checkedAt,
         verdict: this.selfCheck.verdict,
+        // Both independent fields, straight from the diagnostic.
+        sinceStartMs: this.selfCheck.sinceStartMs ?? null,
+        noDeliveryForMs: this.selfCheck.noDeliveryForMs ?? null,
       },
       // The repeated-failure reminder, as bounded evidence: one small object per
       // reported episode, never arguments, output or error prose.
@@ -1236,18 +1969,30 @@ export class TaskMonitor {
    *  2. `ready`/`failed`/`cancelled` — the task reached a terminal state. This wins
    *     over a disposal wake, so an observation released by engine teardown still
    *     reports the outcome the run actually reached;
-   *  3. `permission` — a per-call decision is outstanding. Waiting for approval is
-   *     not a stall;
-   *  4. `attention` — the silence reached `attentionSeconds` (once, then on the
-   *     cooldown) AND the claim was won. Genuine progress never produces this: it
-   *     resets the silence instead, which is the whole point of the feature;
+   *  3. `permission` / `question` — a human decision is outstanding. Waiting for an
+   *     answer is not a stall;
+   *  3b. `attention` with `checkpoint: "failure"` — the repeated-tool-failure reminder.
+   *     Independent of any clock: a busy run can fail the same call over and over;
+   *  4. `attention` with `checkpoint: "progress"` — the run has DELIVERED nothing new to
+   *     the commander for `attentionSeconds` (default 40 minutes) and the claim for this
+   *     delivery interval was won. DSH-internal model steps, text, tool activity,
+   *     heartbeats, the self-check and this very check never count as a delivery, so a
+   *     run that is visibly busy can still reach it — and one interval produces at most
+   *     one report;
    *  5. `heartbeat` — the bounded wait expired with nothing to report.
    *
-   * The self-check runs inside the loop, so a monitor with no observer costs
-   * nothing. Every caller gets its own controller and timer, so an observation
-   * never cancels another.
+   * The self-check runs inside the loop AND on its own scheduled timer (see
+   * {@link scheduleSelfCheck}): an observation finds it already done for this run when no
+   * caller was waiting, and a run with no observer at all is still inspected. The diagnostic
+   * it produces travels on the answer as a READ of local facts; it is not a delivery and does
+   * not advance the 40-minute clock. Neither does a heartbeat, an empty poll, a `wait-limit`,
+   * a permission/question wait, a failure reminder or the check itself — this channel
+   * delivers the run's result when the task ENDS, and nothing before that is a result. A real
+   * stage result could only arrive through {@link noteStageResult}.
+   * Every caller gets its own controller and timer, so an observation never cancels
+   * another.
    * @param {object} [options] - `waitMs`, `signal`.
-   * @returns {Promise<{ reason: string, activitySinceWait: boolean, waitedMs: number, selfCheck: object | null }>} outcome.
+   * @returns {Promise<{ reason: string, checkpoint: string | null, activitySinceWait: boolean, waitedMs: number, selfCheck: object | null }>} outcome.
    */
   async observe(options = {}) {
     const signal = options.signal ?? null;
@@ -1279,20 +2024,28 @@ export class TaskMonitor {
         const at = this.now();
         const activitySinceWait = this.activity.sequence !== startingSequence;
         // A pure read of local facts, run BEFORE any reason is returned so every
-        // report carries the diagnostic that explains the silence.
+        // report carries the diagnostic that explains the run's state.
         const checked = this.runSelfCheck(at);
         if (checked !== null) selfCheck = checked;
 
         // (2) The run's own outcome outranks a wake-up: a task that ended must be
-        // reported as ended even if the monitor was disposed in the same instant.
+        // reported as ended even if the monitor was disposed in the same instant. The
+        // outcome is a delivery only when THIS answer is the one that releases it, and the
+        // engine decides that at the single place an answer is built (`observationOf`) — a
+        // monitor-level pre-answer would claim a delivery nobody necessarily received.
         const terminal = terminalReason(this.task);
-        if (terminal !== null) return this.outcome(terminal, activitySinceWait, at - startedAt, selfCheck);
+        if (terminal !== null) {
+          return this.outcome(terminal, activitySinceWait, at - startedAt, selfCheck);
+        }
 
         // (1) Only one's OWN abort (or disposal) interrupts.
         if (this.disposed || waiter.controller.aborted === true || (signal !== null && signal.aborted === true)) {
           return this.outcome(OBSERVE_REASONS.interrupted, activitySinceWait, at - startedAt, selfCheck);
         }
 
+        // A permission or question wait is NOT a delivery of progress: the commander is
+        // being asked something, and the 40-minute interval must keep running so a task
+        // that is blocked on a human is still reported as "not returned for X minutes".
         if (this.task?.permission?.pending !== null && this.task?.permission?.pending !== undefined) {
           return this.outcome(OBSERVE_REASONS.permission, activitySinceWait, at - startedAt, selfCheck);
         }
@@ -1303,25 +2056,50 @@ export class TaskMonitor {
           // turn this into `attention`.
           return this.outcome(OBSERVE_REASONS.question, activitySinceWait, at - startedAt, selfCheck);
         }
-        // (3b) Repeated failures. Same reason as the silence report — it needs the
-        // commander — but it carries its own typed diagnostic and is NOT gated on
-        // silence: a busy run that keeps failing the same operation must still reach
-        // the host. Permission and a terminal state above outrank it.
+        // (3b) Repeated failures. Same reason as the progress check — it needs the
+        // commander — but it carries its own typed diagnostic and is NOT gated on the
+        // delivery clock: a busy run that keeps failing the same operation must still
+        // reach the host. Permission and a terminal state above outrank it. It is not a
+        // delivery of progress either: a reminder is not a new result.
         const failure = this.claimFailureReport();
         if (failure !== null) {
-          return this.outcome(OBSERVE_REASONS.attention, activitySinceWait, at - startedAt, selfCheck, failure);
+          return this.outcome(OBSERVE_REASONS.attention, activitySinceWait, at - startedAt, selfCheck, failure, CHECKPOINTS.failure);
         }
-        // (4) `claimAttention` is false while genuine progress has reset the clock,
-        // because the origin moved into the future relative to `nextAttentionAt()`.
-        if (this.claimAttention(at)) {
-          return this.outcome(OBSERVE_REASONS.attention, activitySinceWait, at - startedAt, selfCheck);
+        // (4) The run progress check, measured on the DELIVERY clock (see
+        // `progressOrigin`): it fires at most once per delivery interval and asks the
+        // commander to check the run — it never cancels, restarts or resubmits anything,
+        // and reporting it does NOT advance the clock.
+        //
+        // It is CLAIMED at the instant it became due (bounded by this reading), because a
+        // single bounded wait routinely spans that instant: a caller must be told as soon as
+        // the wait ends instead of keeping quiet. The diagnostic is still reported at THIS
+        // reading, so the span it states is the time that has really passed.
+        const dueAt = this.nextAttentionAt();
+        if (Number.isFinite(dueAt) && dueAt <= at && this.claimAttention(dueAt)) {
+          return this.outcome(
+            OBSERVE_REASONS.attention,
+            activitySinceWait,
+            at - startedAt,
+            selfCheck,
+            null,
+            CHECKPOINTS.progress,
+            this.progressCheckpoint(at),
+          );
         }
         const elapsed = at - startedAt;
         if (elapsed >= waitMs) {
+          // A heartbeat is nothing new: it is explicitly NOT a delivery, so the
+          // 40-minute clock is untouched by a commander that polls.
           return this.outcome(OBSERVE_REASONS.heartbeat, activitySinceWait, elapsed, selfCheck);
         }
-        const untilAttention = this.nextAttentionAt() - at;
-        const slice = Math.max(1, Math.min(this.waitSliceMs, waitMs - elapsed, untilAttention));
+        // Wake for the next reminder the run could actually produce. A disabled reminder
+        // contributes `Infinity`, so "off" cannot make the slice shorter.
+        //
+        // The slice is a TIME TO WAIT, so it is floored at 1 ms even when the next reminder
+        // is already due: waking in the same millisecond would spin on a due instant the loop
+        // is about to handle, which is how an interval could be claimed between two readings.
+        const untilNext = Math.max(1, this.nextAttentionAt() - at);
+        const slice = Math.max(1, Math.min(this.waitSliceMs, waitMs - elapsed, untilNext));
         try {
           await this.wait(slice, { signal: waiter.controller.signal });
         } catch {
@@ -1344,16 +2122,74 @@ export class TaskMonitor {
    * @param {object | null} selfCheck - the last self-check diagnostic.
    * @param {object | null} [failure] - the repeated-failure diagnostic, when that is
    *   what ended the wait.
+   * @param {string | null} [checkpoint] - which `attention` reminder this is
+   *   (`progress`/`stall`/`failure`), or null for a reason that is not one.
+   * @param {object | null} [progress] - the bounded progress-checkpoint diagnostic.
    * @returns {object} outcome.
    */
-  outcome(reason, activitySinceWait, waitedMs, selfCheck, failure = null) {
+  outcome(reason, activitySinceWait, waitedMs, selfCheck, failure = null, checkpoint = null, progress = null) {
     return {
       reason,
+      // Only an `attention` reason has a checkpoint; stating one for any other reason
+      // would invite a host to act on a reminder that was never made.
+      checkpoint: reason === OBSERVE_REASONS.attention ? checkpoint : null,
       failure,
+      progress,
       activitySinceWait: activitySinceWait === true,
       waitedMs: Math.max(0, Math.trunc(waitedMs)),
       selfCheck,
     };
+  }
+
+  /**
+   * Publish the bounded delivery state, and count a delivery the ENGINE confirmed.
+   *
+   * Two things in one place so the engine never has to know how the interval is derived:
+   *
+   *  * it reports how long the current interval is (`noDeliveryForMs`) and what the run is
+   *    doing (`activity`), which is exactly the pair of independent fields the reminder
+   *    must state;
+  /**
+   * Publish the bounded delivery state, and count the ONE delivery the engine can name.
+   *
+   * Two things in one place so the engine never has to know how the interval is derived:
+   *
+   *  * it reports how long the current interval is (`noDeliveryForMs`) and what the run is
+   *    doing (`activity`) — exactly the pair of independent fields the reminder must state;
+   *  * when the engine passes `delivered: true`, the run reached its terminal outcome, which
+   *    IS the result the commander receives, so the clock advances once and `counted` says so.
+   *    Every other answer — a heartbeat, an empty poll, a self-check diagnostic, a permission
+   *    or question wait, a failure reminder, the progress check itself — counts nothing.
+   * @param {object} [options] - `at`, `delivered`.
+   * @returns {{ noDeliveryForMs: number, noDeliveryMinutes: number, lastDeliveryAt: number | null,
+   *   deliveries: number, activity: object, counted: boolean, countReason: string | null }} delivery state.
+   */
+  delivery({ at = this.now(), delivered = false } = {}) {
+    const noted = delivered === true ? this.noteDelivery(at) : null;
+    const noDeliveryMs = Math.max(0, at - this.progressOrigin());
+    return {
+      noDeliveryForMs: noDeliveryMs,
+      noDeliveryMinutes: Math.floor(noDeliveryMs / 60_000),
+      lastDeliveryAt: this.attentionDelivered === null ? null : this.attentionDelivered.at,
+      deliveries: this.deliveries,
+      activity: this.runActivity(at),
+      counted: noted !== null && noted.counted === true,
+      countReason: noted === null ? null : noted.reason,
+    };
+  }
+
+  /**
+   * Freeze every elapsed value — including the delivery interval — at the run's end.
+   *
+   * Called once by {@link dispose}, so a stored record reports the spans the run really
+   * had. The delivery interval is frozen only if it is not already frozen.
+   * @param {number} endedAt - the recorded end instant.
+   * @returns {void}
+   */
+  freezeDelivery(endedAt) {
+    if (this.deliveredAtMs !== null) return;
+    if (!Number.isFinite(endedAt)) return;
+    this.deliveredAtMs = endedAt;
   }
 
   /**
@@ -1365,9 +2201,16 @@ export class TaskMonitor {
    * @returns {void}
    */
   dispose(endedAt = undefined) {
-    if (typeof endedAt === 'number') this.activity.finalize(endedAt);
+    if (typeof endedAt === 'number') {
+      this.activity.finalize(endedAt);
+      // A finished run can deliver nothing more, so its delivery interval stops being
+      // measured at the recorded end instead of reporting a wait nobody could shorten.
+      this.freezeDelivery(endedAt);
+    }
     if (this.disposed) return;
     this.disposed = true;
+    // The scheduled self-check goes with the run: a disposed monitor leaves no timer.
+    this.clearSelfCheckTimer();
     // Open calls can never produce a result for a run that has ended; the reported
     // trail stays as bounded evidence. The undelivered reminder is dropped with it.
     this.failures.dispose();
@@ -1408,16 +2251,63 @@ function boundedWait(waitMs) {
 }
 
 /**
- * Convert a validated seconds threshold to milliseconds, with the documented
- * default when the value is absent.
+ * Convert a validated seconds threshold to milliseconds.
+ *
+ * Three cases, deliberately distinct:
+ *  * a missing/invalid value takes the documented default — a monitor built without
+ *    a threshold must behave like the configured default, not like "off";
+ *  * `0` (or a negative value) is DISABLED and becomes `0` ms, which every caller
+ *    treats as "this reminder never fires";
+ *  * any other whole number of seconds becomes that many milliseconds.
  * @param {unknown} value - seconds.
- * @param {number} fallbackSeconds - default.
- * @returns {number} milliseconds.
+ * @param {number} fallbackSeconds - documented default.
+ * @returns {number} milliseconds, `0` meaning disabled.
  */
-function secondsToMs(value, fallbackSeconds) {
-  const seconds = Number.isSafeInteger(value) && value > 0 ? value : fallbackSeconds;
+function thresholdToMs(value, fallbackSeconds) {
+  const seconds = Number.isSafeInteger(value) ? value : fallbackSeconds;
+  if (seconds <= 0) return 0;
   return seconds * 1000;
 }
+
+/** Whether a milliseconds threshold is enabled. */
+function enabled(ms) {
+  return Number.isFinite(ms) && ms > 0;
+}
+
+/**
+ * The longest delay a `setTimeout` honours on both Node and the browser (~24.8 days).
+ *
+ * A longer delay is a platform-dependent overflow (Node clamps it to 1 ms), so it is never
+ * passed to the timer: see the poll in {@link TaskMonitor#scheduleSelfCheck}.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/** Short poll used only when the threshold is further away than a timer can express. */
+const SELF_CHECK_POLL_MS = 60_000;
+
+/**
+ * How close an armed instant must be to the monitor's own clock to be treated as an epoch
+ * instant a real platform timer can be given.
+ *
+ * A production monitor reads `Date.now()`, so its due instant is an epoch millisecond and is
+ * handed to `setTimeout` verbatim: a timer that fires late still records the check at the
+ * instant the threshold was reached. A monitor built over an injected (arbitrary) clock has
+ * an instant that means nothing to the platform timer, so it is not handed over at all and
+ * the check is recorded at that clock's own reading instead.
+ */
+const MAX_EPOCH_DOMAIN_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The oldest recorded run start this monitor will measure silence from, relative to its
+ * own clock.
+ *
+ * A task record carries its start from the HOST wall clock while the monitor reads its
+ * injected clock. A difference beyond this is not a real elapsed time but two clocks that
+ * disagree (a test's frozen clock, or a clock that moved); measuring from it would make a
+ * fresh run look long silent. Past this bound the monitor measures from its own `now`,
+ * which is the only instant it can honestly compare against.
+ */
+const MAX_PLAUSIBLE_IDLE_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Default wait seam: a real, unref'd timeout that honours an abort signal.

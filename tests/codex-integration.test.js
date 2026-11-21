@@ -40,12 +40,14 @@ import {
   desiredMcpCommand,
   digest,
   discoveryPin,
+  emplaceMcpMarker,
   hostRuntimeKind,
   inspectCodexBoundary,
   isKnownPriorTemplate,
   isNodeExecutableName,
   isOwnedEntryScript,
   isOwnedStaleEntry,
+  locateMcpDefinition,
   packageEntryRoot,
   samePlatformPath,
   packagedNodePath,
@@ -97,7 +99,7 @@ for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} m
     assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
   }
 });
-const DELIVERABLE_VERSION = '1.6.0';
+const DELIVERABLE_VERSION = '1.7.0';
 
 // The 1.5.0 allow-list entries are the OLD published identity of the template. This
 // working tree's template text has grown (team, same-chain preflight, review evidence
@@ -152,7 +154,7 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
     assert.deepEqual(refreshed.changed, ['agent']);
     assert.deepEqual(refreshed.refused, []);
     assert.equal(refreshed.status.agent.state, 'installed');
-    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.6\.0"$/mu);
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.6\.1"$/mu);
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
   } finally {
     fixture.cleanup();
@@ -3367,7 +3369,7 @@ test('startup upgrades THROUGH a root link, and still refuses an agents-director
     const bodyOf = (text) => text.replace(/\r\n/g, '\n').replace(/^version[ \t]*=[ \t]*"[^"]*"\r?$/mu, 'version = "<rendered>"');
     assert.equal(bodyOf(migrated), bodyOf(candidate),
       'the old body was replaced by THIS candidate template, not by a same-version lookalike');
-    assert.ok(migrated.includes('AGENT TEAMS IS YOUR DECISION'), 'and it carries the new rules');
+    assert.ok(migrated.includes('not enable Agent Teams on your own initiative'), 'and it carries the new rules');
     assert.notEqual(migrated, published, 'the old published bytes are gone');
     assert.equal(lstatSync(linkHome).isSymbolicLink(), true, 'the root link is still there');
 
@@ -3604,16 +3606,31 @@ test('classifyMcpEntry requires the marker before it accepts an entry as its own
   assert.equal(classifyMcpEntry(new Document(ours), desired).state, 'configured');
   assert.equal(classifyMcpEntry(new Document(ours), desired).marked, true);
 
-  // Identical values, no marker: a conflict, never silently adopted.
+  // Identical values, no marker: a conflict, never silently adopted. The reason names the
+  // exact-shape case, which is the only one the MCP-only repair may complete — with the
+  // marker line and nothing else. The state stays `conflict`: no read adopts it.
   const unmarked = `[mcp_servers.dsh-delegate]\n${values}`;
   const unmarkedResult = classifyMcpEntry(new Document(unmarked), desired);
   assert.equal(unmarkedResult.state, 'conflict');
-  assert.equal(unmarkedResult.reason, 'unmanaged-entry');
+  assert.equal(unmarkedResult.reason, 'unmanaged-entry-exact');
   assert.equal(unmarkedResult.marked, false);
 
-  // A marker that is not directly above the definition does not prove anything.
+  // A marker that is not directly above the definition does not prove anything. (Here the
+  // entry is the owned shape, so the reason is the exact-shape one.)
   const detached = `${MCP_MARKER}\n\nmodel = "gpt-6.1"\n[mcp_servers.dsh-delegate]\n${values}`;
-  assert.equal(classifyMcpEntry(new Document(detached), desired).reason, 'unmanaged-entry');
+  assert.equal(classifyMcpEntry(new Document(detached), desired).reason, 'unmanaged-entry-exact');
+
+  // Any difference from the owned shape is a plain unmanaged entry again.
+  for (const [label, body] of [
+    ['another command', 'command = "C:\\\\node\\\\node2.exe"\nargs = ["C:\\\\pkg\\\\bin\\\\dsh-delegate-mcp.js"]\ntool_timeout_sec = 3660\n'],
+    ['another script', 'command = "C:\\\\node\\\\node.exe"\nargs = ["C:\\\\mine\\\\dsh-delegate-mcp.js"]\ntool_timeout_sec = 3660\n'],
+    ['a missing timeout', 'command = "C:\\\\node\\\\node.exe"\nargs = ["C:\\\\pkg\\\\bin\\\\dsh-delegate-mcp.js"]\n'],
+    ['a different timeout', 'command = "C:\\\\node\\\\node.exe"\nargs = ["C:\\\\pkg\\\\bin\\\\dsh-delegate-mcp.js"]\ntool_timeout_sec = 120\n'],
+  ]) {
+    const classified = classifyMcpEntry(new Document(`[mcp_servers.dsh-delegate]\n${body}`), desired);
+    assert.equal(classified.state, 'conflict', label);
+    assert.equal(classified.reason, 'unmanaged-entry', label);
+  }
 
   // The inline spelling is managed only when marked too. (Without the marker this
   // document already conflicts earlier, as `not-a-table`.)
@@ -3888,7 +3905,11 @@ test('the agent no longer points at a repository checkout and covers the exact d
   // Only shared isolation may be overridden for a dirty workspace; routing stays
   // entirely under the DSH Delegate plugin settings.
   assert.match(template, /For a `shared` decision, pass only\s+`overrides = \{ isolation = "shared" \}`/u);
-  assert.match(template, /Never\s+override the configured provider, model, reasoning effort or timeout/u);
+  assert.match(template, /Never\s+override the configured provider, model or reasoning effort/u);
+  // The retired execution timeout: never a global cap, never sent by default, and the
+  // explicit per-job override is the only way a deadline exists at all.
+  assert.match(template, /NO TOTAL EXECUTION DEADLINE/u);
+  assert.match(template, /do\s+NOT send it unless the operator asked for one/u);
   assert.match(template, /never\s+encode a route in the task prompt/u);
   assert.match(template, /project\s+override/u);
   // Poll the same task; no duplicates.
@@ -3962,9 +3983,10 @@ test('the companion inspects the workspace before dispatching and makes an expli
   assert.match(template, /changed-file count and bounded paths from the preflight/u);
 
   // 7. A dirty-workspace decision reaches the job as an isolation-only override;
-  //    configured routing and timeout are never changed.
+  //    configured routing is never changed, and no deadline is invented.
   assert.match(template, /For a `shared` decision, pass only\s+`overrides = \{ isolation = "shared" \}`/u);
-  assert.match(template, /Never\s+override the configured provider, model, reasoning effort or timeout/u);
+  assert.match(template, /Never\s+override the configured provider, model or reasoning effort/u);
+  assert.match(template, /NO TOTAL EXECUTION DEADLINE/u);
   assert.match(template, /does not change the submitted job's isolation by itself/u);
 
   // 8. Making a preflight pass is never done by destroying the operator's edits.
@@ -4118,10 +4140,14 @@ test('a changed or non-integer tool_timeout_sec is never silently adopted', () =
     (error) => error.code === 'MCP_ENTRY_CONFLICT',
   );
 
-  // An unmarked entry with the right values is still not ours, whatever it contains.
+  // An unmarked entry with the right values is still not ours: it stays a `conflict` and is
+  // only named as the exact shape (which `repair` may complete with the marker alone). A
+  // stale value is a plain unmanaged entry.
   const unmarked = new Document('[mcp_servers.dsh-delegate]\ncommand = "/usr/bin/node"\nargs = ["/pkg/bin/dsh-delegate-mcp.js"]\ntool_timeout_sec = 3660\n');
   assert.equal(classifyMcpEntry(unmarked, desired).state, 'conflict');
-  assert.equal(classifyMcpEntry(unmarked, desired).reason, 'unmanaged-entry');
+  assert.equal(classifyMcpEntry(unmarked, desired).reason, 'unmanaged-entry-exact');
+  const unmarkedStale = new Document('[mcp_servers.dsh-delegate]\ncommand = "/usr/bin/node"\nargs = ["/pkg/bin/dsh-delegate-mcp.js"]\ntool_timeout_sec = 120\n');
+  assert.equal(classifyMcpEntry(unmarkedStale, desired).reason, 'unmanaged-entry');
 });
 
 test('the LEGACY 1.0.0 identities are retained and labelled, never claimed as git bytes', () => {
@@ -4184,7 +4210,7 @@ for (const previous of ['1.5.0', '1.5.1']) test(`a real published ${previous} in
       const candidate = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
       assert.equal(upgraded.replace(/\r\n/g, '\n'), candidate.replace(/\r\n/g, '\n'),
         `${label}: the file now holds exactly the candidate template text`);
-      assert.ok(upgraded.includes('AGENT TEAMS IS YOUR DECISION'), `${label}: and it carries the new rules`);
+      assert.ok(upgraded.includes('not enable Agent Teams on your own initiative'), `${label}: and it carries the new rules`);
 
       // Idempotent: a second install changes nothing.
       const again = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
@@ -4230,7 +4256,7 @@ test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () =
   assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0'
     && entry.sha256 === '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b'), true);
   // The public version matches this formal release; historical identity registration is separate.
-  assert.equal(DELIVERABLE_VERSION, '1.6.0');
+  assert.equal(DELIVERABLE_VERSION, '1.7.0');
 });
 
 test('an untouched 1.5.1-test.1 install (LF and CRLF) upgrades to this candidate, idempotently', async () => {
@@ -4256,7 +4282,7 @@ test('an untouched 1.5.1-test.1 install (LF and CRLF) upgrades to this candidate
       const bodyOf = (text) => text.replace(/\r\n/g, '\n').replace(/^version[ \t]*=[ \t]*"[^"]*"\r?$/mu, 'version = "<rendered>"');
       assert.equal(bodyOf(upgraded), bodyOf(candidate), `${label}: the candidate body`);
       assert.ok(upgraded.includes('version = "1.5.1-test.2"'), `${label}: rewrote the version line`);
-      assert.ok(upgraded.includes('AGENT TEAMS IS YOUR DECISION'), `${label}: and the current rules`);
+      assert.ok(upgraded.includes('not enable Agent Teams on your own initiative'), `${label}: and the current rules`);
 
       const again = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.2' });
       assert.equal(again.status.agent.state, 'installed');
@@ -4841,4 +4867,336 @@ test('a user note added to the ORIGINAL 1.5.3-test.2 install is never overwritte
       fixture.cleanup();
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// Both settings-page regressions:
+//   (1) an untouched `1.6.1-test.6` agent with NO installation record, and
+//   (2) an `mcp_servers.dsh-delegate` definition that is already exactly this build's
+//       entry but carries no managed marker.
+// ---------------------------------------------------------------------------
+
+test("the 1.6.1-test.6 agent identity is enumerated from the packed release bytes, not from today's template", () => {
+  const fixtureText = readFileSync(join(ROOT, 'tests', 'fixtures', 'agent-1.6.1-test.6.toml'), 'utf8');
+  assert.equal(digest(fixtureText), 'f4650d6250b4133f6693f11c8288e973b433bbfab02e76ebba0eda989594d7b8');
+  assert.match(fixtureText, /^version = "1\.6\.1-test\.6"$/mu);
+  assert.equal(fixtureText.includes('\r'), false, 'the fixture is the LF form that build wrote');
+  assert.equal(KNOWN_AGENT_TEMPLATES.filter((entry) => entry.version === '1.6.1-test.6').length, 1);
+  // A single edited character or an added line is somebody else's file.
+  assert.equal(isKnownPriorTemplate(fixtureText.replace('Codex', 'Codexx')), false);
+  assert.equal(isKnownPriorTemplate(`${fixtureText}\n# operator note\n`), false);
+});
+
+test('an untouched 1.6.1-test.6 agent with NO installation record is restored to the managed version in ONE install', async () => {
+  const published = readFileSync(join(ROOT, 'tests', 'fixtures', 'agent-1.6.1-test.6.toml'), 'utf8');
+  for (const [label, text] of [['LF', published], ['CRLF', published.replace(/\n/g, '\r\n')]]) {
+    const fixture = codexHomeFixture();
+    try {
+      // No `$DSH_HOME` ownership record exists for this home: the classification rests on
+      // the published bytes alone, which is exactly the reported failure.
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      writeFileSync(fixture.agentPath, text);
+      const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+
+      const before = await runCodexAction('status', options);
+      assert.equal(before.status.agent.state, 'outdated', `${label}: an untouched published build is outdated`);
+      assert.equal(before.status.agent.managed, true, `${label}: and it is a managed file`);
+
+      const install = await runCodexAction('install', options);
+      assert.deepEqual(install.refused, [], `${label}: nothing is refused`);
+      assert.equal(install.changed.includes('agent'), true, `${label}: the agent was refreshed`);
+      assert.equal(install.status.agent.state, 'installed', `${label}: it is now this build`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'),
+        expectedInstalledText(readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8'), DELIVERABLE_VERSION),
+        `${label}: exactly this candidate's rendered text`);
+      const again = await runCodexAction('install', options);
+      assert.deepEqual(again.changed, [], `${label}: idempotent`);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+test('an edited or impersonated 1.6.1-test.6 agent is never adopted, even with the same name and version line', async () => {
+  const published = readFileSync(join(ROOT, 'tests', 'fixtures', 'agent-1.6.1-test.6.toml'), 'utf8');
+  const cases = [
+    ['one edited character', published.replace('Codex', 'Codexx')],
+    ['an added operator line', `${published.trimEnd()}\n# my own note\n`],
+    ['a trailing space', published.replace(/^name = .*$/mu, (line) => `${line} `)],
+  ];
+  for (const [label, text] of cases) {
+    const fixture = codexHomeFixture();
+    try {
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      writeFileSync(fixture.agentPath, text);
+      const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+      assert.equal((await runCodexAction('status', options)).status.agent.state, 'modified', `${label}: it is the operator's file`);
+      const install = await runCodexAction('install', options);
+      assert.ok(install.refused.some((entry) => entry.target === 'agent' && entry.code === 'AGENT_USER_MODIFIED'), `${label}: install refuses`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), text, `${label}: left byte-identical`);
+      const removed = await runCodexAction('remove', options);
+      assert.ok(removed.refused.some((entry) => entry.target === 'agent'), `${label}: remove refuses too`);
+      assert.equal(readFileSync(fixture.agentPath, 'utf8'), text, `${label}: still byte-identical`);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+/** The owned entry exactly as this build writes it, WITHOUT the marker comment. */
+function unmarkedOwnedEntry({ env = {}, timeout = null } = {}) {
+  const entry = desiredMcpCommand({ node: resolveNodeExecutable(), script: join(ROOT, 'bin', 'dsh-delegate-mcp.js') });
+  const values = [
+    `[mcp_servers.${MCP_SERVER_NAME}]`,
+    `command = ${JSON.stringify(entry.command)}`,
+    `args = [${JSON.stringify(entry.args[0])}]`,
+    `tool_timeout_sec = ${String(timeout ?? entry.toolTimeoutSec)}`,
+  ];
+  for (const key of Object.keys(env)) values.push(`env.${key} = ${JSON.stringify(env[key])}`);
+  values.push('');
+  return values.join('\n');
+}
+
+/** The same entry inside an operator config with their own content around it. */
+function configAroundUnmarked(entry, { eol = '\n' } = {}) {
+  return [
+    '# operator config',
+    'model = "gpt-6.1"',
+    '',
+    '[mcp_servers]',
+    'other = { command = "node", args = ["C:/other/server.mjs"] }',
+    '',
+    entry.trimEnd(),
+    '',
+    '[desktop]',
+    'sansFontSize = 16',
+    '',
+  ].join(eol);
+}
+
+/** The single inserted line, or null when the difference is larger than one line. */
+function singleInsertedLine(before, after) {
+  const split = (text) => text.split('\n').map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line));
+  const left = split(before);
+  const right = split(after);
+  if (right.length !== left.length + 1) return null;
+  let index = 0;
+  while (index < left.length && left[index] === right[index]) index += 1;
+  const rest = [...right.slice(0, index), ...right.slice(index + 1)];
+  if (rest.length !== left.length || rest.some((line, position) => line !== left[position])) return null;
+  return [right[index]];
+}
+
+test("MCP-only repair adds the missing marker to an entry that is ALREADY this build's, changing exactly one line", async () => {
+  for (const [label, eol] of [['LF', '\n'], ['CRLF', '\r\n']]) {
+    const fixture = codexHomeFixture();
+    try {
+      const unmarked = configAroundUnmarked(unmarkedOwnedEntry(), { eol });
+      writeFileSync(fixture.configPath, unmarked);
+      const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+
+      const before = await runCodexAction('status', options);
+      assert.equal(before.status.mcp.state, 'conflict', `${label}: an unmarked entry is a conflict`);
+      assert.equal(before.status.mcp.reason, 'unmanaged-entry-exact', `${label}: named as the exact shape`);
+      assert.equal(before.status.mcp.marked, false, `${label}: it carries no marker`);
+
+      const install = await runCodexAction('install', options);
+      assert.ok(install.refused.some((entry) => entry.target === 'mcp' && entry.code === 'MCP_ENTRY_CONFLICT'), `${label}: install never adopts it`);
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), unmarked, `${label}: install leaves it byte-identical`);
+
+      const repaired = await runCodexAction('repair', options);
+      assert.deepEqual(repaired.refused, [], `${label}: the marker step refuses nothing`);
+      assert.deepEqual(repaired.changed, ['mcp'], `${label}: only the MCP entry was written`);
+      assert.equal(repaired.status.mcp.state, 'configured', `${label}: managed and correct`);
+      assert.equal(repaired.status.mcp.marked, true, `${label}: it carries the marker`);
+      // The agent file is out of this action's scope. A separate home proves that the marker
+      // step alone creates nothing: the config below needs no `install` first.
+
+      const after = readFileSync(fixture.configPath, 'utf8');
+      assert.deepEqual(singleInsertedLine(unmarked, after), [MCP_MARKER], `${label}: the difference is exactly the marker line`);
+      const values = readTomlValues(after);
+      assert.equal(values['mcp_servers.dsh-delegate.command'].text, JSON.stringify(resolveNodeExecutable()));
+      assert.equal(after.includes('other = { command = "node", args = ["C:/other/server.mjs"] }'), true);
+      assert.equal(after.includes('sansFontSize = 16'), true);
+      assert.equal(after.includes('# operator config'), true);
+      assert.equal(after.includes(eol === '\n' ? '\r' : '\r\r'), false, `${label}: line endings unchanged`);
+
+      const again = await runCodexAction('repair', options);
+      assert.deepEqual(again.changed, [], `${label}: a second repair writes nothing`);
+      assert.equal(readFileSync(fixture.configPath, 'utf8'), after, `${label}: byte-identical`);
+      // `install` in this same home wrote the agent file; the marker step did not touch it.
+      assert.equal(existsSync(fixture.agentPath), true, `${label}: the agent file is the one install wrote`);
+      assert.equal(repaired.status.agent.state, 'installed', `${label}: and it is reported unchanged`);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+test('a differing command, script, argument, timeout or environment never gains the marker, and the file is not written', async () => {
+  const entry = unmarkedOwnedEntry();
+  const otherScript = join(tmpdir(), 'someone-else', 'bin', 'dsh-delegate-mcp.js');
+  const cases = [
+    ['another command', entry.replace(/^command = .*$/mu, 'command = "C:\\\\tools\\\\node-other.exe"')],
+    ['the legacy desktop command', entry.replace(/^command = .*$/mu, `command = ${JSON.stringify(DESKTOP_EXE)}`)],
+    ['another script', entry.replace(/^args = .*$/mu, `args = [${JSON.stringify(otherScript)}]`)],
+    ['an extra argument', entry.replace(/^args = \[(.*)\]$/mu, 'args = [$1, "--verbose"]')],
+    ['a different timeout', entry.replace(/^tool_timeout_sec = .*$/mu, 'tool_timeout_sec = 120')],
+    ['a non-integer timeout', entry.replace(/^tool_timeout_sec = .*$/mu, 'tool_timeout_sec = 3660.5')],
+    ['an extra env key', entry.replace(/^(tool_timeout_sec = .*)$/mu, '$1\nenv.MINE = "1"')],
+    ['an unknown field', entry.replace(/^(tool_timeout_sec = .*)$/mu, '$1\ncwd = "/tmp"')],
+    // A duplicated key, an inline table beside the header and an unknown sub-table are the
+    // ambiguous shapes the parser accepts: the merge would let the last value win, so the
+    // marker must never be attached to any of them.
+    ['a duplicated command key', `${entry.trimEnd()}\ncommand = ${JSON.stringify(resolveNodeExecutable())}\n`],
+    ['an inline table dot path', entry.replace(/^(tool_timeout_sec = .*)$/mu, '$1\ndsh-delegate = { command = "node" }')],
+    ['an empty extra sub-table', `${entry.trimEnd()}\n[mcp_servers.${MCP_SERVER_NAME}.custom]\n`],
+    ['a nested inline table value', entry.replace(/^(tool_timeout_sec = .*)$/mu, '$1\nmystery = { a = 1 }')],
+  ];
+  for (const [label, body] of cases) {
+    const fixture = codexHomeFixture();
+    try {
+      const config = configAroundUnmarked(body);
+      writeFileSync(fixture.configPath, config);
+      const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+      const status = await runCodexAction('status', options);
+      assert.equal(status.status.mcp.state, 'conflict', `${label}: still a conflict`);
+      assert.equal(status.status.mcp.marked, false, `${label}: never marked`);
+      for (const action of ['repair', 'install', 'remove']) {
+        const outcome = await runCodexAction(action, options);
+        assert.ok(outcome.refused.some((refusal) => refusal.target === 'mcp' && refusal.code === 'MCP_ENTRY_CONFLICT'), `${label}: ${action} refuses`);
+        assert.equal(readFileSync(fixture.configPath, 'utf8'), config, `${label}: ${action} left it byte-identical`);
+      }
+      assert.equal(readFileSync(fixture.configPath, 'utf8').includes('[desktop]'), true, `${label}: custom content kept`);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+test("the MCP-only marker step keeps the operator's custom content and the uninstall boundary", async () => {
+  const fixture = codexHomeFixture();
+  try {
+    writeFileSync(fixture.configPath, configAroundUnmarked(unmarkedOwnedEntry()));
+    const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+    assert.deepEqual((await runCodexAction('repair', options)).changed, ['mcp']);
+    const removed = await runCodexAction('remove', options);
+    assert.deepEqual(removed.changed, ['mcp']);
+    const text = readFileSync(fixture.configPath, 'utf8');
+    for (const kept of ['# operator config', 'model = "gpt-6.1"', '[mcp_servers]', 'other = { command = "node", args = ["C:/other/server.mjs"] }', '[desktop]', 'sansFontSize = 16']) {
+      assert.equal(text.includes(kept), true, `remove kept ${kept}`);
+    }
+    assert.equal(text.includes(`[mcp_servers.${MCP_SERVER_NAME}]`), false, 'only our entry went');
+    assert.equal(text.includes(MCP_MARKER), false, 'and its marker with it');
+    assert.equal(removed.status.mcp.state, 'not-configured');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('plugin startup never adopts the unmarked exact entry: it refreshes the agent and leaves the config byte-identical', async () => {
+  const published = readFileSync(join(ROOT, 'tests', 'fixtures', 'agent-1.6.1-test.6.toml'), 'utf8');
+  const fixture = codexHomeFixture();
+  const backup = backupFixture();
+  try {
+    mkdirSync(dirname(fixture.agentPath), { recursive: true });
+    writeFileSync(fixture.agentPath, published);
+    const config = configAroundUnmarked(unmarkedOwnedEntry());
+    writeFileSync(fixture.configPath, config);
+    const seam = createCodexSeam({ codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION, backupDir: backup.dir });
+    const outcome = await seam.refreshManagedIntegration({ startupTarget: await seam.startupTarget() });
+    assert.deepEqual(outcome.changed, ['agent'], 'startup refreshed the agent only');
+    assert.equal(outcome.status.mcp.state, 'conflict', 'and never adopted the unmarked entry');
+    assert.equal(readFileSync(fixture.configPath, 'utf8'), config, 'the config is byte-identical');
+    assert.deepEqual(readdirSync(backup.dir), [], 'nothing was copied because nothing was written');
+  } finally {
+    fixture.cleanup();
+    backup.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Round-2 marker insert: byte fidelity (no re-serialization) and the ambiguous shapes the
+// TOML parser accepts but this plugin must refuse to mark.
+// ---------------------------------------------------------------------------
+
+/** The owned definition block, as an operator would type it. */
+function ownedBlockLines() {
+  const entry = desiredMcpCommand({ node: resolveNodeExecutable(), script: join(ROOT, 'bin', 'dsh-delegate-mcp.js') });
+  return [
+    `[mcp_servers.${MCP_SERVER_NAME}]`,
+    `command = ${JSON.stringify(entry.command)}`,
+    `args = [${JSON.stringify(entry.args[0])}]`,
+    `tool_timeout_sec = ${String(entry.toolTimeoutSec)}`,
+  ];
+}
+
+test('the marker is spliced in as one line: mixed endings and a missing final newline all survive', async () => {
+  const block = ownedBlockLines();
+  const shapes = [
+    ['LF with a final newline', `${block.join('\n')}\n`, MCP_MARKER + '\n'],
+    ['LF without a final newline', block.join('\n'), MCP_MARKER + '\n'],
+    ['mixed CRLF and LF', `${block[0]}\r\n${block.slice(1).join('\n')}\n`, MCP_MARKER + '\r\n'],
+    ['an indented header', `  ${block[0]}\n${block.slice(1).join('\n')}\n`, MCP_MARKER + '\n'],
+    ['CRLF throughout', `${block.join('\r\n')}\r\n`, MCP_MARKER + '\r\n'],
+  ];
+  for (const [label, text, expectedInsert] of shapes) {
+    const result = await emplaceMcpMarker(new Document(text), desiredMcpCommand({
+      node: resolveNodeExecutable(),
+      script: join(ROOT, 'bin', 'dsh-delegate-mcp.js'),
+    }));
+    assert.equal(result.ok, true, `${label}: ${JSON.stringify(result)}`);
+    // The header line (indentation included) still starts the definition; the marker is
+    // exactly one line immediately before it, with the line ending chosen from that position.
+    // The comparison is relative to the header, so an indented header (whose insertion offset
+    // sits before its own indentation) needs no special case.
+    const headerAt = result.text.indexOf(`[mcp_servers.${MCP_SERVER_NAME}]`);
+    assert.ok(headerAt >= expectedInsert.length, `${label}: the header is still there`);
+    const indent = text.length - text.replace(/^\s*/u, '').length;
+    const markerAt = headerAt - indent - expectedInsert.length;
+    assert.equal(result.text.slice(markerAt, markerAt + expectedInsert.length), expectedInsert,
+      `${label}: exactly one marker line sits directly above the header`);
+    // Deleting that one line gives the original text back byte for byte.
+    const restored = `${result.text.slice(0, markerAt)}${result.text.slice(markerAt + expectedInsert.length)}`;
+    assert.equal(restored, text, `${label}: deleting the new line restores the original byte for byte`);
+  }
+});
+
+test('a marker inserted above a prefixed comment stays adjacent to the header and keeps the comment', async () => {
+  const block = ownedBlockLines();
+  const text = ['# keep: operator note about this entry', ...block, '', '[desktop]', 'sansFontSize = 16', ''].join('\n');
+  const result = await emplaceMcpMarker(new Document(text), desiredMcpCommand({
+    node: resolveNodeExecutable(),
+    script: join(ROOT, 'bin', 'dsh-delegate-mcp.js'),
+  }));
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const expected = ['# keep: operator note about this entry', MCP_MARKER, ...block, '', '[desktop]', 'sansFontSize = 16', ''].join('\n');
+  assert.equal(result.text, expected, 'the marker goes between the comment and the header only');
+  const after = new Document(result.text);
+  assert.equal(locateMcpDefinition(after).marker, MCP_MARKER, 'the locator still sees it above the header');
+  assert.equal(classifyMcpEntry(after, desiredMcpCommand({ node: resolveNodeExecutable(), script: join(ROOT, 'bin', 'dsh-delegate-mcp.js') })).state,
+    'configured', 'and the entry is managed');
+});
+
+test('the marker never goes above a shared [mcp_servers] parent, so sibling entries stay unclaimed', async () => {
+  const block = ownedBlockLines();
+  const text = ['[mcp_servers]', 'other = { command = "node", args = ["C:/other/server.mjs"] }', '', ...block, ''].join('\n');
+  const result = await emplaceMcpMarker(new Document(text), desiredMcpCommand({
+    node: resolveNodeExecutable(),
+    script: join(ROOT, 'bin', 'dsh-delegate-mcp.js'),
+  }));
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.text.startsWith('[mcp_servers]\n'), true, 'the shared parent header is untouched');
+  assert.equal(result.text.includes('other = { command = "node", args = ["C:/other/server.mjs"] }'), true);
+  assert.equal(result.text.indexOf(MCP_MARKER) > result.text.indexOf(`[mcp_servers.${MCP_SERVER_NAME}]`), false,
+    'the marker sits just above our own header, after the sibling assignment');
+});
+
+test('an inline table plus a header for the same server is refused, never merged', async () => {
+  const entry = desiredMcpCommand({ node: resolveNodeExecutable(), script: join(ROOT, 'bin', 'dsh-delegate-mcp.js') });
+  const inline = `dsh-delegate = { command = ${JSON.stringify(entry.command)}, args = [${JSON.stringify(entry.args[0])}], tool_timeout_sec = ${String(entry.toolTimeoutSec)} }`;
+  const text = ['[mcp_servers]', inline, '', ...ownedBlockLines(), ''].join('\n');
+  const result = await emplaceMcpMarker(new Document(text), entry);
+  assert.equal(result.ok, false, 'a doubled definition is not this plugin\'s to mark');
+  assert.equal(classifyMcpEntry(new Document(text), entry).reason, 'unmanaged-entry');
 });

@@ -17,10 +17,12 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  RECORD_IDLE_REFRESH_INTERVAL_MS,
   RECORD_REFRESH_INTERVAL_MS,
   REVIEW_NOTE_PREVIEW_CHARS,
   hasChangingRecords,
   isTaskRecordChanging,
+  recordRefreshMode,
   recordRefreshPlan,
   reviewNotePreview,
   taskOutcome,
@@ -86,41 +88,77 @@ test('a record is changing while it runs, waits for review, or its conclusion is
   assert.equal(isTaskRecordChanging(null), false);
 });
 
-test('the refresh plan pauses when hidden, skips while loading, and stops when settled', () => {
+test('the refresh plan pauses when hidden, skips while loading, and drops to the idle rate when settled', () => {
   const tasks = [WAITING];
   assert.deepEqual(recordRefreshPlan({ tasks, visible: true }), {
     refresh: true, intervalMs: RECORD_REFRESH_INTERVAL_MS, reason: 'changing',
   });
-  assert.equal(RECORD_REFRESH_INTERVAL_MS, 5_000, 'the page refreshes every 5 seconds');
+  assert.equal(RECORD_REFRESH_INTERVAL_MS, 5_000, 'a changing record refreshes every 5 seconds');
+  assert.equal(RECORD_IDLE_REFRESH_INTERVAL_MS, 15_000, 'an idle page checks every 15 seconds');
   // Hidden: no polling at all.
   assert.equal(recordRefreshPlan({ tasks, visible: false }).reason, 'hidden');
   assert.equal(recordRefreshPlan({ tasks, visible: false }).refresh, false);
   // A request already in flight owns the next tick, so reads never overlap.
   assert.equal(recordRefreshPlan({ tasks, visible: true, loading: true }).reason, 'loading');
   assert.equal(recordRefreshPlan({ tasks, visible: true, loading: true }).refresh, false);
-  // A page of settled conclusions does not poll.
+  // Off the records page there is nothing to keep current, so nothing is read.
+  assert.equal(recordRefreshPlan({ tasks, visible: true, mounted: false }).reason, 'unmounted');
+  assert.equal(recordRefreshPlan({ tasks: [], visible: true, mounted: false }).refresh, false);
+  // A page of settled conclusions STILL polls, slowly: a task submitted from outside the
+  // page has to be discovered without a reload. This is the defect this test pins.
   const settled = [{
     state: 'awaiting-host-review',
     hostAcceptance: { accepted: true, accepted: false, state: 'changes-requested', acceptedAt: 1, note: 'redo' },
     reviewPersistence: { state: 'saved', durable: true, pending: false },
   }];
-  assert.equal(recordRefreshPlan({ tasks: settled, visible: true }).reason, 'settled');
+  assert.deepEqual(recordRefreshPlan({ tasks: settled, visible: true }), {
+    refresh: true, intervalMs: RECORD_IDLE_REFRESH_INTERVAL_MS, reason: 'idle',
+  });
+  // An EMPTY list is the same case: the first record of the day must appear on its own.
+  assert.deepEqual(recordRefreshPlan({ tasks: [], visible: true }), {
+    refresh: true, intervalMs: RECORD_IDLE_REFRESH_INTERVAL_MS, reason: 'idle',
+  });
+  // And a newly arrived running task moves the SAME page back to the active rate.
+  assert.deepEqual(recordRefreshPlan({ tasks: [...settled, { state: 'running' }], visible: true }), {
+    refresh: true, intervalMs: RECORD_REFRESH_INTERVAL_MS, reason: 'changing',
+  });
+  // Hidden still wins over a settled list, and loading still wins over an idle one.
+  assert.equal(recordRefreshPlan({ tasks: [], visible: false }).refresh, false);
+  assert.equal(recordRefreshPlan({ tasks: [], visible: true, loading: true }).refresh, false);
   // The SELECTED detail counts too: a stale list row must not hide a changing detail.
   assert.equal(recordRefreshPlan({ tasks: [], selectedTask: WAITING, visible: true }).refresh, true);
+  assert.equal(recordRefreshMode({ tasks: [WAITING], visible: true }), 'active');
+  assert.equal(recordRefreshMode({ tasks: [], visible: true }), 'idle');
+  assert.equal(recordRefreshMode({ tasks: [], visible: true, mounted: false }), null);
+  assert.equal(recordRefreshMode({ tasks: [], visible: false }), null);
   assert.equal(hasChangingRecords(settled), false);
 });
 
 test('the page keeps polling for review but offers no cancel and no "running" claim', () => {
-  // The hook is driven by the record predicate, not by "is live".
-  assert.match(PAGE_SOURCE, /recordRefreshPlan\(/u);
-  assert.match(PAGE_SOURCE, /hasChangingRecords\(/u);
+  // The page delegates its reads to the ONE loop both records surfaces use: the page and
+  // the sidebar must not each invent a policy.
+  assert.match(PAGE_SOURCE, /startRecordsReadLoop\(/u);
+  const LOOP_SOURCE = readFileSync(new URL('../src/client/api.js', import.meta.url), 'utf8');
+  assert.match(LOOP_SOURCE, /recordRefreshPlan\(/u);
+  assert.match(LOOP_SOURCE, /hasChangingRecords\(/u);
   // Hidden tabs pause, and returning reads immediately.
-  assert.match(PAGE_SOURCE, /visibilitychange/u);
-  assert.match(PAGE_SOURCE, /document\?\.hidden === true/u);
+  assert.match(LOOP_SOURCE, /visibilitychange/u);
+  assert.match(LOOP_SOURCE, /doc\?\.hidden !== true/u);
   // No overlapping reads.
-  assert.match(PAGE_SOURCE, /if \(inFlight\) return/u);
+  assert.match(LOOP_SOURCE, /if \(disposed \|\| inFlight\) return/u);
   // A failed refresh is stated, not turned into a lost task.
   assert.match(PAGE_SOURCE, /自动刷新失败/u);
+  // The loop must not gate the timer on "something is changing": that is precisely what
+  // left an idle page unable to see a newly submitted task.
+  assert.doesNotMatch(LOOP_SOURCE, /if \(!changing\) return undefined/u);
+  // Both rates are re-planned from the CURRENT snapshot, so a task appearing switches
+  // the rate in place instead of freezing the interval captured at mount.
+  assert.match(LOOP_SOURCE, /nextRecordsRead\(\{ \.\.\.readState\(\)/u);
+  assert.match(LOOP_SOURCE, /setTimeout\(tick, plan\.delayMs\)/u);
+  // The operator-facing hint states both rates instead of claiming nothing ever refreshes.
+  assert.match(PAGE_SOURCE, /每 15 秒只读检查一次/u);
+  assert.match(PAGE_SOURCE, /切回本页会立即刷新/u);
+  assert.doesNotMatch(PAGE_SOURCE, /当前没有会变化的记录，不会自动刷新/u);
   // A waiting task is still not cancellable and not described as executing.
   assert.equal(taskOutcome(WAITING).label, '等待宿主审查');
   assert.notEqual(taskOutcome(WAITING).label, '执行中');

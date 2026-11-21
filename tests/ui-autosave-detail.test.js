@@ -216,21 +216,38 @@ test('auto-save: an invalid draft is never sent, is kept for correction, and sta
   await store.loadSettings();
   const before = store.getSnapshot().settings;
 
-  // An invalid value the local precheck refuses (timeout below the documented minimum).
-  store.editDraft((draft) => { draft.worker.timeoutSeconds = 1; });
+  // An invalid value the local precheck refuses. The retired execution timeout is no
+  // longer a control (and no longer prechecked), so the gate is demonstrated on a value
+  // the page still shows: an attention interval that is not after the self-check.
+  store.editDraft((draft) => { draft.monitoring = { ...draft.monitoring, attentionSeconds: 60 }; });
   await flushTimers(timers);
 
   assert.equal(puts.length, 0, 'an invalid draft is never PUT');
   const snapshot = store.getSnapshot();
   assert.equal(snapshot.saveState, 'invalid');
   assert.ok(snapshot.saveProblems.length > 0, 'the exact precheck problem is published');
-  assert.equal(snapshot.draft.worker.timeoutSeconds, 1, 'the invalid draft is KEPT so it can be fixed');
+  assert.equal(snapshot.draft.monitoring.attentionSeconds, 60, 'the invalid draft is KEPT so it can be fixed');
   assert.deepEqual(snapshot.settings, before, 'the last valid document stays committed');
 
   // The operator fixes it: the next save succeeds.
-  store.editDraft((draft) => { draft.worker.timeoutSeconds = 1800; });
+  store.editDraft((draft) => { draft.monitoring = { ...draft.monitoring, attentionSeconds: 2400 }; });
   await flushTimers(timers);
   assert.equal(puts.length, 1);
+  assert.equal(store.getSnapshot().saveState, 'saved');
+});
+
+test('auto-save: a retired legacy timeout is no longer a save gate', async () => {
+  // The field is not shown and does not bound a run, so an old document holding an
+  // out-of-range value must still be SAVABLE — the operator could neither see nor fix it.
+  const fixture = storeFixture({ putSettings: (document) => echoDocument(document) });
+  const { store, puts, timers } = fixture;
+  await store.loadSettings();
+  store.editDraft((draft) => {
+    draft.worker.timeoutSeconds = 1;
+    draft.worker.maxParallelism = 2;
+  });
+  await flushTimers(timers);
+  assert.equal(puts.length, 1, 'the save is not blocked over a field the page no longer offers');
   assert.equal(store.getSnapshot().saveState, 'saved');
 });
 
@@ -264,7 +281,7 @@ test('auto-save: an immediate (switch/select) edit skips the debounce window', a
   const fixture = storeFixture({ putSettings: (document) => echoDocument(document) });
   const { store, timers } = fixture;
   await store.loadSettings();
-  store.editDraft((draft) => { draft.review.enabled = true; }, { immediate: true });
+  store.editDraft((draft) => { draft.worker.isolation = 'shared'; }, { immediate: true });
   const [tick] = timers.slice(-1);
   assert.equal(tick.ms, 0, 'a discrete control is scheduled with no delay');
   await flushTimers(timers);

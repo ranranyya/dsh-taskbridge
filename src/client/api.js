@@ -26,6 +26,38 @@
 // verbatim. The few checks below exist to keep the operator from submitting an
 // obviously broken form, and every one of them is re-checked server-side.
 
+// Task-record cleanup helpers. The page draws the checkbox state from these and the
+// store builds its request with them, so both sides share ONE projection. They are
+// re-exported rather than imported so this module keeps exactly one import list; the
+// store receives the same functions through `options.cleanup` (defaulted by
+// `createStore`'s caller in `index.jsx` to `cleanupProjection()`).
+export {
+  CLEANUP_BLOCKER_LABELS,
+  MAX_CLEANUP_CHAINS,
+  cleanupBlockerLabel,
+  cleanupCandidates,
+  cleanupOutcome,
+  cleanupProjection,
+  cleanupRequest,
+  cleanupSelectionKey,
+  cleanupSelectionSummary,
+  cleanupWarningText,
+  describeCleanupOutcome,
+  pruneCleanupSelection,
+  toggleCleanupSelection,
+  withSelectionState,
+} from './task-cleanup.js';
+
+/** @returns {object} the projection an unconfigured store uses: nothing removable. */
+function emptyCleanupProjection() {
+  return {
+    candidates: () => [],
+    request: () => ({ body: { chains: [] }, problems: ['当前宿主未提供记录清理能力。'] }),
+    outcome: () => ({ chains: 0, rounds: 0, deletedTaskIds: [] }),
+    describe: () => '',
+  };
+}
+
 /** User-plane prefix. Mirrors `USER_PLANE_PREFIX` in `src/http/user-plane.js`. */
 export const USER_PLANE_PREFIX = '/api/dsh-delegate';
 
@@ -46,6 +78,11 @@ export const ROUTES = Object.freeze({
   // One narrow, authenticated operator route for the two silence thresholds. It is
   // a browser-plane write only: the MCP surface never gains a settings write.
   monitoring: `${USER_PLANE_PREFIX}/monitoring`,
+  // One narrow, authenticated operator route for the operator's execution choices —
+  // today, whether a NEW task gets Agent Teams when its dispatcher states no choice.
+  // Browser-plane only: the MCP surface never gains a settings write, and this route
+  // cannot touch DSH's global agent-teams switch.
+  execution: `${USER_PLANE_PREFIX}/execution`,
   catalog: `${USER_PLANE_PREFIX}/catalog`,
   connections: `${USER_PLANE_PREFIX}/connections`,
   connectionsRevoke: `${USER_PLANE_PREFIX}/connections/revoke`,
@@ -55,10 +92,18 @@ export const ROUTES = Object.freeze({
   tasks: `${USER_PLANE_PREFIX}/tasks`,
   tasksGet: `${USER_PLANE_PREFIX}/tasks/get`,
   tasksCancel: `${USER_PLANE_PREFIX}/tasks/cancel`,
+  // One explicit action: remove the durable records of the selected finished
+  // execution chains. It is a `POST`, never a load-time or refresh-time write, and it
+  // only ever names chains and their exact rounds.
+  tasksCleanup: `${USER_PLANE_PREFIX}/tasks/cleanup`,
   // The one planning write the page has: a batch of planning nodes. It creates
   // records only — it cannot dispatch, authorize or review anything.
   plans: `${USER_PLANE_PREFIX}/plans`,
   displayArchive: `${USER_PLANE_PREFIX}/tasks/display-archive`,
+  // The durable task → Workspace/Session identity map, narrowed to identity fields.
+  // The grouped sidebar reads it to know which real DSH sessions this plugin created;
+  // it is a read of the operator plane and never a task action.
+  sessionMap: `${USER_PLANE_PREFIX}/session-map`,
   models: `${USER_PLANE_PREFIX}/models`,
   credentialsStatus: `${USER_PLANE_PREFIX}/credentials/status`,
   credentialsSet: `${USER_PLANE_PREFIX}/credentials/set`,
@@ -181,17 +226,30 @@ export function createApi(options = {}) {
       return await request('POST', ROUTES.settings, { settings });
     },
     /**
-     * Replace only the two silence thresholds.
+     * Replace the monitoring block (both no-progress thresholds and the repeated-failure
+     * count).
      *
-     * This is the narrow route the advanced monitoring controls use, so a operator
-     * adjusting a timer cannot accidentally rewrite a provider list. The host
-     * re-validates: whole seconds, each in range, and the attention threshold strictly
-     * greater than the self-check one.
-     * @param {{ selfCheckSeconds: number, attentionSeconds: number }} monitoring - thresholds in seconds.
+     * This is the narrow route a legacy caller uses, so an operator adjusting a timer
+     * cannot accidentally rewrite a provider list. The host re-validates: whole seconds,
+     * each in range (`0` = off), and — only when both are enabled — the run progress check
+     * strictly after the self-check.
+     * @param {{ selfCheckSeconds: number, attentionSeconds: number, repeatFailureThreshold: number }} monitoring - thresholds in seconds.
      * @returns {Promise<object>} `{ monitoring, settings }`.
      */
     async putMonitoring(monitoring) {
       return await request('POST', ROUTES.monitoring, { monitoring });
+    },
+    /**
+     * Replace the operator's execution-choice block — today, the Agent Teams default a
+     * NEW task gets when its dispatcher states no per-task choice.
+     *
+     * The host re-validates: the value must be a real boolean, and an absent block means
+     * the documented OFF default. This cannot reach DSH's global agent-teams switch.
+     * @param {{ agentTeamsDefault: boolean }} execution - the block as the operator set it.
+     * @returns {Promise<object>} `{ execution, settings }`.
+     */
+    async putExecution(execution) {
+      return await request('POST', ROUTES.execution, { execution });
     },
     /**
      * Resolve provider models/efforts plus the composed effective config.
@@ -267,12 +325,38 @@ export function createApi(options = {}) {
       return await request('POST', ROUTES.tasksGet, { taskId });
     },
     /**
+     * Read the durable task → Workspace/Session identity map.
+     *
+     * Identity only: paths, digests, Workspace, Session, isolation. It is what lets the
+     * grouped sidebar attribute a real session to this plugin after its task records
+     * were cleaned or hidden, without guessing from a title or a directory.
+     * @returns {Promise<object>} `{ sessions }`.
+     */
+    async getSessionMap() {
+      return await request('GET', ROUTES.sessionMap);
+    },
+    /**
      * Cancel a task as the operator.
      * @param {string} taskId - task identity.
      * @returns {Promise<object>} `{ task }`.
      */
     async cancelTask(taskId) {
       return await request('POST', ROUTES.tasksCancel, { taskId });
+    },
+    /**
+     * Remove the durable records of finished execution chains (operator-confirmed).
+     *
+     * The body is exactly `{ confirm: true, chains: [{ chainId, taskIds }] }`: the
+     * chains the operator ticked and the exact rounds the page displayed. The host
+     * re-checks every one of them against the unfiltered current records and refuses
+     * the whole batch when any is unknown, changed or still depended on, so a refusal
+     * means nothing was removed.
+     * @param {{ chains: Array<{ chainId: string, taskIds: string[] }> }} body - selected chains.
+     * @returns {Promise<object>} `{ chains, tasks, deletedTaskIds, remaining, retained }`.
+     */
+    async cleanupTasks(body) {
+      const chains = Array.isArray(body?.chains) ? body.chains : [];
+      return await request('POST', ROUTES.tasksCleanup, { confirm: true, chains });
     },
     /**
      * Create a batch of planning nodes.
@@ -474,7 +558,8 @@ export function monitoringOf(source) {
  * at all, and an absent key is not an operator error — it is the documented default. So
  * `undefined` becomes the default value (making the field editable for an older document),
  * while an explicit `''`, `null`, fractional or out-of-range value is preserved exactly so
- * the precheck still refuses it.
+ * the precheck still refuses it. A stored `0` is a DECISION ("off") and is preserved as
+ * `0`, never re-defaulted.
  * @param {object | null} source - draft or served document.
  * @returns {object} the block as stored, or the defaults when there is none.
  */
@@ -574,7 +659,7 @@ export const TASK_PHASE_LABELS = Object.freeze({
   // A question is a DIFFERENT wait from an approval: answering it grants nothing, so the
   // label must not read as an authorization either.
   'awaiting-question': '等待回答问题',
-  review: '附加审查中',
+  review: '旧版模型复审',
   'awaiting-host-review': '等待宿主审查',
   failed: '已失败',
   cancelled: '已取消',
@@ -603,10 +688,8 @@ export const TASK_STATE_LABELS = Object.freeze({
   interrupted: '已中断（进程重启后不会继续执行）',
 });
 
-/** Chinese labels for task review states. */
+/** Chinese labels for historical model review states. */
 export const REVIEW_STATE_LABELS = Object.freeze({
-  disabled: '未启用附加审查',
-  not_run: '未运行',
   completed: '已完成',
   failed: '审查失败（与任务成败无关）',
 });
@@ -628,6 +711,8 @@ export const CONNECTIVITY_LAYERS = Object.freeze([
 
 /** Bounds mirrored from the host validator, used for input attributes only. */
 export const LIMITS = Object.freeze({
+  // LEGACY: no longer offered as a control and no longer bounds an ordinary run. It
+  // survives only so an older stored value (or an older client) still round-trips.
   timeoutSecondsMin: 30,
   timeoutSecondsMax: 7200,
   maxParallelismMin: 1,
@@ -637,11 +722,12 @@ export const LIMITS = Object.freeze({
   sessionGrantTtlSecondsMin: 60,
   sessionGrantTtlSecondsMax: 43200,
   providers: 32,
-  // Silence thresholds. Mirrors `LIMITS` in `src/config/defaults.js`; the host is
+  // No-progress thresholds. Mirrors `LIMITS` in `src/config/defaults.js`; the host is
   // still the authority, these only drive input attributes and the local precheck.
-  selfCheckSecondsMin: 30,
+  // `0` is legal for either and means "this reminder is off".
+  selfCheckSecondsMin: 0,
   selfCheckSecondsMax: 3600,
-  attentionSecondsMin: 31,
+  attentionSecondsMin: 0,
   attentionSecondsMax: 7200,
   // Repeated-failure reminder: a COUNT of consecutive identical failures, 0 = off.
   repeatFailureThresholdMin: 0,
@@ -649,17 +735,65 @@ export const LIMITS = Object.freeze({
 });
 
 /**
- * Default silence thresholds and failure count, mirroring `MONITORING_DEFAULTS`.
+ * Default monitoring thresholds and failure count, mirroring `MONITORING_DEFAULTS`.
  *
- * Stored as whole SECONDS (300 / 600). The panel presents them as minutes because
- * that is how an operator thinks about them; a value that is not a whole number of
- * minutes is still editable and is shown exactly.
+ * Stored as whole SECONDS: 10 minutes for the read-only self-check, 40 minutes for the
+ * run progress check, and the repeated-failure count. Both durations are measured on
+ * the SAME clock — consecutive time without real progress — and each can be switched off
+ * with `0`. The panel presents them as minutes because that is how an operator thinks
+ * about them; a value that is not a whole number of minutes is still editable and is
+ * shown exactly.
  */
 export const MONITORING_DEFAULTS = Object.freeze({
-  selfCheckSeconds: 300,
-  attentionSeconds: 600,
+  selfCheckSeconds: 600,
+  attentionSeconds: 2400,
   repeatFailureThreshold: 3,
 });
+
+/**
+ * The operator's default for a NEW task's Agent Teams choice, mirroring
+ * `DEFAULT_AGENT_TEAMS_FOR_NEW_TASKS`.
+ *
+ * OFF, so an upgrade or a fresh install never starts collaborating by itself. The host
+ * is still the authority; this only fills a draft a host has not answered for yet.
+ */
+export const AGENT_TEAMS_DEFAULT_FOR_NEW_TASKS = false;
+
+/**
+ * Where a task's frozen Agent Teams decision came from.
+ *
+ * Kept apart from the decision itself: "you asked for this", "this follow-up continues
+ * a chain that had it" and "the TaskBridge default applied it" are three different
+ * stories, and a record that showed the third as the first would misattribute a choice
+ * nobody made.
+ */
+export const AGENT_TEAMS_ORIGIN_LABELS = Object.freeze({
+  request: '本次派工明确指定',
+  continuation: '沿用所续接任务的协作选择',
+  'settings-default': '按 TaskBridge 的「新任务默认」',
+});
+
+/**
+ * The execution block a draft carries, normalized.
+ *
+ * A document written before this block existed, and a host that never served one, both
+ * open at the OFF default — never "on" and never a blank control. A stored value that is
+ * not a real boolean is passed through unchanged so the precheck can refuse it instead of
+ * the page quietly showing "off" for something the host would reject.
+ * @param {object | null} source - served document, draft, or raw block.
+ * @returns {{ agentTeamsDefault: boolean | unknown }} normalized block.
+ */
+export function executionOf(source) {
+  const block = source?.execution;
+  if (block === null || typeof block !== 'object' || Array.isArray(block)) {
+    return { agentTeamsDefault: AGENT_TEAMS_DEFAULT_FOR_NEW_TASKS };
+  }
+  return {
+    agentTeamsDefault: block.agentTeamsDefault === undefined
+      ? AGENT_TEAMS_DEFAULT_FOR_NEW_TASKS
+      : block.agentTeamsDefault,
+  };
+}
 
 /** Chinese labels for the self-check verdicts the host publishes. */
 export const SELF_CHECK_LABELS = Object.freeze({
@@ -698,7 +832,7 @@ export function repeatFailureLine(activity) {
 /** Chinese labels for the reasons a wait returns. */
 export const WAIT_REASON_LABELS = Object.freeze({
   heartbeat: '没有需要处理的事（内部心跳）',
-  attention: '长时间没有任何新进展，需要你判断',
+  attention: '任务需要你看一下进展（只是提醒，任务仍在运行）',
   permission: '有一次工具调用在等待授权决定',
   ready: '执行已结束，等待宿主审查（不等于已接受）',
   failed: '执行失败',
@@ -844,12 +978,14 @@ export function defaultDraft() {
       maxParallelism: 1,
       isolation: 'worktree',
     },
-    review: { enabled: false, providerId: null, model: null, reasoningEffort: null },
     authorization: { taskGrantTtlSeconds: 900, sessionGrantTtlSeconds: 14400 },
     // Silence thresholds. Present in a fresh draft so the controls render without a
     // second load, and normalized from the served document below so an older host
     // (or an older stored file) still opens with the documented defaults.
     monitoring: { ...MONITORING_DEFAULTS },
+    // The operator's default for NEW tasks only: OFF, so a fresh install and an upgrade
+    // both start without agent collaboration. It never opens DSH's global switch.
+    execution: { agentTeamsDefault: AGENT_TEAMS_DEFAULT_FOR_NEW_TASKS },
     projectOverrides: {},
     presets: [],
     // Deprecated and inert, kept only so a save round-trips the stored document
@@ -890,20 +1026,24 @@ export function draftFromSettings(document) {
       }))
       : [],
     worker: { ...base.worker, ...(source.worker ?? {}) },
-    review: { ...base.review, ...(source.review ?? {}) },
     authorization: { ...base.authorization, ...(source.authorization ?? {}) },
     // A document written before this block existed has no `monitoring` key at all,
     // and a host that predates it never serves one. Both open with the documented
     // defaults instead of a blank control, and the values are coerced to whole
     // seconds because that is the only shape the host accepts.
     monitoring: monitoringOf(source),
-    projectOverrides: clone(source.projectOverrides ?? {}),
+    // The same rule for the operator's new-task default: a document (or a host) that
+    // predates the block opens at the documented OFF default, so an upgraded
+    // installation never presents agent collaboration as already decided on.
+    execution: executionOf(source),
+    projectOverrides: Object.fromEntries(Object.entries(source.projectOverrides ?? {})
+      .filter(([, block]) => block?.review === undefined || block.worker !== undefined)
+      .map(([path, block]) => [path, block?.worker === undefined ? {} : { worker: clone(block.worker) }])),
     presets: Array.isArray(source.presets)
-      ? source.presets.map((preset) => ({
+      ? source.presets.filter((preset) => preset.worker != null).map((preset) => ({
         id: String(preset.id ?? ''),
         name: String(preset.name ?? preset.id ?? ''),
-        worker: preset.worker === null || preset.worker === undefined ? null : { ...preset.worker },
-        review: preset.review === null || preset.review === undefined ? null : { ...preset.review },
+        worker: { ...preset.worker },
       }))
       : [],
     // Read back through the same resolver the save path uses, so a document written
@@ -939,17 +1079,18 @@ export function documentFromDraft(draft) {
       };
     }),
     worker: { ...source.worker },
-    review: { ...source.review },
     authorization: { ...source.authorization },
     // Sent on every save, normalized to whole seconds: the host refuses anything
     // else, and a document that omitted the block would store the defaults.
     monitoring: monitoringOf(source),
+    // Sent on every save so the round-trip is faithful. The value is a plain boolean and
+    // a missing one is written as the documented OFF default, exactly as the host would.
+    execution: executionOf(source),
     projectOverrides: clone(source.projectOverrides ?? {}),
     presets: (source.presets ?? []).map((preset) => ({
       id: preset.id,
       name: preset.name,
-      ...(preset.worker === null ? {} : { worker: { ...preset.worker } }),
-      ...(preset.review === null ? {} : { review: { ...preset.review } }),
+      worker: { ...preset.worker },
     })),
     // Sent on every save only so the round-trip is faithful. It is inert: the host
     // validates it as a retired value and no run consults it.
@@ -978,12 +1119,11 @@ export function exportDocument(draft) {
  * immutable snapshot a running job took.
  * @param {object} draft - editable document.
  * @param {string | null} [projectPath] - optional project layer.
- * @returns {{ worker: object, review: object, applied: string[] }} preview.
+ * @returns {{ worker: object, monitoring: object, applied: string[] }} preview.
  */
 export function previewEffective(draft, projectPath = null) {
   const applied = [];
   let worker = { ...(draft?.worker ?? {}) };
-  let review = { ...(draft?.review ?? {}) };
   const overrides = draft?.projectOverrides ?? {};
   if (typeof projectPath === 'string' && projectPath.trim() !== '') {
     const wanted = projectPath.trim().replace(/[\\/]+$/, '');
@@ -996,16 +1136,17 @@ export function previewEffective(draft, projectPath = null) {
         worker = { ...worker, ...block.worker };
         applied.push('项目覆盖：执行设置');
       }
-      if (block.review !== undefined && block.review !== null) {
-        review = { ...review, ...block.review };
-        applied.push('项目覆盖：附加审查');
-      }
     }
   }
-  if (review.enabled !== true) review = { enabled: false, providerId: null, model: null, reasoningEffort: null };
   return {
-    worker: { ...worker, providerRoute: worker.providerId ?? null },
-    review: { ...review, providerRoute: review.providerId ?? null },
+    // `executionTimeoutSeconds` mirrors the host: `null` is the documented state "no
+    // total execution deadline", and the legacy stored value is carried separately so
+    // the preview never presents it as a budget the run gets.
+    worker: {
+      ...worker,
+      providerRoute: worker.providerId ?? null,
+      executionTimeoutSeconds: null,
+    },
     // Global-only, like the host's own snapshot: no project or per-job layer can
     // retime a task, so the preview reports the same pair the task would freeze.
     monitoring: monitoringOf(draft),
@@ -1060,29 +1201,27 @@ export function precheckDraft(draft) {
       modelIds.add(model.id);
     }
   }
-  for (const [role, block] of [['执行设置', draft?.worker], ['附加审查', draft?.review]]) {
-    if (role === '附加审查' && block?.enabled !== true) continue;
-    if (block?.providerId === null || block?.providerId === undefined) {
-      if (role === '执行设置' && providers.length > 0) problems.push('执行设置尚未选择提供方');
-      continue;
-    }
-    const provider = providers.find((entry) => entry.id === block.providerId);
+  const worker = draft?.worker;
+  if (worker?.providerId == null) {
+    if (providers.length > 0) problems.push('执行设置尚未选择提供方');
+  } else {
+    const provider = providers.find((entry) => entry.id === worker.providerId);
     if (provider === undefined) {
-      problems.push(`${role}选择了未配置的提供方「${block.providerId}」`);
-      continue;
-    }
-    const model = (provider.models ?? []).find((entry) => entry.id === block.model);
-    if (model === undefined) {
-      problems.push(`${role}的模型「${block.model ?? '（空）'}」不在提供方「${provider.id}」的模型列表中`);
-    } else if (block.reasoningEffort !== null && block.reasoningEffort !== undefined
-      && !(model.efforts ?? []).includes(block.reasoningEffort)) {
-      problems.push(`${role}的推理强度「${block.reasoningEffort}」不是模型「${model.id}」声明的能力`);
+      problems.push(`执行设置选择了未配置的提供方「${worker.providerId}」`);
+    } else {
+      const model = (provider.models ?? []).find((entry) => entry.id === worker.model);
+      if (model === undefined) {
+        problems.push(`执行设置的模型「${worker.model ?? '（空）'}」不在提供方「${provider.id}」的模型列表中`);
+      } else if (worker.reasoningEffort != null && !(model.efforts ?? []).includes(worker.reasoningEffort)) {
+        problems.push(`执行设置的推理强度「${worker.reasoningEffort}」不是模型「${model.id}」声明的能力`);
+      }
     }
   }
-  const timeout = Number(draft?.worker?.timeoutSeconds);
-  if (!Number.isInteger(timeout) || timeout < LIMITS.timeoutSecondsMin || timeout > LIMITS.timeoutSecondsMax) {
-    problems.push(`超时需为 ${LIMITS.timeoutSecondsMin}–${LIMITS.timeoutSecondsMax} 秒之间的整数`);
-  }
+  // `worker.timeoutSeconds` is LEGACY: the field is no longer offered, no longer
+  // bounds an ordinary run, and the host normalizes a bad stored value instead of
+  // refusing the document. So it is deliberately NOT prechecked here — refusing a
+  // save over a value the page never shows would block the operator for something
+  // they can neither see nor fix.
   const parallelism = Number(draft?.worker?.maxParallelism);
   if (!Number.isInteger(parallelism) || parallelism < LIMITS.maxParallelismMin || parallelism > LIMITS.maxParallelismMax) {
     problems.push(`最大并发需为 ${LIMITS.maxParallelismMin}–${LIMITS.maxParallelismMax} 之间的整数`);
@@ -1093,6 +1232,13 @@ export function precheckDraft(draft) {
   // be validated by the narrow monitoring button and forgotten by this whole-draft check
   // (which is what happened to the repeated-failure count).
   problems.push(...precheckMonitoring(monitoringDraftOf(draft)));
+  // The new-task Agent Teams default must be a real boolean. A UI switch can only ever
+  // produce one, so this only fires for a hand-edited or imported document — and the
+  // host would refuse it too, which is why the page says so before sending.
+  const teamDefault = executionOf(draft).agentTeamsDefault;
+  if (typeof teamDefault !== 'boolean') {
+    problems.push('「新任务默认开启智能体协作」只能是开启或关闭');
+  }
   return problems;
 }
 
@@ -1219,6 +1365,21 @@ export function permissionSummary(task) {
 }
 
 /**
+ * A monitoring threshold in plain Chinese, for a settings summary.
+ *
+ * A threshold is not an elapsed span, so `0` is not "0 秒": it is the documented
+ * "off" and must read as such, or a reader would conclude the reminder fires
+ * instantly. Any other value is the ordinary duration (`formatDuration`).
+ * @param {number | null | undefined} seconds - stored threshold.
+ * @returns {string} Chinese description, or `—` for a value that is not a number.
+ */
+export function monitoringText(seconds) {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return '—';
+  if (seconds === 0) return '已关闭';
+  return formatDuration(seconds * 1000);
+}
+
+/**
  * Human duration in plain Chinese, bounded to two units.
  *
  * Used for every elapsed span the task panels show ("12 秒", "4 分 12 秒",
@@ -1272,6 +1433,17 @@ export function taskActivity(task) {
     toolCallsFinished: Number.isFinite(activity.toolCallsFinished) ? activity.toolCallsFinished : null,
     selfCheckSeconds: Number.isFinite(activity.selfCheckSeconds) ? activity.selfCheckSeconds : null,
     attentionSeconds: Number.isFinite(activity.attentionSeconds) ? activity.attentionSeconds : null,
+    // The run progress check, in the same bounded terms the reminder itself uses: the
+    // one time base (no progress for that long), whether this silence already produced a
+    // report, and the context facts. Absent in a record written before the fields existed.
+    progressCheck: activity.progressCheck !== null && typeof activity.progressCheck === 'object'
+      ? {
+        thresholdSeconds: Number.isFinite(activity.progressCheck.thresholdSeconds) ? activity.progressCheck.thresholdSeconds : null,
+        idleForMs: Number.isFinite(activity.progressCheck.idleForMs) ? activity.progressCheck.idleForMs : null,
+        reportedThisEpisode: activity.progressCheck.reportedThisEpisode === true,
+        nextDueAt: Number.isFinite(activity.progressCheck.nextDueAt) ? activity.progressCheck.nextDueAt : null,
+      }
+      : null,
     selfCheck: selfCheck === null || typeof selfCheck !== 'object'
       ? null
       : {
@@ -1334,11 +1506,13 @@ export function taskProgress(task) {
     // that then restarted), but the run will NOT resume. This branch exists because the
     // generic wording would otherwise promise progress that can never happen.
     detailParts.push('这条记录来自一次进程重启：任务已经中断，不会继续执行，也不会再有新的进展。');
-  } else if (activity.attentionSeconds !== null) {
-    detailParts.push(`超过 ${formatDuration(activity.attentionSeconds * 1000)} 没有新进展时会提醒你；提醒只是提示，不会自动判失败。`);
+  } else if (activity.attentionSeconds !== null && activity.attentionSeconds > 0) {
+    detailParts.push(`连续 ${formatDuration(activity.attentionSeconds * 1000)} 没有新成果回传给派工方时会提醒一次运行进度检查；读到自检结论不算新成果，提醒只是提示，不会自动判失败。`);
+  } else if (activity.attentionSeconds === 0) {
+    detailParts.push('运行进度检查提醒已关闭。');
   }
   if (activity.activityEvents !== null && activity.events !== null) {
-    detailParts.push(`已记录 ${activity.events} 个执行事件，其中 ${activity.activityEvents} 个是真正的进展。`);
+    detailParts.push(`已记录 ${activity.events} 个执行事件，其中 ${activity.activityEvents} 个是真实输出或工具活动——它们不算回传给派工方的成果。`);
   }
   return {
     available: true,
@@ -1423,21 +1597,23 @@ export function hasChangingRecords(tasks) {
 }
 
 /**
- * Pre-flight checks for the silence thresholds AND the repeated-failure count.
+ * Pre-flight checks for the two no-progress thresholds AND the repeated-failure count.
  *
- * Mirrors `validateMonitoringSettings`. Kept separate because the monitoring save has
- * its own narrow button: a bad timer must not block saving the rest of the settings,
- * and a bad provider block must not block saving a timer.
+ * Mirrors `validateMonitoringSettings`. Kept separate because the monitoring block has
+ * its own rules: a bad timer must not block saving the rest of the settings, and a bad
+ * provider block must not block saving a timer.
  *
  * The block passed in must be the RAW one (`monitoringDraftOf`), not the display-normalized
  * `monitoringOf`: the latter replaces a cleared field with the documented default, which
  * would make an empty input look valid. This is the single validation path — `precheckDraft`
- * and the monitoring card both delegate here, so the count cannot be checked in one place
+ * and the monitoring card both delegate here, so no field can be checked in one place
  * and forgotten in another.
  *
  * Backwards compatible with an older document or an older host that has no
  * `repeatFailureThreshold` at all: an ABSENT value takes the documented default, exactly as
- * the host validator does. A value that is present but wrong is still refused.
+ * the host validator does. A value that is present but wrong is still refused. `0` is
+ * ALWAYS valid for either duration and for the count — it is the documented "off" — so
+ * only a missing or non-numeric value is an error there.
  * @param {{ selfCheckSeconds: number, attentionSeconds: number, repeatFailureThreshold?: number }} monitoring - raw block.
  * @returns {string[]} Chinese problem descriptions; empty when plausible.
  */
@@ -1445,7 +1621,7 @@ export function precheckMonitoring(monitoring) {
   const problems = [];
   const self = monitoring?.selfCheckSeconds;
   const attention = monitoring?.attentionSeconds;
-  // An ABSENT count is not an operator error: a document written before this setting
+  // An ABSENT count is not an operator error: a document written before the setting
   // existed has no such key, and the host fills in the documented default. Anything the
   // operator actually supplied — `''`, `null`, a fraction, an out-of-range number — is
   // validated exactly as given. There is deliberately no `Number()` coercion and no
@@ -1454,13 +1630,15 @@ export function precheckMonitoring(monitoring) {
     ? MONITORING_DEFAULTS.repeatFailureThreshold
     : monitoring.repeatFailureThreshold;
   if (!Number.isInteger(self) || self < LIMITS.selfCheckSecondsMin || self > LIMITS.selfCheckSecondsMax) {
-    problems.push(`程序自检间隔需为 ${LIMITS.selfCheckSecondsMin}–${LIMITS.selfCheckSecondsMax} 秒之间的整数`);
+    problems.push(`程序自检间隔需为 ${LIMITS.selfCheckSecondsMin}–${LIMITS.selfCheckSecondsMax} 秒之间的整数（0 表示关闭）`);
   }
   if (!Number.isInteger(attention) || attention < LIMITS.attentionSecondsMin || attention > LIMITS.attentionSecondsMax) {
-    problems.push(`提醒你的间隔需为 ${LIMITS.attentionSecondsMin}–${LIMITS.attentionSecondsMax} 秒之间的整数`);
+    problems.push(`运行进度检查间隔需为 ${LIMITS.attentionSecondsMin}–${LIMITS.attentionSecondsMax} 秒之间的整数（0 表示关闭）`);
   }
-  if (Number.isInteger(self) && Number.isInteger(attention) && attention <= self) {
-    problems.push('提醒你的间隔必须大于程序自检间隔');
+  // The ordering rule applies only when BOTH reminders are on: a disabled threshold has
+  // no instant of its own, so it can never be "too early".
+  if (Number.isInteger(self) && Number.isInteger(attention) && self > 0 && attention > 0 && attention <= self) {
+    problems.push('运行进度检查间隔必须大于程序自检间隔（或把其中一项设为 0 关闭）');
   }
   // The repeated-failure reminder is a COUNT of consecutive identical failures; `0` is a
   // legal "off" value, so the range starts at zero rather than at one.
@@ -1659,28 +1837,192 @@ export function reviewNotePreview(task) {
 export const RECORD_REFRESH_INTERVAL_MS = 5000;
 
 /**
+ * How often a visible records page re-reads the list when NO record may change.
+ *
+ * This is the case that used to stop polling entirely, and it left an open page unable to
+ * notice a task submitted from outside (Codex dispatching while the operator watches): an
+ * empty list stays empty, and a page full of settled records stays settled, until the
+ * operator reloads. The idle read is a plain read of the same list — no model call, no
+ * task action, no settings write — so it is bounded and deliberately slower than the
+ * active rate: a task that started elsewhere shows up within this interval, while an idle
+ * page does not hammer the host.
+ */
+export const RECORD_IDLE_REFRESH_INTERVAL_MS = 15000;
+
+/**
+ * Which rate a visible records page is polling at, or `null` when it must not poll.
+ *
+ * Three answers, because the page has three states:
+ *   * `active`  — a record may still change (running, awaiting review, conclusion being
+ *                 written): read quickly, so a conclusion appears without a reload;
+ *   * `idle`    — nothing of ours may change: keep a SLOW read so a task submitted from
+ *                 outside the page is still discovered;
+ *   * `null`    — do not poll: the document is hidden, the records page is not open, or a
+ *                 read is already in flight.
+ * @param {object} input - `tasks`, `selectedTask`, `visible`, `mounted`, `loading`.
+ * @returns {'active' | 'idle' | null} the polling mode.
+ */
+export function recordRefreshMode(input = {}) {
+  // Off the records page or hidden: nothing is watching, so nothing is read. Checked before
+  // the in-flight case so an unmounted page reports "not polling" rather than "busy".
+  if (input.mounted === false) return null;
+  if (input.visible === false) return null;
+  // One request at a time: a read already in flight owns the next tick.
+  if (input.loading === true) return null;
+  const all = [];
+  if (Array.isArray(input.tasks)) all.push(...input.tasks);
+  if (input.selectedTask !== null && input.selectedTask !== undefined) all.push(input.selectedTask);
+  return hasChangingRecords(all) ? 'active' : 'idle';
+}
+
+/**
  * The refresh decision for one render of the task view.
  *
  * Separates "is the execution running" (a status display question) from "may the RECORD
  * still change" (a polling question): a task waiting for review, or a review mid-save,
- * keeps the page polling even though nothing is executing — and the page stops once every
- * visible record is settled. Hidden pages never poll, and a page that is already loading
- * never starts a second request.
- * @param {object} input - `tasks`, `selectedTask`, `visible`, `loading`.
+ * keeps the page at the ACTIVE rate even though nothing is executing, and a settled list
+ * drops to the IDLE rate instead of stopping. Only a hidden page, an unopened records page
+ * or an in-flight read suppresses the next tick.
+ * @param {object} input - `tasks`, `selectedTask`, `visible`, `mounted`, `loading`.
  * @returns {{ refresh: boolean, intervalMs: number, reason: string }} plan.
  */
 export function recordRefreshPlan(input = {}) {
-  const all = [];
-  if (Array.isArray(input.tasks)) all.push(...input.tasks);
-  if (input.selectedTask !== null && input.selectedTask !== undefined) all.push(input.selectedTask);
-  const changing = hasChangingRecords(all);
-  const intervalMs = RECORD_REFRESH_INTERVAL_MS;
-  if (input.visible === false) return { refresh: false, intervalMs, reason: 'hidden' };
-  if (changing !== true) return { refresh: false, intervalMs, reason: 'settled' };
-  // One request at a time: a refresh already in flight owns the next tick.
-  if (input.loading === true) return { refresh: false, intervalMs, reason: 'loading' };
-  return { refresh: true, intervalMs, reason: 'changing' };
+  const mode = recordRefreshMode(input);
+  if (mode === null) {
+    // The reason distinguishes the three suppression cases for the page and for tests.
+    if (input.mounted === false) return { refresh: false, intervalMs: RECORD_REFRESH_INTERVAL_MS, reason: 'unmounted' };
+    if (input.visible === false) return { refresh: false, intervalMs: RECORD_REFRESH_INTERVAL_MS, reason: 'hidden' };
+    return { refresh: false, intervalMs: RECORD_REFRESH_INTERVAL_MS, reason: 'loading' };
+  }
+  if (mode === 'active') {
+    return { refresh: true, intervalMs: RECORD_REFRESH_INTERVAL_MS, reason: 'changing' };
+  }
+  return { refresh: true, intervalMs: RECORD_IDLE_REFRESH_INTERVAL_MS, reason: 'idle' };
 }
+
+/**
+ * The next read of a visible records surface: when to do it, and why not.
+ *
+ * ONE plan for every surface that shows the shared task records — the records page
+ * and the sidebar's TaskBridge view alike — so an open list that is waiting for a
+ * task dispatched from OUTSIDE (Codex, an MCP host) is discovered by both, on the same
+ * bounded rates, instead of each surface inventing its own policy:
+ *
+ *   * the first read after mount is IMMEDIATE (`delayMs: 0`): a panel that opens on an
+ *     empty list must not wait a whole idle interval to learn whether anything exists;
+ *   * afterwards the ACTIVE rate applies while a record may still change, and the IDLE
+ *     rate otherwise — both plain list reads, no model call and no task action. An
+ *     already-loaded surface uses those rates from its very first tick (the immediate
+ *     read only happens when nothing has been read yet: `loading === false` marks that);
+ *   * a hidden document, an unmounted surface or a read already in flight schedules
+ *     nothing, and the surface re-checks when it becomes visible again.
+ * @param {object} input - `tasks`, `selectedTask`, `visible`, `mounted`, `loading`,
+ *   `first` (true for the read right after mount).
+ * @returns {{ refresh: boolean, delayMs: number | null, intervalMs: number, reason: string }} plan.
+ */
+export function nextRecordsRead(input = {}) {
+  if (input.mounted === false) return { refresh: false, delayMs: null, intervalMs: RECORD_REFRESH_INTERVAL_MS, reason: 'unmounted' };
+  if (input.visible === false) return { refresh: false, delayMs: null, intervalMs: RECORD_REFRESH_INTERVAL_MS, reason: 'hidden' };
+  if (input.loading === true) return { refresh: false, delayMs: null, intervalMs: RECORD_REFRESH_INTERVAL_MS, reason: 'loading' };
+  if (input.first === true && input.hydrated !== true) {
+    return { refresh: true, delayMs: 0, intervalMs: RECORD_REFRESH_INTERVAL_MS, reason: 'initial' };
+  }
+  const plan = recordRefreshPlan(input);
+  return { refresh: plan.refresh, delayMs: plan.refresh ? plan.intervalMs : null, intervalMs: plan.intervalMs, reason: plan.reason };
+}
+
+/**
+ * Drive the records reads of ONE live surface for as long as it stays mounted.
+ *
+ * The single loop behind both surfaces that show the shared task records (the records
+ * page and the sidebar's TaskBridge view). It reads through `store.refreshTasks`, so
+ * the two surfaces never issue duplicate requests for the same store, it never reads a
+ * row on its own, and it stops completely on dispose:
+ *
+ *   * the first read is scheduled at once (an empty panel must not sit empty for a
+ *     whole interval while a task is waiting to be discovered);
+ *   * each read is followed by exactly ONE timer at the planned rate, re-planned from
+ *     the CURRENT snapshot passed in `readState()` so the rate follows the records;
+ *   * a hidden document pauses the loop, and becoming visible reads once immediately;
+ *   * an in-flight read owns the next tick (the plan returns `refresh: false`).
+ *
+ * Nothing here runs during render: a caller starts it from an effect and disposes it
+ * with that effect's cleanup.
+ * @param {object} options - `store` (with `refreshTasks`), `readState()` returning
+ *   `{ tasks, selectedTask, loading }`, `visible()` (default: document not hidden),
+ *   `onError(messageOrNull)`, `onRead()` (called after every attempt).
+ * @returns {() => void} disposer: cancels the timer, drops the listener and never reads again.
+ */
+export function startRecordsReadLoop(options = {}) {
+  const store = options?.store ?? null;
+  if (store === null || typeof store.refreshTasks !== 'function') return () => {};
+  const doc = globalThis.document;
+  const visible = typeof options.visible === 'function'
+    ? options.visible
+    : () => doc?.hidden !== true;
+  const readState = typeof options.readState === 'function' ? options.readState : () => ({});
+  const onError = typeof options.onError === 'function' ? options.onError : () => {};
+  const onRead = typeof options.onRead === 'function' ? options.onRead : () => {};
+
+  let timer = null;
+  let disposed = false;
+  let inFlight = false;
+  let first = true;
+
+  const clearTimer = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  const schedule = () => {
+    clearTimer();
+    if (disposed) return;
+    const plan = nextRecordsRead({ ...readState(), mounted: true, visible: visible(), first });
+    if (!plan.refresh || plan.delayMs === null) return;
+    first = false;
+    // NO `unref()`: this timer is the surface's own life. Unref'd, a process whose only
+    // pending work was this tick (DSH's web host, a Node-driven host) would be free to
+    // exit the moment its last request finished — and the panel would silently stop
+    // noticing anything until the operator clicked. Disposal ends it explicitly.
+    timer = setTimeout(tick, plan.delayMs);
+  };
+  const read = async () => {
+    if (disposed || inFlight) return;
+    inFlight = true;
+    try {
+      const result = await store.refreshTasks('auto');
+      if (disposed || result?.skipped === 'in-flight') return;
+      onError(result?.ok === false ? (result.error ?? true) : null);
+      onRead(result);
+    } catch (error) {
+      if (!disposed) onError(error);
+    } finally {
+      inFlight = false;
+      schedule();
+    }
+  };
+  const tick = () => {
+    timer = null;
+    if (disposed || visible() !== true) return;
+    void read();
+  };
+  const onVisibility = () => {
+    clearTimer();
+    if (disposed) return;
+    if (visible() !== true) return;
+    // Back in view: read now rather than waiting out the remainder of an interval.
+    first = true;
+    void read();
+  };
+
+  doc?.addEventListener?.('visibilitychange', onVisibility);
+  schedule();
+  return () => {
+    disposed = true;
+    clearTimer();
+    doc?.removeEventListener?.('visibilitychange', onVisibility);
+  };
+}
+
 /**
  * Discoverable changed-file list in a task's diff payload.
  *
@@ -1842,6 +2184,19 @@ export function describeError(error) {
     DISCOVERY_MALFORMED_RESPONSE: '提供方返回的内容不是可识别的模型列表（需要 OpenAI 兼容的 {"data":[{"id":...}]}）。',
     DISCOVERY_BODY_TOO_LARGE: '提供方返回的内容超过大小上限，已中止读取。',
     USER_PLANE_METHOD_NOT_ALLOWED: '该请求方法不被允许。',
+    // Task-record cleanup. Each code names a different fix, and none of them removed a
+    // record: a refusal is whole-batch.
+    CLEANUP_INVALID: '清理请求不完整或超出范围，未删除任何记录。',
+    CLEANUP_CHAIN_NOT_FOUND: '所选执行链已不在当前记录中，未删除任何记录；请刷新后重新选择。',
+    CLEANUP_STALE: '任务记录已变化，所选轮次与当前记录不一致，未删除任何记录；请刷新后重新选择。',
+    CLEANUP_CHAIN_LIVE: '所选执行链仍在执行或尚未结束，未删除任何记录。',
+    CLEANUP_NOT_DURABLE: '所选记录尚未写入或未正常结束，未删除任何记录。',
+    CLEANUP_NEXT_ROUND: '所选执行链还有后续续接轮次，未删除任何记录；请把整条链一起选中。',
+    CLEANUP_PLAN_CHILDREN: '所选执行链下还有规划子节点，未删除任何记录；请先处理这些子节点。',
+    CLEANUP_HIERARCHY_CHILDREN: '仍有子任务依赖这条记录，未删除任何记录。',
+    CLEANUP_REVIEW_WRITE: '该任务的审查意见正在写入，未删除任何记录；请稍后重试。',
+    CLEANUP_UNAVAILABLE: '当前宿主不提供记录清理能力（或记录暂时无法读取），未删除任何记录。',
+    CLEANUP_FAILED: '记录写入失败，未删除任何记录；旧记录仍会显示。',
   };
   const known = messages[code];
   if (known !== undefined) return `${known}（${code}）`;
@@ -1914,6 +2269,10 @@ export const TREE_ORPHAN_LABELS = Object.freeze({
  * caller falls back to the flat list. An EMPTY tree is a real answer and is
  * reported separately (`roots: []` with counts), so "nothing planned yet" never
  * reads like "this host cannot show plans".
+ *
+ * `cleanupAvailable`/`cleanupError` are carried through when the host states them, and
+ * are ABSENT when it does not: a page must not offer a removal action an older host
+ * would refuse.
  * @param {object} body - the `/tasks` response body.
  * @returns {{ roots: object[], flatNodes: object[], counts: object, projects: object[] } | null} view.
  */
@@ -1927,12 +2286,20 @@ export function taskTreeView(body) {
   const display = tree.displayArchiveAvailable === undefined ? {} : {
     displayArchiveAvailable: tree.displayArchiveAvailable, displayArchiveError: tree.displayArchiveError,
   };
+  // Task-record cleanup. An absent block means the host predates the feature (the page
+  // then hides the action), while a present one states whether it is available and why.
+  const cleanup = tree.cleanupAvailable === undefined ? {} : {
+    cleanupAvailable: tree.cleanupAvailable === true,
+    cleanupError: typeof tree.cleanupError === 'string' ? tree.cleanupError : null,
+  };
   if (Array.isArray(tree.roots)) {
-    return { roots: tree.roots.filter(isRenderableNode), flatNodes: flatOfRoots(tree.roots), counts, projects, ...display };
+    return { roots: tree.roots.filter(isRenderableNode), flatNodes: flatOfRoots(tree.roots), counts, projects, ...display, ...cleanup };
   }
   if (Array.isArray(tree.flatNodes)) {
     const roots = rootsFromFlatNodes(tree.flatNodes);
-    return { roots, flatNodes: tree.flatNodes.filter(isRenderableNode), counts, projects, ...display };
+    // The flat shape carries no chain detail, so its chains expose no cleanup facts:
+    // the page then hides the action instead of offering a checkbox that would fail.
+    return { roots, flatNodes: tree.flatNodes.filter(isRenderableNode), counts, projects, ...display, ...cleanup };
   }
   // A tree object with neither shape is not a tree: treat it as an older host.
   return null;
@@ -2008,6 +2375,8 @@ function listPatchOf(body) {
     treeAvailable: view !== null,
     plans: plansSummaryOf(body),
     tasksError: null,
+    // Every successful list read marks the surface as hydrated, empty or not.
+    tasksLoaded: true,
   };
 }
 
@@ -2108,6 +2477,10 @@ export function planCreateRequest(draft) {
  */
 export function createStore(options = {}) {
   const api = options.api ?? createApi();
+  // The task-record cleanup projection. It is injected rather than imported so this
+  // module keeps one import list; `index.jsx` passes `cleanupProjection()`, and a
+  // caller that passes nothing gets a projection that removes nothing.
+  const cleanup = options.cleanup ?? emptyCleanupProjection();
   const now = typeof options.now === 'function' ? options.now : () => Date.now();
   // Debounce for the automatic save. Text inputs arrive one keystroke at a time, so a
   // short quiet period merges them into ONE whole-document PUT; switches and selects
@@ -2179,6 +2552,16 @@ export function createStore(options = {}) {
     tree: null,
     treeAvailable: false,
     plans: null,
+    /**
+     * Whether a `/tasks` read has ever SUCCEEDED in this store.
+     *
+     * The records surfaces (the page and the sidebar) decide whether their first tick
+     * must read at once or may wait a full interval: a store that already holds a
+     * published list does not need an immediate read, an UNREAD one does. A list of
+     * zero tasks cannot express that distinction by itself — "empty" and "never read"
+     * look identical — which is why this fact is recorded rather than inferred.
+     */
+    tasksLoaded: false,
     /** The refused list read, or null. Distinguishes "failed" from "empty". */
     tasksError: null,
     /** The last refused plan create, or null; the form shows it and keeps its input. */
@@ -2969,7 +3352,7 @@ export function createStore(options = {}) {
     },
 
     /**
-     * Replace the silence thresholds and the repeated-failure count.
+     * Replace the silence thresholds, the progress-check cadence and the repeated-failure count.
      *
      * The narrow route exists so an operator adjusting a timer cannot rewrite a
      * provider list. On success the committed document is adopted for `settings` and
@@ -3009,6 +3392,46 @@ export function createStore(options = {}) {
           patch({ settings: committed, draft });
           notify('success', '监控间隔已保存。已开始运行的任务保留它自己的快照，新任务使用新值。');
           return { ok: true, monitoring: body.monitoring ?? normalized };
+        } catch (error) {
+          notify('error', describeError(error));
+          return { ok: false, error };
+        } finally {
+          saveInFlight = false;
+        }
+      });
+    },
+
+    /**
+     * Set ONLY the operator's Agent Teams default for new tasks.
+     *
+     * Kept beside {@link saveMonitoring} for the same reason it is narrow: an operator
+     * flipping one switch must not be able to rewrite a provider list through the same
+     * call. It writes through the narrow `/execution` route and adopts the committed
+     * document, leaving OTHER unsaved draft edits alone.
+     *
+     * It never touches DSH's global agent-teams switch, and it never changes a task that
+     * already ran: each task froze its own choice at admission.
+     * @param {boolean} enabled - the default a NEW task without its own choice gets.
+     * @returns {Promise<{ ok: boolean, error?: unknown }>} outcome.
+     */
+    async saveAgentTeamsDefault(enabled) {
+      if (typeof enabled !== 'boolean') {
+        const problems = ['「新任务默认开启智能体协作」只能是开启或关闭'];
+        notify('error', `未保存：${problems.join('；')}`);
+        return { ok: false, problems };
+      }
+      if (saveInFlight) return { ok: false, pending: true };
+      saveInFlight = true;
+      return await track('execution', async () => {
+        try {
+          const body = await api.putExecution({ agentTeamsDefault: enabled });
+          const committed = body.settings ?? null;
+          const draft = state.draft === null
+            ? draftFromSettings(committed)
+            : { ...state.draft, execution: executionOf(committed ?? { execution: { agentTeamsDefault: enabled } }) };
+          patch({ settings: committed, draft });
+          notify('success', '新任务的智能体协作默认已保存。只影响之后没有单独指定协作选择的新派工。');
+          return { ok: true, execution: body.execution ?? { agentTeamsDefault: enabled } };
         } catch (error) {
           notify('error', describeError(error));
           return { ok: false, error };
@@ -3215,6 +3638,43 @@ export function createStore(options = {}) {
           return { ok: true, task: body.task };
         } catch (error) {
           notify('error', describeError(error));
+          return { ok: false, error };
+        }
+      });
+    },
+
+    /** Remove a confirmed selection whose exact rounds still match the current tree. */
+    async cleanupTasks(selection) {
+      const view = cleanup;
+      const candidates = view.candidates(state.tree ?? null);
+      const prepared = view.request(selection ?? {}, candidates);
+      if (prepared.problems.length > 0) {
+        notify('error', prepared.problems[0]);
+        return { ok: false, error: new ApiError('CLEANUP_INVALID', prepared.problems[0]) };
+      }
+      return await track('cleanup', async () => {
+        try {
+          const outcome = await api.cleanupTasks(prepared.body);
+          const deleted = view.outcome(outcome);
+          const sentence = view.describe(outcome);
+          if (sentence === '') throw new ApiError('CLEANUP_RESULT_UNCONFIRMED', '宿主未确认删除结果');
+          notify('success', sentence);
+          if (state.taskDetail !== null && deleted.deletedTaskIds.includes(state.taskDetail.taskId)) {
+            store.closeTask();
+          }
+          // Re-read through the normal path: the tree, the counts and each chain's
+          // eligibility come from the host, never from this response.
+          const refreshed = await store.refreshTasks('manual');
+          if (refreshed?.ok === false) {
+            notify('error', '记录已删除，但列表暂时读取失败；请点“刷新”重试。');
+            return { ok: true, outcome, refreshFailed: true };
+          }
+          return { ok: true, outcome };
+        } catch (error) {
+          const refused = error?.code?.startsWith('CLEANUP_') && error.code !== 'CLEANUP_RESULT_UNCONFIRMED';
+          notify('error', refused ? describeError(error) : '未能确认清理结果，请查看刷新后的任务记录。');
+          // The selection was made from a tree this host no longer agrees with.
+          await store.refreshTasks('manual');
           return { ok: false, error };
         }
       });

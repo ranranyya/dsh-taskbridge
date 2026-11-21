@@ -8,9 +8,8 @@
 //      acquired afterwards is disposed instead of driven;
 //   2. the agent-preset mount, because an Agent that joins no preset has no tools
 //      at all and would report a model it cannot exercise. The identity is the
-//      caller's choice: omitted means "the registry's configured default" (every
-//      worker run), and an explicit `presetId` names a composition the caller
-//      owns and has already verified (the additional review);
+//      caller's choice: omitted uses the registry's configured default. An
+//      explicit `presetId` names a composition the caller owns and has verified;
 //   3. bounded prompt sizes, so a huge request cannot be smuggled into a turn;
 //   4. an explicit, bounded request budget for the model call (never
 //      `maxTokens: 1`, which makes a working provider look broken, and never an
@@ -460,8 +459,7 @@ export class ExecutionDeadline {
  *    was created in.
  *  * no placement: the historical path, which creates a Session (and Agent) through
  *    `agents.create` under a caller-supplied or generated identity. Retained for a
- *    caller that owns its own conversation identity — the additional review, which
- *    composes its own preset and must not join the operator's history.
+ *    caller that owns its own conversation identity.
  *
  * The runner never disposes an agent it resolved. Disposal would end a conversation
  * a later follow-up must be able to continue, so {@link driveAgent} accepts an
@@ -872,9 +870,12 @@ export async function driveAgent(deps, request) {
     // keyword heuristics) and never opens the global default.
     //
     // A REQUESTED team mode that cannot be applied STOPS the run here, before the prompt:
-    // continuing with the Session's old mode would silently do the opposite of what the
-    // commander asked. Only an ABSENT choice (`null`) keeps the Session as it is.
-    state.team = await applyTeamSelection(deps, handle.agent, request?.agentTeams ?? null, state, { aborted });
+    // continuing with the Session's old mode would silently do the opposite of what was
+    // asked. Only an ABSENT choice (`null`) keeps the Session as it is — and an absent
+    // choice is what a continuation with no provable chain decision now arrives as.
+    state.team = await applyTeamSelection(
+      deps, handle.agent, request?.agentTeams ?? null, state, { aborted }, request?.agentTeamsImplicit === true,
+    );
     if (state.team !== null && typeof state.team.refuseReason === 'string') {
       // A requested mode that could not be applied is a REFUSAL, not a downgrade: the
       // worker is released without ever receiving the prompt, so nothing runs under the
@@ -1163,9 +1164,7 @@ export async function driveAgent(deps, request) {
    * `this.ctx.waterfall(scopeTarget(req.agent, req.agent), 'approval/request', req, …)`,
    * and `approveEscalation` is the one caller that raises it for a widened sandbox
    * request). A listener registered on the AGENT's own context therefore sees only
-   * that Agent's requests — an ordinary session, another task's worker and the
-   * optional read-only reviewer are all outside this scope and are never answered
-   * by this bridge.
+   * that Agent's requests. Other sessions and tasks use their own answerers.
    *
    * The listener answers with the bridge's closed outcome. It never throws: the
    * seam already contains a thrown answerer into `'unavailable'`, and a bridge that
@@ -1469,6 +1468,8 @@ export async function driveAgent(deps, request) {
         ? null
         : {
           requested: state.team.requested,
+          // Strictly boolean: was the operator's SETTING behind the request, or a person?
+          implicit: state.team.implicit === true,
           supported: state.team.supported,
           applied: state.team.applied,
           enabled: state.team.enabled,
@@ -1490,20 +1491,33 @@ export async function driveAgent(deps, request) {
    *     other conversation and no future task inherits it;
    *   * a REQUESTED mode that cannot be applied stops the run BEFORE the prompt (the
    *     caller treats `refuseReason` as terminal); an ABSENT choice never does;
+   *   * what is requested is the outcome that will be APPLIED — an explicit per-task
+   *     choice, an inherited chain choice, or the operator's new-task default — not only
+   *     the dispatcher's own field. An older host with no agent-teams service refuses both
+   *     an explicit and an inherited choice (somebody asked for exactly that mode), and
+   *     proceeds only for the operator's implicit OFF default, which it reports as NOT
+   *     APPLIED rather than claiming the Session is off;
    *   * the wait is BOUNDED by the run itself: it races the caller's own `aborted` latch
    *     (internal deadline or cancellation), so a service that never resolves cannot hold
    *     the run past its budget, and a late settle never reaches the prompt.
    * @param {object} deps - run dependencies (`policyServices`).
    * @param {object} agent - the live root Agent this run drives.
-   * @param {boolean | null} requested - the commander's choice, or null.
+   * @param {boolean | null} requested - the decision to apply, or null for none.
    * @param {object} state - the run state carrying the abort latch.
    * @param {{ aborted: Promise<string> }} hooks - the run's own abort latch promise.
-   * @returns {Promise<object>} `{ requested, supported, applied, enabled, reason, refuseReason }`
+   * @param {boolean} [implicit] - whether `requested` is the operator's DEFAULT filling an
+   *   absent choice rather than something a person decided. Only an implicit OFF may
+   *   proceed on a host with no agent-teams service, and even then it is reported as not
+   *   applied rather than claimed as "off".
+   * @returns {Promise<object>} `{ requested, implicit, supported, applied, enabled, reason, refuseReason }`
    *   where `refuseReason` is non-null exactly when the run must NOT proceed.
    */
-  async function applyTeamSelection(deps, agent, requested, state, hooks = {}) {
+  async function applyTeamSelection(deps, agent, requested, state, hooks = {}, implicit = false) {
     const base = {
       requested: requested === true ? true : requested === false ? false : null,
+      // A strictly-boolean view of the same fact, so a reader never has to interpret a
+      // tri-state to know whether the setting or a person was behind the value.
+      implicit: implicit === true,
       supported: false,
       applied: false,
       enabled: null,
@@ -1530,6 +1544,21 @@ export async function driveAgent(deps, request) {
       service = null;
     }
     if (service === null || typeof service.setEnabled !== 'function') {
+      // No agent-teams service on this host.
+      //
+      // An EXPLICIT `true` or `false`, and an INHERITED chain decision, are both REFUSED:
+      // somebody asked for that exact mode, and proceeding would run under whatever the
+      // Session happens to hold while the record implies otherwise. That is a refusal, not
+      // a downgrade, so the prompt is never delivered.
+      //
+      // The one exception is the operator's DEFAULT filling an absent choice, and only its
+      // OFF direction: that is exactly what a host without the service already does, so an
+      // ordinary older-version dispatch keeps working. It is still reported as NOT
+      // APPLIED — `applied: false`, `enabled: null` — because nothing confirmed it, and
+      // claiming "off" would be asserting a fact this run never observed.
+      if (base.requested === false && base.implicit) {
+        return { ...base, supported: false, applied: false, enabled: null, reason: 'service-absent-default-off' };
+      }
       return refuse('agent-teams-unavailable');
     }
     if (state.abortRequested === true) return refuse('agent-teams-aborted');
@@ -1573,9 +1602,18 @@ export async function driveAgent(deps, request) {
     if (state.abortRequested === true) return refuse('agent-teams-aborted');
     // Read back from the SERVICE, not from what we just asked for: `isEnabled` resolves
     // the runtime root and returns the saved projection, so this is the applied fact.
+    //
+    // STRICT: only a real boolean is a confirmed reading. `isEnabled(agent) === true`
+    // would turn `undefined` (no runtime root, no saved selection, a service that answers
+    // nothing) into `false` and then "confirm" an OFF request nobody observed — the same
+    // class of false evidence this plugin refuses everywhere else. Anything that is not
+    // `true` or `false` reads as UNCONFIRMED instead.
     let enabled = null;
     try {
-      enabled = typeof service.isEnabled === 'function' ? service.isEnabled(agent) === true : null;
+      if (typeof service.isEnabled === 'function') {
+        const reported = service.isEnabled(agent);
+        enabled = reported === true ? true : reported === false ? false : null;
+      }
     } catch {
       enabled = null;
     }

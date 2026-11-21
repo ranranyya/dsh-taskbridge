@@ -63,6 +63,16 @@ export const LIMITS = Object.freeze({
   providers: 32,
   manualModelsPerProvider: 128,
   presets: 32,
+  /**
+   * Bounds on the LEGACY `worker.timeoutSeconds`.
+   *
+   * The field is no longer offered in the settings page and no longer bounds a
+   * normal run: an ordinary delegated task has no total execution deadline, only
+   * the explicit per-job override documented in `validateJobOverrides`. The bounds
+   * survive because a stored document (or an older client) may still carry the
+   * value, and a legacy value must keep loading instead of failing the whole
+   * document — see `validateWorkerSettings`.
+   */
   timeoutSecondsMin: 30,
   timeoutSecondsMax: 2 * 60 * 60,
   maxParallelismMin: 1,
@@ -75,9 +85,13 @@ export const LIMITS = Object.freeze({
   // strictly greater than the first: two identical thresholds would deliver a
   // self-check and an attention alert for the same instant, which is exactly the
   // noisy behaviour the whole feature exists to remove.
-  selfCheckSecondsMin: 30,
+  //
+  // `0` is a legal value for EITHER threshold and means "this reminder is off".
+  // The minimum is therefore 0 rather than a duration, and the ordering rule is
+  // only enforced when both thresholds are actually enabled.
+  selfCheckSecondsMin: 0,
   selfCheckSecondsMax: 60 * 60,
-  attentionSecondsMin: 31,
+  attentionSecondsMin: 0,
   attentionSecondsMax: 2 * 60 * 60,
   // Repeated-failure reminder. `0` disables it, so the minimum is a switch rather
   // than an error; the ceiling keeps a silly value from being indistinguishable from
@@ -85,21 +99,35 @@ export const LIMITS = Object.freeze({
   repeatFailureThresholdMin: 0,
   repeatFailureThresholdMax: 20,
   promptChars: 200_000,
-  reviewPromptChars: 400_000,
 });
 
 /**
  * Default activity-monitoring thresholds, in seconds of *inactivity*.
  *
- * A run that keeps producing events never reaches either threshold, so these are
- * not poll intervals: nothing is scheduled until the executor has actually been
- * silent for the first one.
+ * There is exactly ONE time base: consecutive time without real progress. Real progress
+ * — model output, a reasoning step, a tool call or a tool result — resets it; a
+ * heartbeat, a result poll, the self-check itself and a plain state read do not.
+ *
+ * Two reminders are measured on that clock, and each can be switched off with `0`:
+ *
+ *  * `selfCheckSeconds` — one read-only local inspection (default 10 minutes);
+ *  * `attentionSeconds` — one notification to the commander asking it to check the
+ *    run's progress (default 40 minutes).
+ *
+ * Neither depends on total runtime, so a task that keeps working for hours produces
+ * neither. Nothing here ever ends, cancels or restarts a run: a reminder is a REPORT,
+ * never a verdict.
  */
 export const MONITORING_DEFAULTS = Object.freeze({
-  /** Idle span after which one read-only local self-check is performed. */
-  selfCheckSeconds: 300,
-  /** Idle span after which the wait reports `attention` instead of `heartbeat`. */
-  attentionSeconds: 600,
+  /** No-progress span after which one read-only local self-check is performed (0 = off). */
+  selfCheckSeconds: 10 * 60,
+  /**
+   * No-progress span after which the wait reports the run progress check (0 = off).
+   *
+   * This is the ONE notification interval: it doubles as the point at which a host is
+   * asked to confirm the goal, so there is no second duration to configure.
+   */
+  attentionSeconds: 40 * 60,
   /**
    * How many CONSECUTIVE identical tool failures are reported once, or `0` to disable.
    *
@@ -125,6 +153,20 @@ export const KNOWN_EFFORTS = Object.freeze(['off', 'minimal', 'low', 'medium', '
 export const EFFORT_ORDER = Object.freeze(new Map(KNOWN_EFFORTS.map((id, index) => [id, index])));
 
 /**
+ * Default for the operator's per-task Agent Teams choice: OFF.
+ *
+ * This is a TASK-level default, not DSH's global switch. It decides what a NEW
+ * submission does when its dispatcher states no per-task choice of its own:
+ * `false` writes that one run's Session to "teams off", `true` writes it to
+ * "teams on". It is deliberately `false` on a fresh install and on upgrade, so
+ * upgrading never silently turns agent collaboration on for every new task.
+ *
+ * It never touches DSH's global agent-teams setting and never overrides a
+ * dispatcher's explicit per-task `agentTeams` value.
+ */
+export const DEFAULT_AGENT_TEAMS_FOR_NEW_TASKS = false;
+
+/**
  * Default settings document. Delegation is off until the operator enables it.
  */
 export function defaultSettings() {
@@ -136,21 +178,25 @@ export function defaultSettings() {
       providerId: null,
       model: null,
       reasoningEffort: null,
+      // LEGACY, kept so every reader of this document sees one shape. It is no
+      // longer offered in the settings page and no longer bounds an ordinary run;
+      // `resolveEffectiveConfig` publishes it as `executionTimeoutSeconds`.
       timeoutSeconds: 1800,
       maxParallelism: 1,
       isolation: DEFAULT_ISOLATION,
-    },
-    review: {
-      enabled: false,
-      providerId: null,
-      model: null,
-      reasoningEffort: null,
     },
     // Kept separate from the legacy in-memory connection/grant compatibility
     // layer. New installations use this one switch for MCP dispatch.
     authorization: {
       taskGrantTtlSeconds: 900,
       sessionGrantTtlSeconds: 4 * 60 * 60,
+    },
+    // The operator's default for NEW tasks only. Absent in documents written
+    // before this block existed; validation fills in the OFF default, so schema
+    // version 1 stays readable both ways and an upgrade needs no migration and
+    // never turns collaboration on by itself.
+    execution: {
+      agentTeamsDefault: DEFAULT_AGENT_TEAMS_FOR_NEW_TASKS,
     },
     // Silence thresholds for a running task. Absent in documents written before
     // this block existed; validation fills in the defaults, so schema version 1
@@ -160,7 +206,7 @@ export function defaultSettings() {
       attentionSeconds: MONITORING_DEFAULTS.attentionSeconds,
     },
     projectOverrides: {},
-    // Named, non-secret worker/review combinations. Empty by default, and absent
+    // Named, non-secret worker settings. Empty by default, and absent
     // in documents written before presets existed — validation fills it in, so
     // schema version 1 stays readable both ways.
     presets: [],

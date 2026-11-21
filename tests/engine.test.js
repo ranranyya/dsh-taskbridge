@@ -19,7 +19,6 @@ import { AuthorizationRegistry } from '../src/auth/grants.js';
 import { JobEngine, JOB_CODES, OBSERVE_TASK_REASONS, TASK_STATES } from '../src/jobs/engine.js';
 import { SettingsService } from '../src/config/settings.js';
 import { WorkspaceLocks } from '../src/workspace/locks.js';
-import { REVIEW_STATES } from '../src/review/reviewer.js';
 import { DEFAULT_MAX_TOKENS } from '../src/runtime/agent-runner.js';
 import {
   cleanup,
@@ -118,31 +117,6 @@ function enginePresets(inventory = ['read', 'glob', 'grep', 'read_image']) {
 }
 
 /**
- * Stand-in for the plugin-owned read-only review composition.
- *
- * The real composer (`src/review/preset.js`) mounts the native filesystem tool
- * packages, which this repository does not depend on, so without a composer every
- * review fails at `REVIEW_PRESET_UNSUPPORTED` before any route is used. Accepting
- * that failure would make "the reviewer ran on its own provider/model" provable
- * only by its absence, so the engine tests supply the composer contract instead:
- * an id this fixture owns, and a mount that advertises the read-only inventory.
- * Nothing about routing, authorization or the worker run is affected.
- * @param {ReturnType<typeof enginePresets>} presets - the preset registry to own a composition in.
- * @returns {{ id: string, owns: (id: string) => boolean, preparation: () => Promise<string> }} composer.
- */
-function reviewComposer(presets) {
-  void presets;
-  const id = 'dsh-delegate-review-test';
-  return {
-    get id() { return id; },
-    owns(candidate) { return candidate === id; },
-    async preparation() {
-      return id;
-    },
-  };
-}
-
-/**
  * Build an engine over temporary storage, a real workspace directory and faked
  * native services.
  *
@@ -185,10 +159,6 @@ async function harness(options = {}) {
   const deps = {
     agents,
     agentPresets: presets,
-    // The plugin-owned read-only composition a review mounts. Its native rows are
-    // not available in this repository, so the composer contract is supplied here
-    // (see `reviewComposer`); routing and the worker run are unaffected.
-    reviewPresets: options.reviewPresets ?? reviewComposer(presets),
     sessions: { async flush() {} },
     workspaces,
     sessionController,
@@ -215,6 +185,9 @@ async function harness(options = {}) {
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.wait === undefined ? {} : { wait: options.wait }),
     ...(options.observeSliceMs === undefined ? {} : { observeSliceMs: options.observeSliceMs }),
+    // The scheduler seam for the monitor's own scheduled self-check, so a test can fire
+    // it at the instant it was armed for instead of waiting ten real minutes.
+    ...(options.timers === undefined ? {} : { timers: options.timers }),
     authorizationMode: options.authorizationMode ?? 'grants',
     delegationEnabled: options.delegationEnabled === true,
     logger: { info() {}, warn() {} },
@@ -911,105 +884,26 @@ test('a cancelled task releases the workspace for the next job', async () => {
   }
 });
 
-test('review runs only when enabled and uses its own selection', async () => {
-  const agents = fakeAgents({ respond: { text: 'VERDICT: approve\nREASON: correct' } });
+test('a legacy enabled model review goes straight to host acceptance with one worker and no reviewer', async () => {
+  // Submit with settings from an installation that had enabled model review.
+  const agents = fakeAgents({ respond: { text: 'completed by the worker' } });
   const h = await harness({
     agents,
-    settings: validSettings({
-      review: { enabled: true, providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high' },
-    }),
+    settings: validSettings({ review: { enabled: true, providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high' } }),
   });
   try {
     const { connectionId, grant } = h.authorize();
-    const started = await h.engine.start({
-      connectionId,
-      grantId: grant.grantId,
-      workspacePath: h.workspace,
-      prompt: 'go',
-    });
+    const started = await h.engine.start({ connectionId, grantId: grant.grantId, workspacePath: h.workspace, prompt: 'go' });
     const settled = await settle(h.engine, started.taskId);
-    assert.equal(settled.review.state, REVIEW_STATES.completed);
-    assert.equal(settled.review.verdict.verdict, 'approve');
-    assert.equal(settled.review.selection.model, 'deepseek-reasoner');
     assert.equal(settled.state, TASK_STATES.awaitingHostReview);
-
-    // Two distinct conversations, each on its own model:
-    //  * the WORKER is placed, so its model comes from the run that drove the
-    //    resolved agent in the Workspace — recorded on the task, not on a
-    //    `agents.create` call it never made;
-    //  * the REVIEWER is unplaced (it must not join the operator's history), so
-    //    it is the one agent created through the registry.
+    assert.equal(settled.phase, 'awaiting-host-review');
+    assert.equal(settled.hostAcceptance, null);
+    assert.equal(agents.created.length, 0, 'no independent reviewer was started');
+    assert.equal(h.sessionController.creates.length, 1, 'the worker has its own native session');
     assert.equal(settled.execution.selection.model, 'deepseek-chat');
-    const reviewModels = agents.created.map((record) => record.options.model);
-    assert.deepEqual(reviewModels, ['deepseek-reasoner'], 'only the reviewer goes through agents.create');
-    assert.notEqual(
-      settled.execution.conversation.sessionId,
-      agents.created[0].sessionId,
-      'the review must not share the worker conversation',
-    );
-  } finally {
-    await h.close();
-  }
-});
-
-test('both installed requests — worker and reviewer — carry a practical output allowance', async () => {
-  // The job's own evidence, not a unit-test abstraction: the two requests the
-  // installed plugin actually makes must each reserve a real output budget, or a
-  // reasoning turn stops mid-answer and an operator sees a truncated delegation.
-  const agents = fakeAgents({ respond: { text: 'VERDICT: approve\nREASON: correct' } });
-  const h = await harness({
-    agents,
-    settings: validSettings({
-      review: { enabled: true, providerId: 'relay', model: 'deepseek-reasoner', reasoningEffort: 'high' },
-    }),
-  });
-  try {
-    const { connectionId, grant } = h.authorize();
-    const started = await h.engine.start({
-      connectionId,
-      grantId: grant.grantId,
-      workspacePath: h.workspace,
-      prompt: 'go',
-    });
-    const settled = await settle(h.engine, started.taskId);
-    assert.equal(settled.state, TASK_STATES.awaitingHostReview);
-    assert.equal(settled.review.state, REVIEW_STATES.completed);
-
-    const budgets = agents.created.map((record) => record.options.maxTokens);
-    assert.equal(budgets.length, 1, 'one reviewer request goes through agents.create');
-    for (const [index, budget] of budgets.entries()) {
-      assert.equal(budget, DEFAULT_MAX_TOKENS, `request ${index} must carry the default allowance`);
-      assert.ok(budget >= 32768, `request ${index} must reserve at least 32768 output tokens, got ${budget}`);
-    }
-    // The worker's budget is asserted from the run itself: it drove a resolved
-    // agent, so there is no create call to inspect. (`execution.maxTokens` is
-    // redacted in the public view — a field named "token" is masked — so the
-    // budget is read from the task record's raw execution instead.)
     const task = h.engine.tasks.get(started.taskId);
-    assert.equal(task.execution.maxTokens, DEFAULT_MAX_TOKENS, 'the worker request must carry the same allowance');
+    assert.equal(task.execution.maxTokens, DEFAULT_MAX_TOKENS);
     assert.ok(task.execution.maxTokens >= 32768);
-  } finally {
-    await h.close();
-  }
-});
-
-test('review is skipped when disabled, without recording a verdict', async () => {
-  const h = await harness();
-  try {
-    const { connectionId, grant } = h.authorize();
-    const started = await h.engine.start({
-      connectionId,
-      grantId: grant.grantId,
-      workspacePath: h.workspace,
-      prompt: 'go',
-    });
-    const settled = await settle(h.engine, started.taskId);
-    assert.equal(settled.review.state, REVIEW_STATES.disabled);
-    assert.equal(settled.review.verdict, null);
-    // A placed worker creates no agent through the registry, so an empty
-    // `agents.created` is exactly the evidence that no reviewer ran.
-    assert.equal(h.agents.created.length, 0, 'no reviewer agent may be created when review is off');
-    assert.equal(h.sessionController.creates.length, 1, 'and the worker still got its one conversation');
   } finally {
     await h.close();
   }
@@ -1317,8 +1211,8 @@ test('a settled task freezes the monitoring thresholds it ran under', async () =
       prompt: 'go',
     });
     const settled = await settle(h.engine, started.taskId);
-    assert.equal(settled.effective.monitoring.selfCheckSeconds, 300);
-    assert.equal(settled.effective.monitoring.attentionSeconds, 600);
+    assert.equal(settled.effective.monitoring.selfCheckSeconds, 600);
+    assert.equal(settled.effective.monitoring.attentionSeconds, 2400);
     // The activity summary is published on an ordinary view, and carries no text.
     assert.ok(settled.activity !== null);
     assert.equal(typeof settled.activity.activityEvents, 'number');
@@ -1341,8 +1235,8 @@ test('a task keeps its frozen thresholds when settings change mid-run', async ()
     });
     await h.settings.setMonitoring({ selfCheckSeconds: 60, attentionSeconds: 120 });
     const live = liveTask(h.engine, started.taskId);
-    assert.equal(live.effective.monitoring.selfCheckSeconds, 300, 'the running task kept its own snapshot');
-    assert.equal(live.effective.monitoring.attentionSeconds, 600);
+    assert.equal(live.effective.monitoring.selfCheckSeconds, 600, 'the running task kept its own snapshot');
+    assert.equal(live.effective.monitoring.attentionSeconds, 2400);
     await h.engine.cancel(started.taskId, 'test-end');
   } finally {
     await h.close();
@@ -1412,7 +1306,493 @@ test('observing an unknown or another connection\'s task is one identical refusa
   }
 });
 
-test('a silent run reports heartbeat, then attention after the frozen threshold', async () => {
+test('a healthy run crossing the legacy 1800-second point keeps running, with no delivery reminder and ONE self-check', async () => {
+  // The decisive regression for this packet: the retired global timeout was 1800 s, and a
+  // run that used to be killed there must now simply continue — for hours — as long as it
+  // keeps making real progress. Total runtime is not a reminder either.
+  //
+  // The two reminders are measured by DIFFERENT clocks, and this test pins both down:
+  //  * the ten-minute self-check runs from the real start of execution, so a BUSY run is
+  //    inspected exactly once (never skipped because the model kept streaming), and reading
+  //    that diagnostic is NOT a result returned to anyone;
+  //  * the forty-minute check is measured from the last real delivery to the commander (the
+  //    run's own start opens the first interval), so a run whose every answer is an ordinary
+  //    heartbeat — carrying a readable self-check diagnostic — never advances it: it reaches
+  //    the reminder on schedule, and that report still leaves the run running.
+  const clock = observedClock();
+  // The scheduled self-check runs on a platform timer in production. The host owns that
+  // timer, so this test plays its part: each round fires the armed timer once its instant
+  // has passed, which is exactly what the real timer would do.
+  const pendingTimers = [];
+  const setTimer = (fn, delay) => {
+    const handle = { fn, delay, armedAt: clock.clockMs, cleared: false, fired: false, unref() {} };
+    pendingTimers.push(handle);
+    return handle;
+  };
+  const clearTimer = (handle) => { if (handle !== null && handle !== undefined) handle.cleared = true; };
+  const h = await harness({
+    sessionController: busySessionController(),
+    now: clock.now,
+    wait: clock.wait,
+    observeSliceMs: 1_000,
+    timers: { setTimeout: setTimer, clearTimeout: clearTimer },
+  });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'long healthy job',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    // The defaults froze on the task, and NO budget bounds an ordinary run.
+    assert.equal(task.effective.monitoring.selfCheckSeconds, 600);
+    assert.equal(task.effective.monitoring.attentionSeconds, 2400);
+    assert.equal(task.effective.worker.executionTimeoutSeconds, null);
+    assert.equal(task.deadlineAt, null, 'no deadline is armed for an ordinary run');
+    // The stored legacy value is still READABLE on the document; it simply does not bound
+
+    // this run (a fresh document defaults it to 1800, and nothing applies it).
+    assert.equal(typeof (await h.settings.read()).worker.timeoutSeconds, 'number');
+    h.engine.onExecutionEvent(task, { type: 'turn/start', data: {} });
+
+    // THREE hours of real output every 10 minutes, crossing 1800 s and the 40-minute
+    // interval many times over. Nothing may end, and a busy run that delivered nothing new
+    // produces exactly ONE reminder: the forty-minute check on its first active interval.
+    let reports = 0;
+    let selfCheckVerdict = null;
+    /** What the engine armed and what the monitor thinks it owes, for the failure message. */
+    const diagnostics = [];
+    for (let minute = 10; minute <= 180; minute += 10) {
+      clock.advance(10 * 60_000 - 1_000);
+      // Play the host's part: fire the armed self-check timer once it is due.
+      for (const handle of pendingTimers) {
+        if (handle.cleared || handle.fired) continue;
+        if (clock.clockMs >= handle.armedAt + handle.delay) {
+          handle.fired = true;
+          handle.fn();
+        }
+      }
+      // Minute 10 is a REAL DELIVERY: the ten-minute self-check diagnostic is handed back to
+      // the commander for the first time, which opens the interval the next check describes.
+      const delivering = minute === 10;
+      const before = task.monitor.deliveries;
+      // The self-check diagnostic IS readable on this answer — and reading it must count
+      // NOTHING: the run produced no new result for anyone.
+      h.engine.onExecutionEvent(task, { type: 'text-delta', data: { index: 0, text: `step-${minute}` } });
+      const observation = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+      if (observation.checkpoint === 'progress') reports += 1;
+      if (observation.selfCheck !== null && observation.selfCheck.verdict !== null) selfCheckVerdict = observation.selfCheck.verdict;
+      if (delivering) {
+        assert.equal(observation.selfCheck.verdict, 'executor-alive-silent');
+        assert.equal(task.monitor.deliveries, before,
+          'reading the first self-check diagnostic is NOT a delivery and must not postpone the clock');
+      }
+      diagnostics.push(`minute ${minute} ${observation.reason} origin=${task.monitor.progressOrigin() - task.runStartedAt}`
+        + ` due=${task.monitor.attentionDue()} delivered=${JSON.stringify(task.monitor.attentionDelivered)}`
+        + ` returned=${observation.returnState?.returned}`
+        + ` timer=${task.monitor.selfCheckTimer === null ? 'none' : task.monitor.selfCheckTimer.at - task.runStartedAt}`);
+      assert.equal(observation.task.state, 'running', `minute ${minute}: a busy run keeps running`);
+      assert.notEqual(observation.reason, OBSERVE_TASK_REASONS.ready, 'a busy run is never reported as finished');
+      // A BUSY run still delivers nothing new, so every answer is a plain heartbeat except
+      // the one progress check — which is a report, not a verdict.
+      if (observation.reason === OBSERVE_TASK_REASONS.attention) {
+        assert.equal(observation.checkpoint, 'progress');
+        assert.equal(observation.task.state, 'running', 'a reminder never ends the run');
+      }
+    }
+    // The progress check fires once the FIRST delivery interval is spent (the run start),
+    // and every later heartbeat is not a delivery, so that ONE interval keeps its latch.
+    assert.equal(reports, 1, `one delivery interval, one report — duration alone is never a reminder\n${diagnostics.join('\n')}`);
+    // The check exists and was made once: its verdict is reported on every later answer, and
+    // the run's own record shows the ONE inspection the timer performed.
+    assert.equal(selfCheckVerdict, 'executor-alive-silent', 'the run was inspected, though it kept working');
+    // ONE inspection for the whole run: its instant is the run's own ten-minute mark, and
+    // the check was performed either by the host's timer or by the very answer that carried
+    // it — never twice.
+    const performed = task.monitor.lastSelfCheck();
+    assert.equal(performed.sinceStartMs >= 600_000, true, 'the inspection states the run time it saw');
+    const firstPerformed = task.monitor.scheduledSelfCheckAt ?? performed.checkedAt;
+    assert.equal(firstPerformed - task.runStartedAt >= 600_000, true,
+      `inspected ${firstPerformed - task.runStartedAt} ms after the real start, never earlier`);
+    assert.equal(task.monitor.selfCheckTimer, null, 'and nothing stays armed afterwards');
+    // 180 rounds of 10 minutes: thirty simulated hours, far past the retired 1800 s budget.
+    // (The engine clamps one observation to 25 s, so the seam — not the wait — moves time.)
+    assert.equal(Number.isFinite(task.monitor.runOrigin()), true, 'the run has a real start');
+    // Nothing has been DELIVERED for hours, so the delivery clock is due and already spent.
+    assert.equal(task.monitor.attentionDue(), true, 'nothing was delivered back for the whole interval');
+    assert.equal(task.monitor.progressReported.origin, task.monitor.progressOrigin(), 'that interval was reported once');
+    const live = h.engine.get(started.taskId);
+    assert.equal(live.state, TASK_STATES.running, 'the run survived far beyond the retired 1800-second budget');
+    assert.equal(live.phase, 'execute');
+    assert.equal(task.slotHeld, true, 'it still holds its own concurrency slot');
+    await h.engine.cancel(started.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a run that delivers nothing reports once, and stays running through every reminder', async () => {
+  // The delivery clock: internal model steps, turn boundaries, tool activity AND the local
+  // self-check diagnostic are NOT deliveries back to the commander, so they never postpone the
+  // check. Only a new result the commander really receives does — and this wait channel
+  // delivers that when the task ENDS.
+  const clock = observedClock();
+  const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait, observeSliceMs: 1_000 });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'quiet job',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    // A busy executor: a real step/start and turn boundaries all the way through. NONE of
+    // them is news the commander received, so the delivery clock keeps running.
+    h.engine.onExecutionEvent(task, { type: 'step/start', data: {} });
+
+    // Nine busy minutes: nothing has run its course yet, so every answer is a heartbeat even
+    // though the model and its turn boundaries never stopped.
+    for (let minute = 0; minute < 9; minute += 1) {
+      clock.advance(60_000);
+      h.engine.onExecutionEvent(task, { type: 'turn/start', data: {} });
+    }
+    assert.equal(task.monitor.claimAttention(clock.clockMs), false,
+      'nothing is due yet, however busy the run is');
+    for (let round = 0; round < 3; round += 1) {
+      const quiet = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+      assert.equal(quiet.reason, OBSERVE_TASK_REASONS.heartbeat);
+      assert.equal(quiet.checkpoint ?? null, null);
+    }
+
+    // Forty minutes of a busy run with NO delivery: the opening interval is spent, so the
+    // check fires — the model's own activity never postponed it.
+    clock.advance(40 * 60_000);
+    const first = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    assert.equal(first.reason, OBSERVE_TASK_REASONS.attention, 'a busy run with no delivery is reported');
+    assert.equal(first.checkpoint, 'progress');
+    // A reminder is a REPORT about the interval that just ran out, never a delivery of progress:
+    // the clock is measured from the run's own start and nothing since then moved it.
+    assert.equal(first.returnState.returned, false, 'the reminder itself is not a delivery');
+    assert.equal(task.monitor.deliveries, 0, 'and no diagnostic or internal event counted as one');
+
+    // Nothing about the run changed: same state, same phase, still holding its slot.
+    assert.equal(h.engine.get(started.taskId).state, TASK_STATES.running);
+    assert.equal(h.engine.get(started.taskId).phase, 'execute');
+    assert.equal(task.slotHeld, true, 'a reminder never releases or takes a concurrency slot');
+    assert.equal(h.engine.locks.isLocked(h.workspace), true, 'nor a workspace lease');
+
+    // Hours later, with nothing delivered in between: at most ONE report per interval. A
+    // single long wait can legitimately be answered on its way out, so the assertion is on
+    // the LATENCY — an answer that is not a reminder is never starved for long.
+    clock.advance(3 * 60 * 60_000);
+    const later = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    if (later.reason === OBSERVE_TASK_REASONS.attention) {
+      assert.equal(later.checkpoint, 'progress', 'only the run progress check can be reported');
+      assert.equal(later.task.state, TASK_STATES.running, 'and the run keeps running');
+    } else {
+      assert.equal(later.reason, OBSERVE_TASK_REASONS.heartbeat, 'a quiet answer is a heartbeat');
+      assert.equal(later.checkpoint ?? null, null);
+    }
+
+    await h.engine.cancel(started.taskId, 'test-end');
+  } finally {
+    await h.close();
+  }
+});
+
+test('each reminder can be switched off without disturbing the other', async () => {
+  const cases = [
+    // self-check off: nothing is ever inspected, and the delivery check is unaffected.
+    { monitoring: { selfCheckSeconds: 0, attentionSeconds: 2400 }, expectSelfCheckOff: true },
+    // delivery check off: the self-check keeps its own clock and still runs once.
+    { monitoring: { selfCheckSeconds: 600, attentionSeconds: 0 }, expectSelfCheckOff: false },
+  ];
+  for (const testCase of cases) {
+    const clock = observedClock();
+    const h = await harness({
+      sessionController: busySessionController(),
+      now: clock.now,
+      wait: clock.wait,
+      observeSliceMs: 1_000,
+      settings: validSettings({ monitoring: testCase.monitoring }),
+    });
+    try {
+      const { connectionId, grant } = h.authorize();
+      const started = await h.engine.start({
+        connectionId,
+        grantId: grant.grantId,
+        workspacePath: h.workspace,
+        prompt: 'quiet job',
+      });
+      const task = await waitForExecute(h.engine, started.taskId);
+      // A busy run for an hour: real `step/start` events throughout. The delivery clock is
+      // NOT moved by them, and each switch must hold on its OWN interval.
+      let reports = 0;
+      for (let minute = 0; minute < 60; minute += 1) {
+        clock.advance(60_000);
+        h.engine.onExecutionEvent(task, { type: 'step/start', data: {} });
+        const observation = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1 });
+        if (observation.checkpoint === 'progress') reports += 1;
+        else if (observation.checkpoint === 'stall') assert.fail('no second checkpoint label exists');
+        assert.equal(observation.reason === OBSERVE_TASK_REASONS.attention, observation.checkpoint === 'progress',
+          'attention and the progress checkpoint are the same event');
+        assert.equal(observation.task.state, TASK_STATES.running, 'no reminder ends the run');
+      }
+      // ONE interval of no delivery, so at most ONE report — and a disabled reminder never
+      // reports at all.
+      assert.equal(reports, testCase.monitoring.attentionSeconds === 0 ? 0 : 1,
+        `the delivery check fires once, or never when it is off (${JSON.stringify(testCase.monitoring)})`);
+      // The self-check is its own switch, read from the monitor's own state.
+      if (testCase.expectSelfCheckOff) {
+        assert.equal(task.monitor.selfCheckMs, 0, 'a disabled self-check is OFF in the monitor');
+        assert.equal(task.monitor.selfCheckDue(clock.clockMs + 10 * 60 * 60_000), false);
+        assert.equal(task.monitor.runSelfCheck(clock.clockMs), null, 'and it never runs');
+        // A disabled check does not disturb the reminder measured beside it.
+        assert.equal(task.monitor.attentionMs, 2_400_000);
+      } else {
+        assert.equal(task.monitor.selfCheckMs, 600_000, 'an enabled self-check keeps its interval');
+        // The inspection happened on the run's own ten-minute mark, even though the run was
+        // busy the whole time — that is the point of measuring from the start.
+        assert.equal(task.monitor.lastSelfCheck()?.verdict, 'executor-alive-silent');
+        assert.equal(task.monitor.lastSelfCheck().sinceStartMs >= 600_000, true);
+        // A self-check is a READ: it never changes the run.
+        assert.equal(h.engine.get(started.taskId).state, TASK_STATES.running);
+        // A disabled delivery check never reports.
+        assert.equal(task.monitor.attentionMs, 0);
+        assert.equal(task.monitor.attentionDue(clock.clockMs + 10 * 60 * 60_000), true,
+          'due is true by duration, but the switch still refuses to report');
+        assert.equal(task.monitor.claimAttention(clock.clockMs), false, 'an off reminder can never be claimed');
+      }
+      await h.engine.cancel(started.taskId, 'test-end');
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test('a live run gets its scheduled self-check with no observer, and teardown leaves no timer', async () => {
+  // The product requirement: ten minutes after the run REALLY started, the engine inspects
+  // it ONCE — even though nothing ever calls observe, and even if the run is busy.
+  const clock = observedClock();
+  const timers = [];
+  // The fake mirrors the REAL delay cap: a delay a platform timer cannot express is
+  // clamped to the platform maximum, so the test sees the same scheduling the engine does.
+  const setTimer = (fn, delay) => {
+    const handle = { fn, delay: Math.min(delay, 2_147_483_647), armedAt: clock.clockMs, cleared: false, fired: false, unref() {} };
+    timers.push(handle);
+    return handle;
+  };
+  const clearTimer = (handle) => { if (handle !== null && handle !== undefined) handle.cleared = true; };
+  const armed = () => timers.filter((handle) => !handle.cleared && !handle.fired);
+  const h = await harness({
+    sessionController: busySessionController(),
+    now: clock.now,
+    wait: clock.wait,
+    observeSliceMs: 1_000,
+    timers: { setTimeout: setTimer, clearTimeout: clearTimer },
+  });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'quiet job',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    // The run armed exactly ONE timer for its frozen 10-minute threshold, from the real
+    // start of execution (the engine's own stamp, in the clock the monitor reads).
+    const first = armed();
+    assert.equal(first.length, 1, 'one scheduled self-check for the run');
+    assert.equal(first[0].delay, 600_000, 'armed for selfCheckSeconds, not a third clock');
+    assert.equal(task.monitor.selfCheckTimer.at, task.runStartedAt + 600_000, 'measured from the real start');
+    // NO OBSERVATION AT ALL — and a BUSY executor: internal output the whole way must not
+    // postpone the inspection.
+    clock.advance(300_000);
+    h.engine.onExecutionEvent(task, { type: 'text-delta', data: { index: 0, text: 'still working' } });
+    assert.equal(task.monitor.lastSelfCheck(), null, 'halfway: nothing inspected yet');
+    assert.equal(task.monitor.selfCheckTimer !== null, true, 'and the one timer is still pending');
+    assert.equal(armed().length, 1, 'a busy run does not stack timers');
+    // Move the clock to the instant the timer was armed for and fire it, exactly as the
+    // platform would.
+    clock.advance(300_000);
+    first[0].fired = true;
+    first[0].fn();
+    const diagnostic = task.monitor.lastSelfCheck();
+    assert.ok(diagnostic !== null, 'the inspection happened with no observer, during a busy run');
+    assert.equal(diagnostic.verdict, 'executor-alive-silent');
+    assert.equal(diagnostic.sinceStartMs >= 600_000, true, 'the check states the time since the run started');
+    assert.equal(task.monitor.scheduledSelfCheckAt, diagnostic.checkedAt, 'the timer is what performed it');
+    // The two independent fields are both stated by the check.
+    assert.equal(typeof diagnostic.noDeliveryMs, 'number', 'how long nothing was returned');
+    assert.equal(diagnostic.detail.activity.kind, 'model-working', 'and what DSH is doing');
+    // The run itself is untouched by a read-only inspection.
+    assert.equal(h.engine.get(started.taskId).state, TASK_STATES.running);
+    assert.equal(task.slotHeld, true, 'a self-check never releases or takes a slot');
+    // Once per RUN, not once per silence: more output arms NOTHING new.
+    h.engine.onExecutionEvent(task, { type: 'step/start', data: {} });
+    assert.equal(armed().length, 0, 'the run is inspected once, so nothing stays armed');
+
+    // Cancelling the run clears it: a terminal task leaves no timer behind.
+    await h.engine.cancel(started.taskId, 'test-end');
+    assert.equal(armed().length, 0, 'cancel clears the scheduled self-check');
+    assert.equal(task.monitor.selfCheckTimer, null);
+  } finally {
+    await h.close();
+  }
+});
+
+test('a busy long run is inspected once on its own timer and never stacks timers', async () => {
+  const clock = observedClock();
+  const timers = [];
+  // The fake mirrors the REAL delay cap: a delay a platform timer cannot express is
+  // clamped to the platform maximum, so the test sees the same scheduling the engine does.
+  const setTimer = (fn, delay) => {
+    const handle = { fn, delay: Math.min(delay, 2_147_483_647), armedAt: clock.clockMs, cleared: false, fired: false, unref() {} };
+    timers.push(handle);
+    return handle;
+  };
+  const clearTimer = (handle) => { if (handle !== null && handle !== undefined) handle.cleared = true; };
+  const armed = () => timers.filter((handle) => !handle.cleared && !handle.fired);
+  const h = await harness({
+    sessionController: busySessionController(),
+    now: clock.now,
+    wait: clock.wait,
+    observeSliceMs: 1_000,
+    timers: { setTimeout: setTimer, clearTimeout: clearTimer },
+  });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'busy job',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    // Real output every 5 minutes for an hour — a busy run. The ten-minute inspection is
+    // measured from the START, so it happens exactly once, at ~10 minutes, and never
+    // again: the HOST is what fires the scheduled timer here (the platform owns it), so
+    // this test plays that role at the instant the engine armed it for.
+    let inspectedAt = [];
+    for (let minute = 5; minute <= 60; minute += 5) {
+      clock.advance(5 * 60_000 - 1_000);
+      h.engine.onExecutionEvent(task, { type: 'text-delta', data: { index: 0, text: `step-${minute}` } });
+      // At most ONE timer exists at any moment, armed for the run's own start instant.
+      assert.equal(armed().filter((handle) => handle.cleared === false).length <= 1, true,
+        `at most one timer exists (minute ${minute})`);
+      const pending = armed()[0];
+      if (pending !== undefined && clock.clockMs >= pending.armedAt + pending.delay) {
+        pending.fired = true;
+        pending.fn();
+      }
+      const diagnostic = task.monitor.lastSelfCheck();
+      if (diagnostic !== null && diagnostic.checkedAt > (inspectedAt.at(-1) ?? -1)) inspectedAt.push(diagnostic.checkedAt);
+      if (diagnostic === null) assert.equal(task.monitor.selfCheckTimer !== null, true, `the timer is still pending (minute ${minute})`);
+      else assert.equal(task.monitor.selfCheckTimer, null, `no timer survives its one inspection (minute ${minute})`);
+    }
+    assert.equal(inspectedAt.length, 1, 'a busy run is inspected ONCE, not skipped and not repeated');
+    assert.equal(inspectedAt[0] - task.runStartedAt >= 600_000, true,
+      `inspected ${inspectedAt[0] - task.runStartedAt} ms after the real start, never earlier`);
+    await h.engine.cancel(started.taskId, 'test-end');
+    assert.equal(armed().length, 0, 'and teardown leaves none');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a run whose tools stay busy is reported at the 40-minute mark, even though its self-check is readable', async () => {
+  // The defect this test pins down: the FIRST wait starts BEFORE the local self-check has run;
+  // the observer then reads that self-check diagnostic on the SAME task; and the run keeps a
+  // tool, a tool result and a model step going the whole time. Reading the diagnostic is a read
+  // of local facts, NOT a result returned to anyone, so it must NOT reset the 40-minute clock.
+  // One millisecond before the interval the answer is a heartbeat; AT it the SAME taskId reports
+  // the run progress check, the run is still `running`, and its real delivery is untouched.
+  const clock = observedClock();
+  const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait, observeSliceMs: 1_000 });
+  try {
+    const { connectionId, grant } = h.authorize();
+    const started = await h.engine.start({
+      connectionId,
+      grantId: grant.grantId,
+      workspacePath: h.workspace,
+      prompt: 'busy job with a tool',
+    });
+    const task = await waitForExecute(h.engine, started.taskId);
+    // The baseline: the run really started, and nothing has been delivered to anyone yet.
+    assert.equal(Number.isFinite(task.runStartedAt), true, 'the run has a real start');
+    assert.equal(task.monitor.progressOrigin(), task.runStartedAt, 'the first interval begins at the start');
+    assert.equal(task.monitor.deliveries, 0, 'the start is a baseline, not a delivery');
+
+    // THE FIRST WAIT, before the self-check exists. The executor is busy: a step, a tool call
+    // and its result — real internal work, and none of it is a result for the commander.
+    clock.advance(30_000);
+    h.engine.onExecutionEvent(task, { type: 'step/start', data: {} });
+    h.engine.onExecutionEvent(task, { type: 'tool/call', data: { callId: 'c-1', name: 'bash', arguments: '{"command":"npm test"}' } });
+    const early = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 25_000 });
+    assert.equal(early.reason, OBSERVE_TASK_REASONS.heartbeat, 'the first wait answers a heartbeat');
+    assert.equal(early.selfCheck.verdict, null, 'and no self-check has run yet');
+
+    // The tool settles and the model keeps working: still internal, still not a delivery. The
+    // clock is placed exactly at the run's own ten-minute mark, where its armed inspection is due.
+    clock.state.current = task.runStartedAt + 600_000;
+    h.engine.onExecutionEvent(task, { type: 'tool/result', data: { message: { role: 'tool', toolCallId: 'c-1', content: [{ type: 'text', text: 'ok' }] } } });
+    h.engine.onExecutionEvent(task, { type: 'text-delta', data: { index: 0, text: 'continuing' } });
+
+    // The run is now past its own ten-minute mark, so the inspection it armed at the start is
+    // due. The observer reads the diagnostic on the same task: it is available, and reading it
+    // moves nothing.
+    const checked = task.monitor.runSelfCheck();
+    assert.ok(checked !== null, 'the run is inspected at its own ten-minute mark');
+    const reading = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    assert.equal(reading.selfCheck.verdict, 'executor-alive-silent', 'the diagnostic is readable');
+    assert.notEqual(reading.selfCheck.checkedAt, null, 'and it states when it ran');
+    assert.equal(reading.returnState.returned, false, 'reading it is not a delivery');
+    assert.equal(task.monitor.progressOrigin(), task.runStartedAt, 'the interval is still the opening one');
+    assert.equal(task.monitor.deliveries, 0, 'no diagnostic counted as a result');
+
+    // Keep the tool activity going all the way to the mark, so nothing here is "silence".
+    const dueAt = task.runStartedAt + task.effective.monitoring.attentionSeconds * 1_000;
+    for (let step = 0; step < 6; step += 1) {
+      clock.advance(Math.floor((dueAt - 1_000 - clock.clockMs) / (6 - step)));
+      h.engine.onExecutionEvent(task, { type: 'tool/call', data: { callId: `c-${step + 2}`, name: 'bash', arguments: '{"command":"ls"}' } });
+      h.engine.onExecutionEvent(task, { type: 'tool/result', data: { message: { role: 'tool', toolCallId: `c-${step + 2}`, content: [{ type: 'text', text: 'ok' }] } } });
+    }
+    // ONE MILLISECOND BEFORE the interval, asked with a wait that ends BEFORE the mark: no
+    // reminder is produced. (A wait that ends exactly ON the mark is reported — that is the
+    // earliest a caller can be told, and it is not early.)
+    clock.state.current = dueAt - 2_000;
+    const justBefore = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    assert.equal(justBefore.reason, OBSERVE_TASK_REASONS.heartbeat, 'before the mark is not a reminder');
+    assert.equal(justBefore.checkpoint ?? null, null);
+    assert.equal(task.monitor.progressReported, null, 'and nothing was reported yet');
+
+    // AT the interval, on the SAME taskId: the progress check, once, and the run still runs.
+    clock.state.current = dueAt;
+    const attention = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    assert.equal(attention.reason, OBSERVE_TASK_REASONS.attention, 'the interval is reported at its mark');
+    assert.equal(attention.checkpoint, 'progress');
+    assert.equal(attention.task.taskId, started.taskId, 'on the SAME taskId');
+    assert.equal(attention.task.state, TASK_STATES.running, 'the run keeps running');
+    assert.equal(attention.progress.noDeliveryForMs, 2_400_000, 'measured from the start baseline');
+    assert.equal(attention.progress.activity.kind, 'model-working', 'and it states what DSH is doing');
+    assert.equal(attention.returnState.returned, false, 'the reminder is not a delivery');
+    // And only ONE: asking again at the same instant answers nothing new.
+    const again = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    assert.equal(again.reason, OBSERVE_TASK_REASONS.heartbeat, 'one interval, one report');
+
+    // The real delivery is untouched by all of this: the run ends normally and IS the result.
+    const settled = await h.engine.cancel(started.taskId, 'test-end');
+    assert.equal(settled.state, TASK_STATES.cancelled, 'a reminder never stopped or changed the run');
+  } finally {
+    await h.close();
+  }
+});
+
+test('a single observation that spans the whole interval reports it once, on the same task', async () => {
   const clock = observedClock();
   const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait, observeSliceMs: 1_000 });
   try {
@@ -1427,30 +1807,61 @@ test('a silent run reports heartbeat, then attention after the frozen threshold'
     // Anchor the episode on one real event, through the engine hook the runner uses.
     h.engine.onExecutionEvent(task, { type: 'step/start', data: {} });
 
-    // Well under the threshold: the observation is silent.
-    clock.advance(120_000);
-    const quiet = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
-    assert.equal(quiet.reason, OBSERVE_TASK_REASONS.heartbeat);
-    assert.equal(quiet.task.state, 'running');
-    // That event was real evidence, so the published phase says the run is executing.
-    assert.equal(quiet.task.phase, 'execute', 'a run the engine has seen working reports execute');
+    // Well under the threshold, while the executor is BUSY: the answer is a heartbeat and
+    // nothing is due. Internal activity is never a delivery, so it cannot postpone the check
+    // either — it simply does not advance the clock. (The loop stops BEFORE the threshold, so
+    // the reminder below is produced by the single wait that spans it.)
+    for (let minute = 1; minute <= 36; minute += 1) {
+      clock.advance(60_000);
+      h.engine.onExecutionEvent(task, { type: 'step/start', data: {} });
+      if (minute % 10 !== 0) continue;
+      const busy = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+      assert.equal(busy.reason, OBSERVE_TASK_REASONS.heartbeat, `minute ${minute}: a busy run answers nothing new`);
+      assert.equal(busy.checkpoint ?? null, null);
+      assert.equal(busy.task.phase, 'execute', 'a run the engine has seen working reports execute');
+    }
 
-    // Past the threshold: attention, once.
-    clock.advance(600_000);
-    const attention = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
-    assert.equal(attention.reason, OBSERVE_TASK_REASONS.attention);
-    assert.equal(attention.activity.idleForMs >= 600_000, true);
+    // Cross that interval, one waiting turn at a time: the reminder arrives as soon as the due
+    // instant has passed. Each turn waits as long as the documented bound allows, so the
+    // observation that spans the due instant answers on its way out.
+    let attention = null;
+    for (let turn = 0; turn < 8; turn += 1) {
+      attention = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 25_000 });
+      if (attention.reason === OBSERVE_TASK_REASONS.attention) break;
+      assert.equal(attention.reason, OBSERVE_TASK_REASONS.heartbeat, `turn ${turn}: a bounded wait may end first`);
+      clock.advance(20 * 60_000);
+    }
+    assert.equal(attention.reason, OBSERVE_TASK_REASONS.attention,
+      `now=${clock.clockMs - task.runStartedAt} origin=${task.monitor.progressOrigin() - task.runStartedAt}`
+      + ` due=${task.monitor.attentionDue()} next=${task.monitor.nextAttentionAt() - task.runStartedAt}`
+      + ` delivered=${JSON.stringify(task.monitor.attentionDelivered)}`
+      + ` reported=${JSON.stringify(task.monitor.progressReported)}`
+      + ` waited=${attention.wait.waitedMs} state=${attention.task.state}`);
+    assert.equal(attention.checkpoint, 'progress', 'the run progress check');
+    assert.equal(attention.progress.thresholdSeconds, 2400);
+    assert.equal(attention.progress.noDeliveryForMs >= 2_400_000, true, 'nothing was delivered in that interval');
+    // The reminder is a report about the interval that ran out, never a delivery of progress.
+    assert.equal(attention.returnState.returned, false, 'the check itself is not a delivery');
+    // The two independent fields: how long nothing was returned, and what DSH is doing.
+    assert.equal(typeof attention.progress.activity.kind, 'string');
+    assert.equal(attention.progress.activity.kind, 'model-working', 'a busy run is described as working');
 
-    // The episode's latch: the next request stays silent.
+    // The interval's latch: the next request stays silent, and stays silent for the rest of
+    // this interval however long it lasts — the heartbeat is not a delivery.
     clock.advance(1_000);
     const cooled = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
     assert.equal(cooled.reason, OBSERVE_TASK_REASONS.heartbeat);
+    clock.advance(3 * 60 * 60_000);
+    const later = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 1_000 });
+    // One interval, one report: nothing new can be reported for the interval the reminder
+    // already described, so the only answers are heartbeats.
+    assert.equal(later.reason, OBSERVE_TASK_REASONS.heartbeat, 'one interval, one report');
+    assert.equal(later.checkpoint ?? null, null);
     await h.engine.cancel(started.taskId, 'test-end');
   } finally {
     await h.close();
   }
 });
-
 test('an observation returns a compact summary with the self-check diagnostic', async () => {
   const clock = observedClock();
   const h = await harness({ sessionController: busySessionController(), now: clock.now, wait: clock.wait });
@@ -1464,7 +1875,9 @@ test('an observation returns a compact summary with the self-check diagnostic', 
     });
     const task = await waitForExecute(h.engine, started.taskId);
     task.monitor.onEvent({ type: 'text-delta', data: { text: 'working' } }, clock.clockMs);
-    clock.advance(300_000);
+    // Past the 10-minute self-check mark, inside the 40-minute progress interval: the
+    // observation stays a heartbeat and its own bounded wait spans the check.
+    clock.advance(660_000);
 
     const observation = await h.engine.observeTask(started.taskId, { connectionId, waitMs: 25_000 });
     assert.equal(observation.reason, OBSERVE_TASK_REASONS.heartbeat);
@@ -1475,8 +1888,8 @@ test('an observation returns a compact summary with the self-check diagnostic', 
     assert.equal(summary.taskId, started.taskId);
     assert.equal(summary.route.providerId, 'relay');
     assert.equal(summary.route.model, 'deepseek-chat');
-    assert.equal(summary.route.monitoring.selfCheckSeconds, 300);
-    // The five-minute self-check ran inside the wait and is reported.
+    assert.equal(summary.route.monitoring.selfCheckSeconds, 600, 'the 10-minute default is frozen on the task');
+    // The ten-minute self-check ran inside the wait and is reported.
     assert.equal(observation.selfCheck.verdict, 'executor-alive-silent');
     assert.equal(summary.selfCheck.verdict, 'executor-alive-silent');
     assert.equal(observation.wait.waitMs, 25_000);
@@ -1729,6 +2142,21 @@ test('a settled task reports a frozen idle span', async () => {
     });
     const settled = await settle(h.engine, started.taskId);
     assert.equal(settled.activity.finalizedAt, settled.endedAt, 'the record is frozen at the end');
+    // The delivery clock is frozen too: once the run has ended nobody can be told anything
+    // more, so "nothing returned for N" stops growing instead of describing a wait that no
+    // action could have shortened. It is not negative, and it is not re-derived afterwards.
+    const frozen = settled.activity.progressCheck;
+    assert.equal(Number.isFinite(frozen.noDeliveryForMs), true, 'the delivery span is a real number');
+    assert.equal(frozen.noDeliveryForMs >= 0, true, 'a frozen span is never negative');
+    // A settled run also says WHERE its span was frozen at: the recorded end, not the wall
+    // clock, so the value cannot keep growing after the reader stopped watching.
+    const live = liveTask(h.engine, started.taskId);
+    assert.equal(live.monitor.deliveredAtMs !== null, true, 'the delivery span is frozen once the run ends');
+    assert.equal(Number.isFinite(live.monitor.deliveredAtMs), true, 'and it is frozen at a real instant');
+    // The frozen origin never moves again, whoever asks and whenever.
+    const originBefore = live.monitor.progressOrigin();
+    await new Promise((resolvePromise) => { setTimeout(resolvePromise, 25); });
+    assert.equal(live.monitor.progressOrigin(), originBefore, 'a frozen delivery origin never drifts');
 
     // A later read cannot grow: the same query returns the same spans.
     const first = h.engine.get(started.taskId).activity;
@@ -1756,13 +2184,14 @@ test('a settled task reports a frozen idle span', async () => {
  * @param {string} [prompt] - task prompt.
  * @returns {Promise<object>} the live task record.
  */
-async function startedTask(h, prompt = 'go') {
+async function startedTask(h, prompt = 'go', overrides = undefined) {
   const { connectionId, grant } = h.authorize();
   const started = await h.engine.start({
     connectionId,
     grantId: grant.grantId,
     workspacePath: h.workspace,
     prompt,
+    ...(overrides === undefined ? {} : { overrides }),
   });
   return h.engine.tasks.get(started.taskId);
 }
@@ -1770,10 +2199,12 @@ async function startedTask(h, prompt = 'go') {
 /**
  * Start a task whose executor never settles, so it stays live for the assertions.
  * @param {object} h - harness built over {@link busySessionController}.
+ * @param {object} [overrides] - bounded per-job overrides (for example an explicit
+ *   `timeoutSeconds`, the one retained way to give a run a total budget).
  * @returns {Promise<object>} the live task record.
  */
-async function startedLongTask(h) {
-  const task = await startedTask(h, 'long job');
+async function startedLongTask(h, overrides = undefined) {
+  const task = await startedTask(h, 'long job', overrides);
   await waitForExecute(h.engine, task.taskId);
   return task;
 }
@@ -1912,18 +2343,20 @@ test('a run that produced no output ends failed with the failed phase', async ()
 });
 
 test('a timed-out run ends failed with the failed phase instead of a pre-creation one', async () => {
-  // The execution budget is a real `setTimeout` inside the runner and its smallest legal
-  // value is 30 s. Mocking the timer was tried and is NOT reliable here: the deadline is
-  // armed only after the native placement resolves, so a tick that lands before that
-  // point expires nothing and the run hangs. This test therefore spends the real 30 s,
-  // which is the honest way to exercise the production path without adding a test-only
-  // seam to the runner. It is the only slow test in the suite.
-  const h = await harness({
-    sessionController: busySessionController(),
-    settings: validSettings({ worker: { ...validSettings().worker, timeoutSeconds: 30 } }),
-  });
+  // The execution budget is a real `setTimeout` inside the runner. It is no longer taken
+  // from the settings document (`worker.timeoutSeconds` is retired and bounds nothing),
+  // so this run asks for the budget the ONE retained way: an explicit per-job override.
+  // Mocking the timer was tried and is NOT reliable here: the deadline is armed only
+  // after the native placement resolves, so a tick that lands before that point expires
+  // nothing and the run hangs. This test therefore spends the real 30 s, which is the
+  // honest way to exercise the production path without adding a test-only seam to the
+  // runner. It is the only slow test in the suite.
+  const h = await harness({ sessionController: busySessionController() });
   try {
-    const task = await startedLongTask(h);
+    const task = await startedLongTask(h, { timeoutSeconds: 30 });
+    // The task froze an explicit cap (the compatibility path) rather than a retired
+    // global default: that is what makes the deadline real here.
+    assert.equal(task.effective.worker.executionTimeoutSeconds, 30);
     // The executor was seen working, so the phase is execution, not creation.
     h.engine.onExecutionEvent(task, { type: 'turn/start', data: {} });
     assert.equal(task.phase, 'execute');
@@ -1987,7 +2420,13 @@ test('a completed run ends awaiting host review with its own phase, not execute'
 // ---------------------------------------------------------------------------
 
 test('repeated identical tool failures reach the host once as a typed failure diagnostic', async () => {
-  const h = await harness({ sessionController: busySessionController() });
+  // The no-progress reminder is switched OFF for this fixture so the failure reminder is
+  // the only `attention` reason in play: the two are now separate checkpoints, and this
+  // test is about the failure one.
+  const h = await harness({
+    sessionController: busySessionController(),
+    settings: validSettings({ monitoring: { selfCheckSeconds: 600, attentionSeconds: 0 } }),
+  });
   try {
     const task = await startedLongTask(h);
     const args = '{"command":"npm test"}';
@@ -2012,6 +2451,7 @@ test('repeated identical tool failures reach the host once as a typed failure di
 
     const observation = await h.engine.observeTask(task.taskId, { connectionId: task.connectionId, waitMs: 1 });
     assert.equal(observation.reason, OBSERVE_TASK_REASONS.attention);
+    assert.equal(observation.checkpoint, 'failure', 'the answer says WHICH reminder this is');
     assert.equal(observation.failure.kind, 'repeated-tool-failure');
     assert.equal(observation.failure.toolName, 'bash');
     assert.equal(observation.failure.failureCode, code);
@@ -2063,7 +2503,7 @@ test('the reminder is frozen per task, and threshold 0 disables it', async () =>
   const h = await harness({
     sessionController: busySessionController(),
     settings: validSettings({
-      monitoring: { selfCheckSeconds: 300, attentionSeconds: 600, repeatFailureThreshold: 0 },
+      monitoring: { selfCheckSeconds: 600, attentionSeconds: 2400, repeatFailureThreshold: 0 },
     }),
   });
   try {

@@ -355,55 +355,6 @@ test('a preset mount failure fails the run closed and delivers no prompt', async
   assert.equal(agents.created[0].disposed, false, 'a factory that never published sells no handle to dispose');
 });
 
-test('the plugin-owned review composition never becomes the registry default', async () => {
-  // The review's own preset is an ADDITION: a worker run must keep joining the
-  // configured default, and registering the review composition must not create,
-  // select or shadow a deployment preset. This is the property an operator
-  // depends on, so it is asserted rather than described.
-  const { ReviewPreset, reviewPresetDefinition } = await import('../src/review/preset.js');
-  const { nativePresetRegistry } = await import('./helpers/fakes.js');
-  const registry = nativePresetRegistry({ defaultId: 'standard' });
-  registry.mounts = [];
-  registry.mount = async (ctx, id) => {
-    // Record exactly what the runner asked for, which is how "the default" is
-    // distinguished from "a named composition".
-    registry.mounts.push({ ctx, requested: id, mounted: id ?? registry.defaultId });
-    return { id: id ?? registry.defaultId };
-  };
-  const composer = new ReviewPreset({ registry, id: 'dsh-delegate-review-life', importer: async () => ({ apply() {} }) });
-
-  const owned = await composer.preparation({});
-  assert.equal(owned, 'dsh-delegate-review-life');
-  assert.equal(registry.defaultId, 'standard', 'the configured default is untouched');
-  assert.equal(registry.definitions.has('standard'), false, 'no deployment preset is created or selected');
-  assert.equal(registry.definitions.size, 1, 'exactly the plugin-owned composition exists');
-
-  // A worker run still joins the default; only the review names the owned id.
-  // Asserted on the unplaced creation path, which is where a mount happens.
-  const agents = fakeAgents({ respond: { text: 'ok' } });
-  await runAgent(depsFor(agents, registry), {
-    prompt: 'go',
-    cwd: CWD,
-    selection: SELECTION,
-    timeoutMs: 5000,
-    allowUnplaced: true,
-  });
-  const workerRun = registry.mounts.at(-1);
-  assert.equal(workerRun.requested, undefined, 'a worker run leaves the preset identity to the registry');
-  assert.equal(workerRun.mounted, 'standard', 'and therefore still joins the configured default');
-
-  const definition = reviewPresetDefinition('dsh-delegate-review-life');
-  assert.deepEqual(
-    definition.plugins.map((row) => row.name),
-    ['@deepseek-ai/dsh-tool-fs', '@deepseek-ai/dsh-tool-fs-search'],
-    'the composition adds no tool rows beyond the two read surfaces',
-  );
-
-  await composer.dispose();
-  assert.equal(registry.definitions.size, 0, 'unload removes only the plugin-owned composition');
-  assert.equal(registry.defaultId, 'standard');
-});
-
 test('the workspace cwd reaches the native session metadata', async () => {
   const agents = fakeAgents({ respond: { text: 'ok' } });
   await runAgent(depsFor(agents), {

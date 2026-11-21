@@ -29,7 +29,7 @@ function temporaryCodexHome() {
 
 /** Environment with only the given Codex home; no DSH overrides leak in. */
 function isolatedEnv(codexHome) {
-  return { CODEX_HOME: codexHome, DSH_HOME: '', DSH_DELEGATE_DISCOVERY_FILE: '' };
+  return { CODEX_HOME: codexHome, DSH_HOME: join(codexHome, '.dsh-test-home'), DSH_DELEGATE_DISCOVERY_FILE: '' };
 }
 
 /**
@@ -206,8 +206,8 @@ test('the shipped companion drives delegate_wait and never polls delegate_result
   assert.match(template, /is not\s+acceptance/iu);
   // Attention defaults to waiting, not to cancelling or failing. Matched against the
   // reflowed text, because this sentence wraps differently as the rules above change.
-  assert.match(template, /DEFAULT: keep waiting/u);
-  assert.match(shippedAgentText(), /Never cancel, never mark the task failed/u);
+  assert.match(template, /KEEP WAITING on the SAME taskId/u);
+  assert.match(template, /unless you\s+find a concrete error or a real drift from the goal/u);
   // Result evidence is read ONCE, not repeatedly.
   assert.match(template, /`delegate_result` ONCE/u);
 });
@@ -278,8 +278,10 @@ test('the shipped companion states the normal wait contract: omit waitSeconds, s
   assert.match(template, /cannot\s+wait longer than that/u);
   // A short explicit wait stays legal, but only for a requested one-off diagnostic.
   assert.match(template, /one-off diagnostic the\s+operator explicitly asked for/u);
-  // `attention` is the inactivity threshold, NOT any ordinary wait ending.
-  assert.match(template, /It does NOT mean an ordinary wait\s+ended/u);
+  // `attention` is the NO-PROGRESS interval — not an ordinary wait ending, and not a
+  // function of how long the task has been running.
+  assert.match(template, /It is NOT reported because the task\s+has been running a long time/u);
+  assert.match(template, /A task that keeps working\s+for hours never produces\s+this/u);
   assert.doesNotMatch(template, /OR the wait ended because the run\s+is still going/u);
   // `wait-limit` is non-actionable; a client-side timeout proves nothing about the run.
   assert.match(template, /`actionable: false` and `terminal: false`/u);
@@ -318,15 +320,21 @@ test('the shipped companion prefers waitAfterDecision and forbids inheriting the
   assert.match(shipped, /the request you just decided is never re-asked/u);
 });
 
-test('the shipped companion names the four different expiry kinds, and never promises a wake-up', () => {
+test('the shipped companion names the five different expiry and reminder kinds, and never promises a wake-up', () => {
   const shipped = shippedAgentText();
-  assert.match(shipped, /FOUR DIFFERENT THINGS, never conflated/u);
-  // (a) this call's own deadline; (b) the client's outer limit; (c) real inactivity;
-  // (d) the task's total execution budget.
+  assert.match(shipped, /FIVE DIFFERENT THINGS, never conflated/u);
+  // (a) this call's own deadline; (b) the client's outer limit; (c) the ONE no-progress
+  // interval; (d) the repeated-failure reminder; (e) an EXPLICIT per-job cap.
   assert.match(shipped, /`wait-limit` — THIS call's own wait budget ran out/u);
   assert.match(shipped, /An OUTER limit — your client handed the call back/u);
-  assert.match(shipped, /`attention` — genuine inactivity/u);
-  assert.match(shipped, /The task's TOTAL execution timeout/u);
+  assert.match(shipped, /`attention` — the run produced NO REAL PROGRESS/u);
+  assert.match(shipped, /repeated-tool-failure reminder/u);
+  assert.match(shipped, /There is NO default total execution timeout/u);
+  // There is exactly ONE notification interval: no third scheduled cadence.
+  assert.doesNotMatch(shipped, /SCHEDULED progress check/u);
+  assert.doesNotMatch(shipped, /`checkpoint: "stall"`/u);
+  // The default answer to the reminder is to keep waiting on the same task.
+  assert.match(shipped, /KEEP WAITING on the SAME taskId unless you\s+find a concrete error/u);
   // An ordinary single failing test belongs to the worker, not to the host.
   assert.match(shipped, /An ordinary\s+single failing test inside the worker is the WORKER's job/u);
   // Honest boundary: no invented background wake-up, and no zero-wake claim.

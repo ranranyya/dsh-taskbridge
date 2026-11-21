@@ -27,11 +27,12 @@
 // `plugins.bundle.config` page must keep working on a host without a sidebar — so
 // nothing in this module is a prerequisite for the settings page.
 //
-// Two public sibling plugins (GT-610/dsh-workspace-organize and
-// Larrtroffen/dsh-workspace-folders) occupy or replace the single
-// `sidebar.workspaces` slot. This module therefore does NOT register there: it adds
-// entries beside whatever those plugins draw, instead of competing for their
-// surface. No code is borrowed from them and no package is added.
+// The shell's own workspace/session browsing region belongs to DSH: THIS module never
+// registers there, and no TaskBridge task view replaces it. The grouped workspaces
+// browser is a SEPARATE registration (`workspaces-browser.jsx`, `sidebar.workspaces`,
+// lower priority than the shipped entry) whose identity rules are stated there and in
+// `docs/workspace-grouping.md`; it keeps ordinary Workspaces, and it falls back to the
+// shipped browser whenever it cannot prove what belongs to which project.
 //
 // What the panel may and may not do
 // ---------------------------------

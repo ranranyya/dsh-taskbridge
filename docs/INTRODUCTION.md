@@ -22,7 +22,7 @@ Use TaskBridge when you want Codex to understand the project and check the resul
 - **Choose execution settings once.** Select the provider, model and reasoning effort in DSH; tasks use the effective plugin configuration.
 - **Reduce repetitive progress checks.** The program observes execution and returns when there is something to decide or review.
 - **Keep context for corrections.** Send a consolidated correction list back to the original conversation and execution workspace.
-- **Distinguish delivery from acceptance.** Execution status, optional model review and the commander's final conclusion have separate records.
+- **Distinguish delivery from acceptance.** Execution status and the commander's final conclusion have separate records.
 
 Typical tasks include feature development, bug fixes, test coverage, code cleanup and project documentation. Both the commander and executor still incur their own model usage; quiet waiting reduces repetitive queries and transfers of intermediate results.
 
@@ -37,10 +37,10 @@ Typical tasks include feature development, bug fixes, test coverage, code cleanu
 | **Quiet waiting** | Let the program wait and return for approvals, questions, exceptions and delivery. |
 | **Per-operation permissions** | Decide a specific request, then continue waiting for the same task. |
 | **Task workspaces and continuation** | Name workspaces after the work; start independent tasks separately and explicitly continue corrections. |
+| **Agent collaboration default** | Decide the new-task agent-teams default, overridable per dispatch; off by default. |
 | **Review after delivery** | Inspect changes and evidence together, then record acceptance or request changes. |
-| **Optional additional model review** | Configure a separate model and effort for a read-only second opinion. |
 | **Automatic settings saving** | Save selections promptly and text edits after a short pause, with visible save status. |
-| **Presets and project overrides** | Reuse worker/reviewer combinations and give projects their own settings. |
+| **Presets and project overrides** | Reuse worker settings and give projects their own settings. |
 | **Task history and details** | Inspect phases, actual routing, activity, permission decisions, changes and complete review notes. |
 
 ## Get started
@@ -56,12 +56,12 @@ dsh-taskbridge
 To install this specific release:
 
 ```text
-dsh-taskbridge@1.6.0
+dsh-taskbridge@1.7.0
 ```
 
 Enable **DSH TaskBridge** and open its settings. Use the official npm registry if a regional mirror has not synchronized yet. GitHub Releases also provide `.tgz` packages.
 
-**dsh-crew is not required.** DSH supplies the execution environment. The local MCP entry requires Node.js 24 or newer; the Codex installer checks for an available runtime.
+TaskBridge runs tasks through DSH. The local MCP connection to Codex requires Node.js 24 or newer. The Codex integration installer checks for an available runtime.
 
 ### 2. Select an API, model and effort
 
@@ -99,14 +99,14 @@ The commander checks the connection and workspace before submission. Follow exec
 | **Dispatch** | Submit a clear goal, project path and task title. | Start the task with the effective configuration and create its record and conversation. |
 | **Execute** | Wait. | Modify files, run tools and tests, record activity and keep waiting internally. |
 | **Request or question** | Decide specific permissions and answer questions needed for execution. | Pause the relevant operation, provide evidence and resume the same task after a decision. |
-| **Deliver** | Review actual changes, verification and unresolved issues together. | Return results and evidence, including optional additional model review. |
+| **Deliver** | Review actual changes, verification and unresolved issues together. | Return results and evidence. |
 | **Accept or correct** | Record a review conclusion or prepare one correction list. | Save the conclusion or continue the original conversation and execution workspace. |
 
 Execution completion means the executor has returned its work. Acceptance means the commander has reviewed it. Task history distinguishes the two.
 
 ## Settings
 
-The page has **API management, Execution settings, Additional review, Task history and Codex integration** tabs, with the local delegation switch above them.
+The page has **API management, Execution settings, Task history and Codex integration** tabs, with the local delegation switch above them.
 
 ### API, model and execution options
 
@@ -118,7 +118,8 @@ The page has **API management, Execution settings, Additional review, Task histo
 | **Timeout** | Total time budget for a task, 1800 seconds by default; inactivity checks do not extend it. |
 | **Maximum concurrency** | Limit simultaneous tasks, 1 by default; the commander decides whether to split work. |
 | **Workspace isolation** | Use an independent Git worktree or the authorized shared project directory. |
-| **Presets** | Save commonly used worker/reviewer combinations. |
+| **Agent collaboration for new tasks** | Decide whether a new dispatch with no per-task choice uses DSH's native agent teams; off by default, a per-task choice wins, continuations keep the chain's choice. |
+| **Presets** | Save commonly used worker settings. |
 | **Project overrides** | Apply project-specific settings instead of the global selection. |
 
 **You choose the executor.** Managed commander rules preserve the configured provider, model and reasoning effort. An unavailable combination is reported instead of silently switching to another model.
@@ -141,12 +142,6 @@ Worktree mode requires a usable Git repository and committed baseline. Preflight
 The switch starts disabled. Installing the plugin or merely mentioning DSH does not start a task. Even with the switch enabled, the commander needs an explicit assignment.
 
 Disabling the switch rejects new tasks and requests that running tasks stop. Local use does not require manually issuing signed connections.
-
-### Optional additional model review
-
-Enable additional model review and select its API connection, model and effort independently.
-
-The reviewer reads delivered changes and evidence and provides another assessment. This is **read-only** and adds reviewer model usage and cost. It cannot edit files or replace final commander acceptance. With this option off, the commander still reviews the result.
 
 ## Quiet waiting
 
@@ -183,7 +178,31 @@ After a DSH restart, the plugin checks the original task and workspace identitie
 
 ### Use DSH teams when appropriate
 
-The commander can decide per task whether to enable DSH's native agent teams. A small fix can use a single executor; larger work may benefit from a team. This decision does not change your configured API, model or effort. Additional permissions needed by team members currently have to be handled through the main executor.
+**You set the default; the dispatcher may decide one task.** Execution settings have a
+**"Enable agent collaboration for new tasks"** switch, and upgrades and fresh installs
+both start it **off**:
+
+- Upgrading or installing never turns it on by itself.
+- It decides only what a **new dispatch** does when it states no per-task choice. When the
+  dispatcher states `true` or `false` for one dispatch, **that choice wins**.
+- **Continuations** with no new choice keep the collaboration choice the task they
+  continue **recorded**. If that task recorded none (an older record), the plugin applies
+  nothing and writes nothing: the Session keeps the mode it already has.
+- It affects **later submissions only**; a task that already started keeps its own
+  frozen snapshot.
+- It is **not DSH's global switch**: the plugin writes only that one task's own Session
+  and never changes DSH's global default or a conversation you adjusted yourself.
+
+On a DSH without agent-teams support, an **explicit** `true` or `false` is refused
+**before the prompt** and the task detail states why; it never quietly runs in the previous
+mode. The one exception is the implicit off default: such an ordinary dispatch still runs,
+but reports **not applied** (not "turned off"), which keeps older dispatches working. This
+decision does not change your configured API, model or effort, and team members' additional
+permissions currently have to be handled through the main executor. Cancellation works the
+same either way.
+
+One outer task always holds **one conversation and one concurrency slot**: enabling
+collaboration adds neither, and there is no reason to dispatch extra tasks for it.
 
 ## Task history: progress and acceptance
 
@@ -191,10 +210,13 @@ Open **Task history → Details** to inspect:
 
 - **Execution:** phase, recent activity, current tool and inactivity diagnosis.
 - **Effective settings:** actual provider, model, effort and isolation.
+- **Agent collaboration:** the choice frozen on this task, where it came from (per-task
+  request / inherited continuation / TaskBridge default), and what DSH confirmed or why it
+  could not be applied.
 - **Task relationships:** execution workspace, conversation and continuation links.
 - **Decisions:** permission requests and their per-operation allow/deny records.
 - **Delivery evidence:** changed files, diffs, verification and results.
-- **Review:** additional model feedback, commander acceptance and complete review notes.
+- **Review:** commander acceptance and complete review notes.
 
 | Status | Meaning |
 | --- | --- |
@@ -223,7 +245,7 @@ Requests return to the commander using TaskBridge. It assesses the specific oper
 
 ### Does quiet waiting guarantee zero Codex token use?
 
-No. Planning, approvals, answers, exception handling and review still use model calls. Savings depend on the task, client waiting behavior and context size. See the [historical waiting-stage comparison](releases/1.5.0-token-benchmark.zh.md) for measurements and their limits.
+No. Planning, approvals, answers, exception handling and review still use model calls. Savings depend on the task, client waiting behavior and context size. See the [historical waiting-stage comparison](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.0-token-benchmark.zh.md) for measurements and their limits.
 
 ### Why does a finished task still say “awaiting host review”?
 
@@ -237,7 +259,7 @@ For Codex, use the install/update button and reload the client. Use the MCP-only
 
 ### Does TaskBridge install every dependency and client integration?
 
-It does not require dsh-crew. Project dependencies still follow the task environment; initial Codex setup uses the plugin button. Claude Code and Claude Desktop integration is planned for 2.0. Keep DSH running with the plugin enabled.
+Enable TaskBridge in DSH and keep DSH running during delegated tasks. Set up the dependencies each project needs. To connect Codex for the first time, open **Codex integration** in the plugin and click **Install / update TaskBridge agent**. Claude Code and Claude Desktop integration is planned for 2.0.
 
 ## Client support and the 2.0 plan
 
@@ -260,11 +282,11 @@ The goal for 2.0 is to let more commanders use the execution models configured i
 | [Conversation placement](conversation-placement.md) | Workspace naming, conversation creation and explicit continuation. |
 | [Plugin discovery and updates](plugin-market.md) | Custom indexes, npm and GitHub installation sources. |
 | [Migration](taskbridge-upgrade.md) | Upgrading from DSH Delegate / TaskDispatch. |
-| [1.5.4 release notes](releases/1.5.4.zh.md) | Persisted task records, explicit goals and summaries, and placement checks. |
-| [1.5.3 release notes](releases/1.5.3.zh.md) | Review summaries, full-note layout, mixed line endings, and commander planning rules. |
-| [1.5.2 release notes](releases/1.5.2.zh.md) | The introduction update and its validation scope. |
+| [1.5.4 release notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.4.zh.md) | Persisted task records, explicit goals and summaries, and placement checks. |
+| [1.5.3 release notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.3.zh.md) | Review summaries, full-note layout, mixed line endings, and commander planning rules. |
+| [1.5.2 release notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.2.zh.md) | The introduction update and its validation scope. |
 
-TaskBridge uses runtime capability checks rather than a DSH version whitelist; see [runtime notes](runtime-compatibility.md). A separate CLI execution channel and validation of every runtime environment are not complete. Existing limits are documented in the [1.5.1 notes](releases/1.5.1.zh.md).
+TaskBridge uses runtime capability checks rather than a DSH version whitelist; see [runtime notes](runtime-compatibility.md). A separate CLI execution channel and validation of every runtime environment are not complete. Existing limits are documented in the [1.5.1 notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.1.zh.md).
 
 Report issues and suggestions on [GitHub Issues](https://github.com/ranranyya/dsh-taskbridge/issues). Include the plugin version, reproduction steps and relevant redacted errors; leave out API keys.
 

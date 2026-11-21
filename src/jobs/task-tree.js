@@ -157,6 +157,7 @@ export function groupContinuationChains(tasks = []) {
       }
     }
 
+    // Keep the original task name when a continuation uses a different round title.
     const recordedTitle = firstNonEmptyTitle(rounds);
     const titleMissing = recordedTitle === null;
     const displayTitle = titleMissing
@@ -711,8 +712,8 @@ function trailingSegments(pathValue, count) {
 }
 
 function firstNonEmptyTitle(rounds) {
-  for (let i = rounds.length - 1; i >= 0; i -= 1) {
-    const t = rounds[i]?.title;
+  for (const round of rounds) {
+    const t = round.title;
     if (typeof t === 'string' && t.trim() !== '') return t.trim();
   }
   return null;
@@ -729,7 +730,8 @@ function firstNonEmptyDescription(rounds, field) {
 function maxTimestampOfRounds(rounds) {
   let max = 0;
   for (const r of rounds) {
-    for (const candidate of [r.endedAt, r.startedAt, r.createdAt, r.hostAcceptance?.acceptedAt, r.hostAcceptance?.decidedAt]) {
+    for (const candidate of [r.activity?.lastActivityAt, r.endedAt, r.startedAt, r.createdAt,
+      r.hostAcceptance?.acceptedAt, r.hostAcceptance?.decidedAt]) {
       const num = finiteNumber(candidate);
       if (num !== null && num > max) max = num;
     }

@@ -284,6 +284,11 @@ export function createCodexSeam(options = {}) {
      * Migrate a byte-exact, known prior agent template during plugin startup, and
      * upgrade an already-installed managed MCP entry that is merely stale.
      *
+     * "Known" now has two exact sources: the enumerated published history
+     * (`KNOWN_AGENT_TEMPLATES`) and the digest of the template THIS plugin recorded writing
+     * into this same home — see `src/codex/agent-ownership.js`. Neither is a name, a marker
+     * or a version line: an edited character still makes the file the operator's.
+     *
      * This never creates the agent file, never CREATES the MCP entry, never adopts a
      * same-name entry it cannot prove it wrote, and never edits another Codex setting.
      * @param {object} [callOptions] - `startupTarget`: the target `startupTarget()`

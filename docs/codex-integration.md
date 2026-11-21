@@ -1,10 +1,18 @@
 # Codex integration contract
 
-Status: implemented in 1.6.0 (planning nodes, multi-level parent-child hierarchy, persisted task descriptions, commander planning, placement checks, and managed template upgrades). This automatic installer covers Codex, the currently supported client. Claude Code and Claude Desktop integration is planned for 2.0; see the separate roadmap.
+Status: implemented in 1.7.0 (planning nodes, multi-level parent-child hierarchy, persisted task descriptions, commander planning, placement checks, and managed template upgrades). This automatic installer covers Codex, the currently supported client. Claude Code and Claude Desktop integration is planned for 2.0; see the separate roadmap.
 
-1.5.1 refreshes the manifest on each activation, resolves a normal linked home root, and upgrades exact shipped/candidate templates while preserving custom content. See [1.5.1 notes](releases/1.5.1.zh.md).
+The 1.7.0 release also makes future managed upgrades self-recognising: the two exact
+companions this machine really held (`1.6.1` in both terminator spellings and the local
+`1.6.1-test.5` prerelease) are now enumerated, and an explicit install or the startup refresh
+records the LF-normalized digest of the template it wrote, in one small file per real Codex
+home. A LATER release therefore recognises the template the previous one wrote without
+appending another digest by hand, while an edited file — one changed character, or only the
+`version` line — still stays the operator's and is never rewritten. See section 5.
 
-1.5.0 adds `delegate_question_answer`, combined decision/answer-and-wait flows and program metrics. Managed upgrades recognize the exact published 1.4.2 and verified local test.1/test.2 companions; customized files remain operator-owned. See the [1.5.0 release notes](releases/1.5.0.zh.md).
+1.5.1 refreshes the manifest on each activation, resolves a normal linked home root, and upgrades exact shipped/candidate templates while preserving custom content. See [1.5.1 notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.1.zh.md).
+
+1.5.0 adds `delegate_question_answer`, combined decision/answer-and-wait flows and program metrics. Managed upgrades recognize the exact published 1.4.2 and verified local test.1/test.2 companions; customized files remain operator-owned. See the [1.5.0 release notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.0.zh.md).
 
 1.4.2 also recognizes the exact published 1.4.1 companion for managed upgrades.
 The review behavior introduced in 1.4.1 recognizes the exact unmodified
@@ -17,7 +25,7 @@ omit review prose. A result that reports `noteOmitted: true` can be read with
 `delegate_result` plus `reviewNoteOffset` and optional `reviewNoteLimit` (1–2000
 Unicode code points per page, default 2000); follow `nextOffset` until `complete`.
 Review notes accept up to 8000 code points after trimming and are stored redacted.
-See the [release notes](releases/1.4.1.zh.md) for validation boundaries.
+See the [release notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.4.1.zh.md) for validation boundaries.
 
 This document is the contract between the plugin's settings page (browser half),
 the host-side installer (`src/codex/installer.js`) and the two files it manages.
@@ -210,7 +218,7 @@ the agent file is an independent target and is still installed.
 | `not-configured` | no `mcp_servers.dsh-delegate` at all | writes the block |
 | `configured` | the marker is present **and** the values are exactly the owned shape | no change |
 | `outdated` | marked owned command, but stale `args`/discovery/`tool_timeout_sec`; or the narrowly recognised 0.1.6 Desktop command with the current package `args` and owned env shape | rewrites only those values in place |
-| `conflict` | anything else (`unmanaged-entry`, `command-not-ours`, `legacy-command-shape`, `url`, `unknown-field`, `extra-env`, `args-not-an-array`, `command-not-a-string`, `not-a-table`, `array-table`, and the boundary reasons below) | **refuses** with `MCP_ENTRY_CONFLICT` and a note explaining why |
+| `conflict` | anything else (`unmanaged-entry`, `unmanaged-entry-exact`, `command-not-ours`, `legacy-command-shape`, `url`, `unknown-field`, `extra-env`, `args-not-an-array`, `command-not-a-string`, `not-a-table`, `array-table`, and the boundary reasons below) | **refuses** with `MCP_ENTRY_CONFLICT` and a note explaining why; `repair` adds the marker for `unmanaged-entry-exact` only |
 
 Every classification also reports **`drift`**: the list of owned facts that are stale
 (`tool_timeout_sec`, `args`, `command`, `env`), or `null` when nothing is. The status
@@ -240,6 +248,28 @@ Two rules are deliberate:
   the comment line directly above the definition (or above the `[mcp_servers]`
   header when the definition is the inline `dsh-delegate = { … }` spelling); a
   marker elsewhere in the file does not count.
+* **`unmanaged-entry-exact`.** The same unmarked definition, but it already IS this
+  build's entry in every owned fact: `command` is the resolved Node executable, `args` is
+  exactly this installation's entry script, `tool_timeout_sec` is the owned integer, and
+  the `env` map is exactly the owned one (no additional key, none missing) — and the
+  definition is ONE unambiguous standard `[mcp_servers.dsh-delegate]` table with unique
+  keys. This is the configuration the settings page shows, entered by hand without the marker
+  comment. It stays a `conflict` for `status`, plugin startup and `remove`, but the reason
+  names it so that “仅修复 MCP 配置” (`repair`) may make ONE edit: insert the marker line
+  directly above the server's OWN header and change no other byte.
+  The write re-reads `config.toml`, requires the plan's digest, the boundary verdict, the
+  whole owned shape and this installation's exact script to still hold, and splices the
+  marker into the original text at the header line's character offset — so a BOM, mixed
+  CRLF/LF endings, an indented header, an operator comment above it and a missing final
+  newline all survive, and deleting the new line restores the file byte for byte. It then
+  verifies the marker is adjacent to the server's own header (never to a shared
+  `[mcp_servers]` parent, which would claim sibling entries), that the result classifies as
+  `configured`, and that the change is exactly that one line.
+  Refused, with the plain `unmanaged-entry` reason and a byte-identical file: any owned value
+  that differs; a duplicated key (the parser keeps every entry, so a merge would let the last
+  value win); an inline table beside or instead of the header; an extra or empty sub-table
+  such as `[mcp_servers.dsh-delegate.custom]`; a nested inline table value; an array table.
+  `install` never adds the marker.
 * **`command-not-ours`.** A different command is a different program, so even
   identical arguments do not make the entry ours. `extra-env` is symmetrical — an
   `env` key the plugin did not write is the operator's data, and an entry carrying
@@ -465,7 +495,7 @@ Reachable only through the authenticated user plane (section 4) or the CLI
 | --- | --- | --- |
 | `status` | nothing | anything |
 | `install` | agent file (absent / older managed build) + MCP entry (absent / `outdated`) | a user's agent file, a conflicting MCP entry, the DSH switch |
-| `repair` | the MCP entry only (absent / `outdated`), exactly as `install` would | the agent file: it is **not created, not refreshed and not deleted**, nor is `agents/` created |
+| `repair` | the MCP entry only (absent / `outdated`), exactly as `install` would; plus the marker line for an `unmanaged-entry-exact` definition | the agent file: it is **not created, not refreshed and not deleted**, nor is `agents/` created; no owned value of an unmarked entry is ever rewritten |
 | `remove` | deletes only owned targets | a user's agent file, a conflicting entry |
 
 `install` is idempotent: a second run with nothing changed reports
@@ -532,7 +562,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.6.0",
+  "packageVersion": "1.7.0",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,
@@ -635,7 +665,8 @@ session's MCP tools, and a second definition would start a second server.
   digests (published builds only: `0.1.6`, both `0.1.7` builds, `0.1.8`, `0.1.9`,
   `0.1.10` in both its CRLF and LF byte forms, `0.1.11`, `0.1.12`, `0.1.13`, `0.1.14`,
   `1.0.0` and `1.1.0` in both byte forms, plus any later build listed when it is packed
-  and verified);
+  and verified) **or** byte-identical to a template this plugin recorded writing into THIS
+  Codex home (section 5.0);
 * `modified`/`conflict` — everything else.
 
 Every release from `0.1.10` through `0.1.13` changes only the version line in the
@@ -707,6 +738,22 @@ A digest is added only for a build that was actually packed and verified, and th
 current template's digest is never in the list under an older label; the tests assert
 both facts (`tests/codex-integration.test.js`, `tests/package.test.js`).
 
+The 1.7.0 package recognizes these two earlier companion versions, each in both
+terminator spellings, and all four are exact identities like every entry above:
+
+| Release | Digest enumerated in `KNOWN_AGENT_TEMPLATES` |
+| --- | --- |
+| `1.6.1` | `efdef5f6e6ebcb26590ca929e674391b3c4fcdb3c017714d2322615783fdf712` (all LF) |
+| `1.6.1` | `5da9fd5eb5a89fd3c76365faca78b51e34233d993605f1b55dff4b07ceb88b80` (same template, CRLF) |
+| `1.6.1-test.5` | `bf698c861e7e560c555f8350b711db88627dce4a8752b2cbebe8748b6d640d37` (the packed agent, LF) |
+| `1.6.1-test.5` | `a45e12d0b234e80854e69429518a2def2d00338f968c2ecfc689307b792e4426` (same file, CRLF) |
+
+Both carry the SAME instruction body — the one `codex/dsh-taskbridge.toml` still holds —
+and differ only in the stamped `version` line, which is exactly why each needs its own
+exact identity: without them an untouched `1.6.1` or `1.6.1-test.5` installation hashes to
+"unknown content" and is reported `modified`, i.e. "somebody else's file", which is the
+false conflict this package removes.
+
 At plugin startup, an `outdated` agent is refreshed automatically only when its
 bytes still match a known shipped build. This does not create a missing agent or
 edit `config.toml`. A file with any other content is preserved, even when its
@@ -716,6 +763,37 @@ Since 1.2.0 the startup check has a second half: an **already installed** manage
 `mcp_servers.dsh-delegate` entry that is merely `outdated` is upgraded in place (see
 section 2.4). It is still not an install: no entry is created, and no entry the plugin
 cannot prove it wrote is adopted or rewritten.
+
+The version line is *never* the proof. A file that still starts with the managed
+header, still contains the dispatch rules, but has an old or invented version line
+and one edited body byte is the operator's: the digest no longer matches, so it is
+`modified`, it is never refreshed, and it is never removed. Conversely a
+byte-exact published build is refreshed and removable, as documented.
+
+### 5.0 The recorded template digest (future releases)
+
+Enumerating every future release by hand does not scale, so one small record exists beside the
+table: after an **explicit `install`** or the startup **`refreshKnownAgentTemplate`** has written
+the agent file, and only when the file it re-reads is exactly the template this build renders,
+the plugin stores the digest of those bytes.
+
+* Path: `<DSH_HOME>/data/dsh-delegate/codex-agent-ownership/<sha256 of the real home>.json` — one
+  file per pinned Codex home, named by a digest of that home so no case equivalence is ever
+  inferred and two homes can never collide.
+* Content: `{ "schemaVersion": 1, "codexHome": "<real home>", "templateLfSha256": "<64 hex>" }`.
+  The digest is **LF-normalized** (the CRLF/LF spelling is not content, exactly as the table
+  treats it), and it is the only digest. No template body, no `config.toml`, no model
+  setting, no version, no timestamp, no credential.
+* A file whose digest equals that value is `outdated`. One changed character — an added line, a
+  tab, or a rewritten `version` line — hashes differently and stays `modified`.
+* The record is read only: `status`, `repair` and `remove` never write it. A record reached
+  through a link or reparse point, missing, unreadable, malformed, over 4 KB, or naming a
+  different home is **no record** — the file is then classified by its content alone. A read
+  never creates the record directory; a write proves each level first and is atomic, owner-only,
+  and read back. An unchanged record is not rewritten. A `DSH_HOME` override must be absolute;
+  without one the `~/.dsh` default applies.
+* A failure to record costs the next release one enumeration. It never fails an install and
+  never changes how a file is classified.
 
 The version line is *never* the proof. A file that still starts with the managed
 header, still contains the dispatch rules, but has an old or invented version line
@@ -743,8 +821,8 @@ one fails the build:
 5. **Switch first, facts second.** Call `delegate_status` first; then call
    `delegate_preflight` with the exact authorized workspace path. If either fails,
    the tool is missing, the switch is off, or the answer is ambiguous, stop and
-   report the bounded refusal. Never open the switch; never fall back to DSH Crew,
-   another endpoint, another provider or local execution.
+   report the bounded refusal. Leave the switch as set and use only the authorized
+   TaskBridge execution path.
 6. **The isolation is decided from the measured facts, and never downgraded.**
    `delegate_preflight` returns `isolation` (`worktree` / `shared` / `block`) and a
    stable `reason` code:
@@ -961,6 +1039,8 @@ session (or a restart) is required to load the new file and the new MCP entry.
 | `config.toml` contains a NUL / control character | `CODEX_CONFIG_UNSUPPORTED`, untouched |
 | `config.toml` uses CRLF | edited in place; CRLF and every unrelated byte preserved |
 | an unmarked same-name `mcp_servers.dsh-delegate` entry | `conflict` (`unmanaged-entry`); byte-identical after install/repair/remove |
+| an unmarked entry that is EXACTLY the owned entry (same command, single script argument, timeout and env) in one unambiguous standard table | `conflict` (`unmanaged-entry-exact`); byte-identical after install/remove, and `repair` adds the one marker line |
+| an unmarked entry with a duplicated key, an inline table beside the header, or an extra/empty sub-table | `conflict` (`unmanaged-entry`); byte-identical after install/repair/remove |
 | entry added between the read and the write | re-classified; refused if it stopped being ours |
 | package `bin/dsh-delegate-mcp.js` missing | MCP refused (`MCP_SCRIPT_MISSING`), agent still installed |
 | plain Node.js host (`process.execPath` is a Node binary) | `command` is that path; no override is consulted |
