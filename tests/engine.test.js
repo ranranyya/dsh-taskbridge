@@ -280,13 +280,14 @@ test('a job refuses to start with no authorization at all', async () => {
 
 test('an authorized task runs and ends awaiting host review, never approved', async () => {
   const h = await harness();
+  const packet = 'Use the existing formatter in src/a.js. Add the fallback first, then run its unit test.';
   try {
     const { connectionId, grant } = h.authorize();
     const started = await h.engine.start({
       connectionId,
       grantId: grant.grantId,
       workspacePath: h.workspace,
-      prompt: 'implement the change',
+      prompt: packet,
     });
 
     const settled = await settle(h.engine, started.taskId);
@@ -306,6 +307,9 @@ test('an authorized task runs and ends awaiting host review, never approved', as
     assert.equal(h.workspaces.workspaces.get(conversation.workspaceId)?.path, h.workspace,
       'the Workspace is keyed by the actual execution directory');
     assert.equal(h.agents.created.length, 0, 'a placed run must not create a second agent');
+    const [message] = h.drivenAgent(settled).followups;
+    assert.ok(message.content.some((entry) => entry.type === 'text' && entry.text.includes(packet)),
+      'the worker receives the implementation steps, not just a summary of the goal');
     // Evidence was measured, not reported.
     assert.equal(settled.diff.fileCount, 1);
     assert.equal(settled.diff.files[0].path, 'src/a.js');

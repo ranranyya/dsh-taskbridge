@@ -56,7 +56,7 @@ dsh-taskbridge
 To install this specific release:
 
 ```text
-dsh-taskbridge@1.7.0
+dsh-taskbridge
 ```
 
 Enable **DSH TaskBridge** and open its settings. Use the official npm registry if a regional mirror has not synchronized yet. GitHub Releases also provide `.tgz` packages.

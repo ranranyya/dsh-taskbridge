@@ -99,7 +99,7 @@ for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} m
     assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
   }
 });
-const DELIVERABLE_VERSION = '1.7.0';
+const DELIVERABLE_VERSION = '1.7.1';
 
 // The 1.5.0 allow-list entries are the OLD published identity of the template. This
 // working tree's template text has grown (team, same-chain preflight, review evidence
@@ -154,7 +154,7 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
     assert.deepEqual(refreshed.changed, ['agent']);
     assert.deepEqual(refreshed.refused, []);
     assert.equal(refreshed.status.agent.state, 'installed');
-    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.6\.1"$/mu);
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.7\.1"$/mu);
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
   } finally {
     fixture.cleanup();
@@ -4256,7 +4256,7 @@ test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () =
   assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0'
     && entry.sha256 === '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b'), true);
   // The public version matches this formal release; historical identity registration is separate.
-  assert.equal(DELIVERABLE_VERSION, '1.7.0');
+  assert.equal(DELIVERABLE_VERSION, '1.7.1');
 });
 
 test('an untouched 1.5.1-test.1 install (LF and CRLF) upgrades to this candidate, idempotently', async () => {
@@ -4911,6 +4911,26 @@ test('an untouched 1.6.1-test.6 agent with NO installation record is restored to
         `${label}: exactly this candidate's rendered text`);
       const again = await runCodexAction('install', options);
       assert.deepEqual(again.changed, [], `${label}: idempotent`);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+test('the published 1.7.0 agent without an ownership record receives the new planning rules', async () => {
+  const published = readFileSync(join(ROOT, 'tests', 'fixtures', 'agent-1.7.0.toml'), 'utf8').replace(/\r\n/gu, '\n');
+  for (const text of [published, published.replace(/\n/gu, '\r\n')]) {
+    const fixture = codexHomeFixture();
+    try {
+      mkdirSync(dirname(fixture.agentPath), { recursive: true });
+      writeFileSync(fixture.agentPath, text);
+      const options = { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION };
+      const result = await refreshKnownAgentTemplate(options);
+      assert.deepEqual(result.refused, []);
+      assert.deepEqual(result.changed, ['agent']);
+      const updated = readFileSync(fixture.agentPath, 'utf8');
+      assert.equal(updated, expectedInstalledText(readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8'), DELIVERABLE_VERSION));
+      assert.notEqual(updated, published);
     } finally {
       fixture.cleanup();
     }

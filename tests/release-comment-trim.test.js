@@ -186,11 +186,11 @@ test('the trimmed modules keep the shared description rule and its call sites', 
   }
 });
 
-test('the 1.7.0 release keeps its budget stricter than the hard packed bound', () => {
+test('the release keeps its budget stricter than the hard packed bound', () => {
   const packet = read('tests/package.test.js');
   assert.match(packet, /assert\.ok\(total < 3_120_000/u, 'the hard bound is bounded');
   assert.match(packet, /const RELEASE_BUDGET_BYTES = 3_080_000;/u, 'the packet budget is 3,080,000');
   assert.match(packet, /total <= RELEASE_BUDGET_BYTES/u, 'the packet budget is actually asserted');
-  assert.match(packet, /const DELIVERABLE_VERSION = '1\.7\.0';/u);
-  assert.match(packet, /const PREVIOUS_VERSION = '1\.6\.0';/u);
+  assert.match(packet, /const DELIVERABLE_VERSION = '1\.7\.1';/u);
+  assert.match(packet, /const PREVIOUS_VERSION = '1\.7\.0';/u);
 });

@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.7.0 (planning nodes, multi-level parent-child hierarchy, persisted task descriptions, commander planning, placement checks, and managed template upgrades). This automatic installer covers Codex, the currently supported client. Claude Code and Claude Desktop integration is planned for 2.0; see the separate roadmap.
+Status: implemented in 1.7.1 (planning nodes, multi-level parent-child hierarchy, persisted task descriptions, commander planning, placement checks, and managed template upgrades). This automatic installer covers Codex, the currently supported client. Claude Code and Claude Desktop integration is planned for 2.0; see the separate roadmap.
 
 The 1.7.0 release also makes future managed upgrades self-recognising: the two exact
 companions this machine really held (`1.6.1` in both terminator spellings and the local
@@ -562,7 +562,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.7.0",
+  "packageVersion": "1.7.1",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,
@@ -800,6 +800,17 @@ header, still contains the dispatch rules, but has an old or invented version li
 and one edited body byte is the operator's: the digest no longer matches, so it is
 `modified`, it is never refreshed, and it is never removed. Conversely a
 byte-exact published build is refreshed and removable, as documented.
+
+### From the project plan to a DSH assignment
+
+Codex checks the relevant code and earlier deliverables before deciding the next
+step. It tells the operator which packet is ready, how it will work, and what it
+will reuse. The `delegate_submit.prompt` carries the plan DSH executes. Include the
+starting point, implementation order, scope and evidence for acceptance. For
+multi-stage work, keep dependencies and reviewed progress in the existing plan tree.
+The worker handles routine implementation choices and reports verified facts that
+would change the agreed approach. Codex reviews the evidence before advancing
+work that depends on it.
 
 ### 5.1 Required dispatch semantics
 

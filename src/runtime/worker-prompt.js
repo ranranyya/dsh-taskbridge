@@ -17,6 +17,8 @@ export function buildWorkerPrompt(input) {
   lines.push(String(input.prompt ?? '').trim());
   lines.push('');
   lines.push('## Working rules');
+  lines.push('- Follow the assigned plan. Make routine choices within the packet. '
+    + 'If a premise conflicts with the project, report what you verified and the affected step to the host before changing course.');
   lines.push('- You may modify files only inside the workspace above.');
   lines.push('- Do not commit, push, tag, or rewrite git history.');
   lines.push('- Do not read or print credentials, tokens, or .env contents.');

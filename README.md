@@ -1,5 +1,7 @@
 # DSH TaskBridge
 
+> **1.7.1** 由 Codex 在派工前确定实施路径、复用方案和验收方法，DSH 按收到的方案执行。
+
 > **1.7.0** 增加任务记录的日期筛选和整链清理、同项目多会话并发、可选智能体协作，以及分级静默监控。详见 [1.7.0 更新说明](docs/releases/1.7.0.zh.md)。
 
 **让 Codex 指挥 DSH 工作，在 DSH 插件里选择执行所用的 API、模型和思考强度。**
@@ -57,7 +59,7 @@ dsh-taskbridge
 也可以指定本次版本：
 
 ```text
-dsh-taskbridge@1.7.0
+dsh-taskbridge
 ```
 
 安装后启用 **DSH TaskBridge**，进入该插件的设置页面。若使用的区域镜像尚未同步新版本，可切换到 npm 官方源；本项目 GitHub Release 也提供 `.tgz` 安装包。
@@ -309,13 +311,13 @@ profile 是**应用保留的**：npm / `dsh plugin` CLI 对该 profile 的操作
 Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式 profile 里执行 npm/pnpm
 命令，也不要直接编辑其中的文件。
 
-1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge@1.7.0`**。
+1. 打开 Desktop 的 **Plugins manager → 添加插件**，输入 **`dsh-taskbridge`**。
    若中国大陆镜像尚未同步，先选择 npm 官方源再重试。安装后的显示名为 **DSH TaskBridge**。
    也可以从本项目 Release 下载 `.tgz`，或在仓库根目录打包：
 
    ```bash
    npm pack
-   #    → dsh-taskbridge-1.7.0.tgz
+   #    → dsh-taskbridge-1.7.1.tgz
    ```
 
 2. 使用本地包时，通过 **添加插件**入口选择下载或生成的 `.tgz`（或本仓库目录）完成安装。
@@ -329,7 +331,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-taskbridge-1.7.0.tgz && dsh plugin --profile web why dsh-taskbridge
+dsh plugin --profile web add ./dsh-taskbridge-1.7.1.tgz && dsh plugin --profile web why dsh-taskbridge
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -342,7 +344,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.7.0.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.7.1.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -773,7 +775,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-taskbridge-1.7.0.tgz
+dsh plugin --profile web add ./dsh-taskbridge-1.7.1.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings

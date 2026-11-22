@@ -41,7 +41,7 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
  * so asserting itself would pass for any value. `1.5.0` adds question handling and combined waits.
  */
-const DELIVERABLE_VERSION = '1.7.0';
+const DELIVERABLE_VERSION = '1.7.1';
 
 /**
  * The published build this release upgrades *from*.
@@ -50,7 +50,7 @@ const DELIVERABLE_VERSION = '1.7.0';
  * current version must be strictly newer than this baseline,
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.6.0';
+const PREVIOUS_VERSION = '1.7.0';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.

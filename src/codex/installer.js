@@ -516,6 +516,9 @@ export const KNOWN_AGENT_TEMPLATES = [
   // character, an added line, or another body carrying the same version line hashes
   // differently and stays the operator's file.
   { version: '1.6.1-test.6', sha256: 'f4650d6250b4133f6693f11c8288e973b433bbfab02e76ebba0eda989594d7b8' },
+  // Published 1.7.0 companion before the implementation brief update, in LF and CRLF.
+  { version: '1.7.0', sha256: 'b40eedd04139c8c6cd0cbc89e1af008417f3210bc3afb889695a2a87c8fd1e82' },
+  { version: '1.7.0', sha256: 'ed3a2efd470e6e7f6e8495538cfa9951dec82878c717ecb84eba41fd52127dc2' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */
