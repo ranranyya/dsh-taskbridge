@@ -50,6 +50,8 @@
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 import {
+  ANTIGRAVITY_ACTIONS,
+  CODEX_ACTIONS,
   CONNECTIVITY_LAYERS,
   CONVERSATION_POLICY_LABEL,
   EFFORT_LABELS,
@@ -64,11 +66,13 @@ import {
   PERMISSION_STATE_LABELS,
   REVIEW_STATE_LABELS,
   REVIEW_VERDICT_LABELS,
+  ROUTES,
   SUPPORTED_PROTOCOLS,
   TASK_STATES,
   TREE_ORPHAN_LABELS,
   TREE_STATUS_LABELS,
   TREE_STATUS_TONES,
+  antigravityTargetView,
   boundedText,
   changedFiles,
   clone,
@@ -76,6 +80,7 @@ import {
   codexTargetView,
   createApi,
   createStore,
+  describeAntigravityOutcome,
   describeCodexOutcome,
   describeError,
   documentFromDraft,
@@ -1612,7 +1617,7 @@ function MonitoringCard({ store, snapshot }) {
         <strong>运行进度检查</strong>从<strong>最近一次真正回传给派工方的新成果</strong>算起（第一段基准是运行开始），
         不是"没有进展"，也不是运行总时长：DSH 内部的模型输出、思考步骤、工具调用与结果，心跳、空轮询、页面刷新、
         等待授权或等待问题答复、重复失败提醒、检查本身，以及本机自检的结论，<strong>都不算新成果</strong>。
-        当前等待通道只在任务结束时交付成果，所以运行一开始就长时间没有新交付的任务，会在约 40 分钟时被提醒一次。
+        当前等待通道只在任务结束时交付成果，所以运行一开始就长时间没有新交付的任务，会在到达你设定的「运行进度检查」间隔时被提醒一次。
         <strong>这些检查完全在本机进行，不会调用任何大模型，也不消耗 token；提醒只是提示，绝不取消、重启或重新提交任务。</strong>
         任一间隔填 <strong>0</strong> 即关闭对应提醒，两项可以分别关闭。
       </p>
@@ -3445,16 +3450,108 @@ function CodexPanel({ store, snapshot }) {
   );
 }
 
+/**
+ * The Antigravity integration card: manages the self-contained plugin bundle under
+ * `<ANTIGRAVITY_CONFIG_DIR>/plugins/dsh-taskbridge/` without touching global config.
+ * @param {object} props - `store`, `snapshot`.
+ * @returns {object} the card.
+ */
+function AntigravityPanel({ store, snapshot }) {
+  const antigravity = snapshot.antigravity ?? null;
+  const error = snapshot.antigravityError ?? null;
+  const busy = snapshot.loading?.antigravityAction === true;
+  const refreshing = snapshot.loading?.antigravityStatus === true;
+  const pluginView = antigravityTargetView(antigravity, null, 'plugin');
+  const mcpView = antigravityTargetView(antigravity, null, 'mcp');
+  const switchAuthorized = snapshot.status?.delegation?.authorized === true
+    || snapshot.settings?.delegationEnabled === true;
+  const switchView = antigravityTargetView(antigravity, { authorized: switchAuthorized }, 'switch');
+  const ready = antigravity?.ready === true;
+  const notes = Array.isArray(antigravity?.notes) ? antigravity.notes : [];
+  const disabled = busy || refreshing || antigravity === null;
+  return (
+    <section className="dshdg-card" aria-labelledby="dshdg-antigravity-title">
+      <div className="dshdg-row">
+        <h3 id="dshdg-antigravity-title">Antigravity 集成（插件包 + Skill + 子智能体 + MCP）</h3>
+        <span className="dshdg-spacer" />
+        <Badge tone={ready ? 'on' : 'off'}>{ready ? '已就绪' : '未就绪'}</Badge>
+      </div>
+      <p className="dshdg-muted">
+        {'点下面的按钮，把独立的 TaskBridge 插件装进 Antigravity 插件目录（'}
+        <span className="dshdg-mono">plugins/dsh-taskbridge/</span>
+        {'），内含 '}
+        <span className="dshdg-mono">plugin.json</span>
+        {'、按需加载的 '}
+        <span className="dshdg-mono">skills/dsh-taskbridge/SKILL.md</span>
+        {'、后台派工子智能体 '}
+        <span className="dshdg-mono">agents/dsh-taskbridge.md</span>
+        {' 以及插件内独立 '}
+        <span className="dshdg-mono">mcp_config.json</span>
+        {'。不会修改 Antigravity 全局 '}
+        <span className="dshdg-mono">mcp_config.json</span>
+        {' 或 '}
+        <span className="dshdg-mono">config.json</span>
+        {'。首次安装只会由你点击触发；已安装且未被手动修改的文件会在插件升级后自动刷新。'}
+      </p>
+      {error === null ? null : <p className="dshdg-fail">{error}</p>}
+      {antigravity === null ? (
+        <p className="dshdg-faint">正在读取 Antigravity 状态…</p>
+      ) : (
+        <>
+          <p className="dshdg-faint">
+            {'Antigravity 配置目录：'}
+            <span className="dshdg-mono">{String(antigravity.antigravityHome ?? '')}</span>
+            {'（设置环境变量 ANTIGRAVITY_CONFIG_DIR 可改到别处）'}
+          </p>
+          <div className="dshdg-list" data-dshdg-antigravity-targets="">
+            <CodexTargetRow view={pluginView} />
+            <CodexTargetRow view={mcpView} />
+            <CodexTargetRow view={switchView} />
+          </div>
+          {notes.length === 0 ? null : (
+            <ul className="dshdg-hint">
+              {notes.map((note) => <li key={note.code}>{note.text}</li>)}
+            </ul>
+          )}
+          <div className="dshdg-row">
+            <button type="button" disabled={busy || refreshing} onClick={() => { void store.refreshAntigravityStatus(); }}>
+              {refreshing ? '读取中…' : '刷新状态'}
+            </button>
+            <button type="button" className="dshdg-primary" disabled={disabled} onClick={() => { void store.runAntigravityAction('install'); }}>
+              {busy ? '处理中…' : '安装 / 更新 Antigravity 插件'}
+            </button>
+            <button type="button" disabled={disabled} onClick={() => { void store.runAntigravityAction('repair'); }}>
+              仅修复 MCP 配置
+            </button>
+            <button type="button" className="dshdg-danger" disabled={disabled} onClick={() => { void store.runAntigravityAction('remove'); }}>
+              移除插件托管项
+            </button>
+          </div>
+          {snapshot.antigravityOutcome === null || snapshot.antigravityOutcome === undefined
+            ? null
+            : <p className="dshdg-hint">{describeAntigravityOutcome(snapshot.antigravityOutcome)}</p>}
+        </>
+      )}
+      <p className="dshdg-hint">
+        {'安装后 Antigravity 会自动发现插件（或在重启 / 新开对话后加载新的 MCP 工具与技能）。'
+          + '你可以在 Antigravity 对话中通过 @dsh-taskbridge 或明确要求“交给 DSH 执行”触发派工，也可由主智能体通过后台子智能体并行盯梢多个独立隔离任务。'
+          + '本页不会替你打开顶部的本机调用开关；被你手动编辑过的 SKILL.md、子智能体或 MCP 配置会被保留并报告，不会被覆盖或删除。'}
+      </p>
+    </section>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Root page
 // ---------------------------------------------------------------------------
 
-/** Tab definitions: authorization is not a tab — it renders above all four. */
+/** Tab definitions: authorization is not a tab — it renders above all five. */
 const TABS = Object.freeze([
   { key: 'providers', label: '接口管理' },
   { key: 'execution', label: '执行设置' },
   { key: 'tasks', label: '任务记录' },
   { key: 'codex', label: 'Codex 集成' },
+  { key: 'antigravity', label: 'Antigravity 集成' },
 ]);
 
 /**
@@ -3541,6 +3638,7 @@ export function DelegateConfigPage(props) {
           </SessionNavigation.Provider>
         ) : null}
         {tab === 'codex' ? <CodexPanel store={store} snapshot={snapshot} /> : null}
+        {tab === 'antigravity' ? <AntigravityPanel store={store} snapshot={snapshot} /> : null}
       </div>
 
       <div className="dshdg-row" data-dshdg-autosave="">
@@ -3565,7 +3663,19 @@ export function DelegateConfigPage(props) {
 }
 
 /** Re-exported so the documented contract and tests share one name for the body document. */
-export { documentFromDraft, describeError, exportDocument, planCreateRequest };
+export {
+  ANTIGRAVITY_ACTIONS,
+  CODEX_ACTIONS,
+  ROUTES,
+  antigravityTargetView,
+  codexTargetView,
+  describeAntigravityOutcome,
+  describeCodexOutcome,
+  describeError,
+  documentFromDraft,
+  exportDocument,
+  planCreateRequest,
+};
 
 export {
   MAX_CLEANUP_CHAINS,

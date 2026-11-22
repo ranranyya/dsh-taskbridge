@@ -20,6 +20,9 @@ export function buildWorkerPrompt(input) {
   lines.push('- Follow the assigned plan. Make routine choices within the packet. '
     + 'If a premise conflicts with the project, report what you verified and the affected step to the host before changing course.');
   lines.push('- You may modify files only inside the workspace above.');
+  if (input.isolation === 'shared' || input.baseline?.dirtyBaseline === true) {
+    lines.push('- Preserve existing uncommitted changes and unrelated files in this checkout.');
+  }
   lines.push('- Do not commit, push, tag, or rewrite git history.');
   lines.push('- Do not read or print credentials, tokens, or .env contents.');
   lines.push('- Do not install packages from the network unless the task explicitly requires it.');
@@ -38,6 +41,8 @@ export function buildWorkerPrompt(input) {
   lines.push('- Run one combined test command, save its FULL stdout/stderr, its real exit code and a short summary '
     + '(for example into `.cache/`), and read that saved log afterwards with the file tools. Do not re-run a test '
     + 'merely to change a filter, a `Select-String` pattern or a `Select-Object -First N`: read the log instead.');
+  lines.push('- After reading temporary test logs you created (such as under `.cache/`), remove those untracked '
+    + 'temporary log files before finishing so the delivery diff contains only intended task changes.');
   lines.push('- A missing dependency is a fact to verify, not a reason to re-run the suite: check whether the module '
     + 'exists before concluding the test failed, and never use extra permission to paper over a module-not-found '
     + 'error.');

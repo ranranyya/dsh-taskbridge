@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.8.0 — Antigravity 一键集成、三层黑盒优化与文档润色（2026-11-22）
+
+- **新增 Antigravity 一键集成**：设置页新增独立「Antigravity 集成」标签页与托管安装器（`src/antigravity/`），可将自包含插件包安装至 `~/.gemini/config/plugins/dsh-taskbridge/`（内含 `plugin.json`、按需加载的 `SKILL.md`、仅含只读与 MCP 权限的后台派工子智能体 `agents/dsh-taskbridge.md` 与插件内独立 `mcp_config.json`），不修改 Antigravity 全局配置。
+- **逐文件所有权与升级保护**：Antigravity 集成支持安装/更新、仅修复 MCP 配置、移除托管项与 DSH 启动自动刷新；通过内容哈希逐文件保护用户自定义修改（例如编辑过 `SKILL.md` 时原样保留，同时不影响其余托管文件的补装与升级），并支持在缺失所有权记录时自动识别未修改的旧版 `plugin.json`。
+- **三层黑盒架构优化（Codex 端大幅瘦身）**：
+  - 将共享工作区保留已有未提交修改与测试后清理新建未追踪临时日志的约束收归底层 `worker-prompt.js`。
+  - 精简 `codex/dsh-taskbridge.toml`（移除顶层手管底层工作区与重复等待段落，篇幅缩减约 73%），保留完整的 P0 规划、静默等待、单次权限审批、原生提问、派工回执核对（含 `agentTeamsOrigin` 与 `team.enabled`）、断线防重与检查点保存纪律。
+  - 去除顶层派工规则与设置页说明中对用户可配监控阈值（自检/运行进度检查分钟数）的硬编码表述，统一对齐 DSH 设置页动态配置与 `1.7.0+` 实际计时口径。
+  - 登记已发布 `1.7.1` 托管模板精确哈希（LF / CRLF），老用户升级自动刷新未修改的 Codex 模板并保留自定义改动。
+- **产品介绍与文档润色**：重写中英文插件介绍（`docs/INTRODUCTION.zh.md`、`docs/INTRODUCTION.md`、`README.md` 开头及 `locale/*.json`），新增 `docs/antigravity-integration.md`（含 Antigravity 首次 MCP 工具放行说明），更新 `docs/claude-code.md`（2.0 接入规划）并补齐历史文档口径一致性。
+- **接口与工程细节**：补齐 `ANTIGRAVITY_*` / `CODEX_*` 错误码 HTTP 映射与前端中文提示，补全客户端入口导出与 `lib/client.d.ts` 类型声明对齐。详见 [1.8.0 更新说明](docs/releases/1.8.0.zh.md)。
+
 ## 1.7.1 — Codex 派工前制定实施方案
 
 - Codex 先查看项目和已有交付，确定当前工作包、复用决策、实施步骤和验收方法，再把方案写入 DSH 收到的指令。

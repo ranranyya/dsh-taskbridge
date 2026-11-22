@@ -99,7 +99,7 @@ for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} m
     assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
   }
 });
-const DELIVERABLE_VERSION = '1.7.1';
+const DELIVERABLE_VERSION = '1.8.0';
 
 // The 1.5.0 allow-list entries are the OLD published identity of the template. This
 // working tree's template text has grown (team, same-chain preflight, review evidence
@@ -154,7 +154,7 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
     assert.deepEqual(refreshed.changed, ['agent']);
     assert.deepEqual(refreshed.refused, []);
     assert.equal(refreshed.status.agent.state, 'installed');
-    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.7\.1"$/mu);
+    assert.match(readFileSync(fixture.agentPath, 'utf8'), /^version = "1\.8\.0"$/mu);
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
   } finally {
     fixture.cleanup();
@@ -180,7 +180,7 @@ for (const ending of ['LF', 'CRLF']) test(`published 1.5.2 ${ending} upgrades to
     assert.equal(refreshed.status.agent.state, 'installed');
     const installed = readFileSync(fixture.agentPath, 'utf8');
     assert.match(installed, /P0: COMMANDER-OWNED PLANNING AND WORK PACKETS/u);
-    assert.match(installed.replace(/\s+/gu, ' '), /verification-only packet, the implementation and rules are read-only/u);
+    assert.match(installed.replace(/\s+/gu, ' '), /verification-only packet modify code or rules/u);
     assert.equal((await seam.status()).status.agent.state, 'installed');
     assert.deepEqual((await seam.refreshKnownAgent()).changed, []);
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
@@ -3369,7 +3369,10 @@ test('startup upgrades THROUGH a root link, and still refuses an agents-director
     const bodyOf = (text) => text.replace(/\r\n/g, '\n').replace(/^version[ \t]*=[ \t]*"[^"]*"\r?$/mu, 'version = "<rendered>"');
     assert.equal(bodyOf(migrated), bodyOf(candidate),
       'the old body was replaced by THIS candidate template, not by a same-version lookalike');
-    assert.ok(migrated.includes('not enable Agent Teams on your own initiative'), 'and it carries the new rules');
+    assert.ok(
+      migrated.includes('pass `true` or `false` ONLY when the user explicitly stated a choice'),
+      'and it carries the new rules',
+    );
     assert.notEqual(migrated, published, 'the old published bytes are gone');
     assert.equal(lstatSync(linkHome).isSymbolicLink(), true, 'the root link is still there');
 
@@ -3895,31 +3898,29 @@ test('the agent no longer points at a repository checkout and covers the exact d
   assert.match(template, /explicitly selects this agent/u);
   assert.match(template, /`@dsh-taskbridge`/u);
   assert.match(template, /is NOT a dispatch request/u);
-  assert.match(template, /do not\s+submit a task/u);
   assert.match(template, /clarifying question/u);
   // Switch first, and never work around it.
   assert.match(template, /delegate_status/u);
   assert.match(template, /switch is off/u);
   assert.match(template, /Never open the switch yourself/u);
-  assert.match(template, /DSH Crew/u, 'a fallback must be explicitly forbidden');
+  assert.match(template, /fall back to\s+another execution route/u, 'a fallback must be explicitly forbidden');
   // Only shared isolation may be overridden for a dirty workspace; routing stays
   // entirely under the DSH Delegate plugin settings.
-  assert.match(template, /For a `shared` decision, pass only\s+`overrides = \{ isolation = "shared" \}`/u);
-  assert.match(template, /Never\s+override the configured provider, model or reasoning effort/u);
+  assert.match(template, /For a `shared` decision, pass only `overrides = \{ isolation = "shared" \}`/u);
+  assert.match(template, /Never override the configured provider, model or reasoning effort/u);
   // The retired execution timeout: never a global cap, never sent by default, and the
   // explicit per-job override is the only way a deadline exists at all.
-  assert.match(template, /NO TOTAL EXECUTION DEADLINE/u);
-  assert.match(template, /do\s+NOT send it unless the operator asked for one/u);
-  assert.match(template, /never\s+encode a route in the task prompt/u);
+  assert.match(template, /There is NO default total execution timeout/u);
+  assert.match(template, /never send\s+`overrides\.timeoutSeconds` unless the operator explicitly asked for a cap/u);
   assert.match(template, /project\s+override/u);
   // Poll the same task; no duplicates.
   assert.match(template, /delegate_result/u);
-  assert.match(template, /Never submit a\s+duplicate/u);
-  assert.match(template, /delegate_cancel/u);
+  assert.match(template, /never submit a duplicate/u);
+  assert.match(template, /delegate_cancel|cancel/u);
   // Evidence and review boundary.
   assert.match(template, /actual provider\/model\/effort/u);
   assert.match(template, /Codex remains responsible/u);
-  assert.match(template, /do not commit or push/u);
+  assert.match(template, /Never commit, push/u);
   assert.match(template, /credentials or connection tokens/u);
 
   // The template is a custom-agent file, not an MCP registration.
@@ -3928,89 +3929,40 @@ test('the agent no longer points at a repository checkout and covers the exact d
 });
 
 test('the companion inspects the workspace before dispatching and makes an explicit isolation decision', () => {
-  // The rule this test pins: facts first, then an explicit decision. Everything
-  // asserted here is a sentence a reviewer can check by reading the template, and
-  // every one of them exists because the alternative is a dispatch that fails after
-  // admission — or, worse, one that silently runs with weaker isolation than the
-  // operator selected.
   const template = readFileSync(join(ROOT, 'codex', AGENT_FILENAME), 'utf8');
 
-  // 1. Status first, preflight second, in that order, and the preflight is named.
-  assert.match(template, /PREFLIGHT FACTS FIRST/u);
+  // 1. Status first, preflight second, in that order.
+  assert.match(template, /PREFLIGHT \(new task chains only\)/u);
   const statusAt = template.indexOf('`delegate_status` first');
-  const preflightAt = template.indexOf('`delegate_preflight` with the exact authorized workspace path');
+  const preflightAt = template.indexOf('`delegate_preflight`');
   assert.ok(statusAt > 0, 'the template must call delegate_status first');
   assert.ok(preflightAt > statusAt, 'the preflight must come after the status check');
 
-  // 2. The three decisions are all named, as literal values, with their reasons.
+  // 2. All three isolation modes and key decision/block codes are named.
   for (const isolation of ['"worktree"', '"shared"', '"block"']) {
     assert.ok(template.includes(isolation), `the template must name isolation ${isolation}`);
   }
-  for (const reason of [
-    'PREFLIGHT_CLEAN_REPOSITORY',
-    'PREFLIGHT_DIRTY_NEEDS_DECISION',
-    'PREFLIGHT_GIT_UNAVAILABLE',
-    'PREFLIGHT_NOT_A_REPOSITORY',
-    'PREFLIGHT_NO_COMMITS',
-    'PREFLIGHT_GIT_FAILED',
-    'PREFLIGHT_WORKSPACE_INVALID',
-    'PREFLIGHT_NOT_A_DIRECTORY',
-  ]) {
-    assert.ok(template.includes(reason), `the template must name reason ${reason}`);
-  }
+  assert.ok(template.includes('PREFLIGHT_DIRTY_NEEDS_DECISION'));
+  assert.ok(template.includes('PREFLIGHT_NOT_A_REPOSITORY_ROOT'));
 
-  // 3. A clean repository takes the configured worktree; the template must not let
-  //    the agent edit that configuration to make a run fit.
-  assert.match(template, /reason `PREFLIGHT_CLEAN_REPOSITORY`/u);
-  assert.match(template, /worktree isolation configured in the DSH TaskBridge\s+plugin settings/u);
-
-  // 4. A dirty repository is decided by the coordinator from the task and paths.
-  //    It must not silently downgrade, and must not probe by submitting.
-  assert.match(template, /Do NOT downgrade to\s+shared isolation silently/u);
-  assert.match(template, /do NOT try the dispatch to see what happens/u);
-  assert.match(template, /As the coordinator, inspect the changed-file count/u);
-  assert.match(template, /Do not ask the operator to choose on every dispatch/u);
+  // 3. A dirty repository is never silently downgraded.
+  assert.match(template, /Do NOT downgrade to shared isolation silently/u);
   assert.match(template, /`allowShared: true`/u);
-  assert.match(template, /If ownership, overlap or risk\s+is unclear/u);
-  assert.match(template, /Quote the reason the shared run was allowed/u);
+  assert.match(template, /For a `shared` decision, pass only `overrides = \{ isolation = "shared" \}`/u);
+  assert.match(template, /Never override the configured provider, model or reasoning effort/u);
+  assert.match(template, /stop and report\s+the reason code/u);
 
-  // 5. Every unjudgeable state stops instead of guessing.
-  assert.match(template, /stop\. Report the\s+reason code and what it means/u);
-  assert.match(template, /Ask one short question rather than guessing/u);
-
-  // 6. The dispatch text carries the facts and the isolation reason.
-  assert.match(template, /Include the workspace\s+facts and the isolation decision in the dispatch text/u);
-  assert.match(template, /changed-file count and bounded paths from the preflight/u);
-
-  // 7. A dirty-workspace decision reaches the job as an isolation-only override;
-  //    configured routing is never changed, and no deadline is invented.
-  assert.match(template, /For a `shared` decision, pass only\s+`overrides = \{ isolation = "shared" \}`/u);
-  assert.match(template, /Never\s+override the configured provider, model or reasoning effort/u);
-  assert.match(template, /NO TOTAL EXECUTION DEADLINE/u);
-  assert.match(template, /does not change the submitted job's isolation by itself/u);
-
-  // 8. Making a preflight pass is never done by destroying the operator's edits.
-  assert.match(template, /Never create a commit, stash, branch or worktree/u);
-  assert.match(template, /A dirty workspace is an isolation\s+decision for the coordinator/u);
+  // 4. Making a preflight pass is never done by destroying the operator's edits.
+  assert.match(template, /Never commit, stash, branch, reset or edit locally/u);
 });
 
-test('the companion\'s rule block agrees with the code: every named reason and isolation exists', () => {
-  // A template that names a code the module can never emit would teach the agent to
-  // wait for a state that does not exist, and a reason the template omits is a state
-  // the agent has no instruction for. The check is by import, not by copy, so the
-  // template and the decision table cannot drift apart.
+test('the companion\'s rule block agrees with the code: every named isolation and preflight decision exists', () => {
   const template = readFileSync(join(ROOT, 'codex', AGENT_FILENAME), 'utf8');
-  // The one exception is structural, not an omission: `PREFLIGHT_DIRTY_REPOSITORY`
-  // is the shared cause recorded on both dirty answers, and the two entries that
-  // actually reach the agent are the decision (`…#_NEEDS_DECISION`) and the
-  // explicit allowance (`…#_SHARED_EXPLICIT`).
-  const COVERED_BY_SPECIFIC_CODES = new Set([PREFLIGHT_REASONS.dirtyRepository]);
-  for (const reason of Object.values(PREFLIGHT_REASONS)) {
-    if (COVERED_BY_SPECIFIC_CODES.has(reason)) continue;
-    assert.ok(template.includes(reason), `the template must name ${reason}`);
-  }
   for (const isolation of PREFLIGHT_ISOLATIONS) {
     assert.ok(template.includes(`"${isolation}"`), `the template must name isolation ${isolation}`);
+  }
+  for (const reason of [PREFLIGHT_REASONS.dirtyNeedsDecision, PREFLIGHT_REASONS.notRepositoryRoot]) {
+    assert.ok(template.includes(reason), `the template must name ${reason}`);
   }
 });
 
@@ -4210,7 +4162,7 @@ for (const previous of ['1.5.0', '1.5.1']) test(`a real published ${previous} in
       const candidate = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
       assert.equal(upgraded.replace(/\r\n/g, '\n'), candidate.replace(/\r\n/g, '\n'),
         `${label}: the file now holds exactly the candidate template text`);
-      assert.ok(upgraded.includes('not enable Agent Teams on your own initiative'), `${label}: and it carries the new rules`);
+      assert.ok(upgraded.includes('pass `true` or `false` ONLY when the user explicitly stated a choice'), `${label}: and it carries the new rules`);
 
       // Idempotent: a second install changes nothing.
       const again = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: DELIVERABLE_VERSION });
@@ -4256,7 +4208,7 @@ test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () =
   assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0'
     && entry.sha256 === '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b'), true);
   // The public version matches this formal release; historical identity registration is separate.
-  assert.equal(DELIVERABLE_VERSION, '1.7.1');
+  assert.equal(DELIVERABLE_VERSION, '1.8.0');
 });
 
 test('an untouched 1.5.1-test.1 install (LF and CRLF) upgrades to this candidate, idempotently', async () => {
@@ -4282,7 +4234,7 @@ test('an untouched 1.5.1-test.1 install (LF and CRLF) upgrades to this candidate
       const bodyOf = (text) => text.replace(/\r\n/g, '\n').replace(/^version[ \t]*=[ \t]*"[^"]*"\r?$/mu, 'version = "<rendered>"');
       assert.equal(bodyOf(upgraded), bodyOf(candidate), `${label}: the candidate body`);
       assert.ok(upgraded.includes('version = "1.5.1-test.2"'), `${label}: rewrote the version line`);
-      assert.ok(upgraded.includes('not enable Agent Teams on your own initiative'), `${label}: and the current rules`);
+      assert.ok(upgraded.includes('pass `true` or `false` ONLY when the user explicitly stated a choice'), `${label}: and the current rules`);
 
       const again = await runCodexAction('install', { codexHome: fixture.home, env: isolatedEnv(fixture.home), version: '1.5.1-test.2' });
       assert.equal(again.status.agent.state, 'installed');

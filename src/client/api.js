@@ -111,6 +111,7 @@ export const ROUTES = Object.freeze({
   connectivity: `${USER_PLANE_PREFIX}/connectivity`,
   // One path, two methods: `GET` diagnoses, `POST` performs one explicit action.
   codex: `${USER_PLANE_PREFIX}/codex`,
+  antigravity: `${USER_PLANE_PREFIX}/antigravity`,
 });
 
 /** A refusal or transport failure carrying the contract's stable code. */
@@ -439,6 +440,14 @@ export function createApi(options = {}) {
      */
     async runCodexAction(action) {
       return await request('POST', ROUTES.codex, { action });
+    },
+    /** Diagnose the Antigravity plugin integration. Read-only on the host. */
+    async getAntigravityStatus() {
+      return await request('GET', ROUTES.antigravity);
+    },
+    /** Perform one explicit Antigravity integration action (`install`, `repair`, `remove`). */
+    async runAntigravityAction(action) {
+      return await request('POST', ROUTES.antigravity, { action });
     },
   };
 }
@@ -938,6 +947,68 @@ export function codexTargetView(codex, switchState, target) {
 export function describeCodexOutcome(outcome) {
   if (outcome === null || outcome === undefined) return '';
   const names = { agent: '子智能体文件', mcp: 'MCP 条目' };
+  const changed = Array.isArray(outcome.changed) ? outcome.changed.map((key) => names[key] ?? key) : [];
+  const refused = Array.isArray(outcome.refused) ? outcome.refused : [];
+  const parts = [];
+  if (changed.length > 0) parts.push(`已写入：${changed.join('、')}`);
+  if (refused.length > 0) parts.push(`未改动：${refused.map((entry) => names[entry?.target] ?? entry?.target ?? '未知').join('、')}`);
+  if (parts.length === 0) {
+    return outcome.action === 'remove' ? '没有需要移除的插件托管文件。' : '已是最新，没有需要写入的内容。';
+  }
+  return parts.join('；') + '。';
+}
+
+export const ANTIGRAVITY_ACTIONS = Object.freeze(['install', 'repair', 'remove']);
+
+export const ANTIGRAVITY_TARGETS = Object.freeze([
+  { key: 'plugin', label: 'Antigravity 插件与规则（Skill + 子智能体）' },
+  { key: 'mcp', label: 'Antigravity 插件 MCP 配置' },
+  { key: 'switch', label: 'DSH 本机调用开关' },
+]);
+
+export function antigravityTargetView(antigravity, switchState, target) {
+  const label = ANTIGRAVITY_TARGETS.find((entry) => entry.key === target)?.label ?? target;
+  if (target === 'switch') {
+    const authorized = switchState?.authorized === true;
+    return {
+      key: 'switch',
+      label,
+      state: authorized ? 'on' : 'off',
+      tone: authorized ? 'on' : 'off',
+      detail: authorized
+        ? '已开启：Antigravity 可以通过 MCP 提交任务。'
+        : '已关闭：Antigravity 可以查询状态，但新任务会被拒绝；本页不会替你打开它。',
+    };
+  }
+  const block = target === 'plugin' ? antigravity?.plugin : antigravity?.mcp;
+  if (block === null || block === undefined || typeof block !== 'object') {
+    return { key: target, label, state: 'unknown', tone: 'off', detail: '宿主尚未回报该状态。' };
+  }
+  const state = String(block.state ?? 'unknown');
+  const done = target === 'plugin' ? block.installed === true : block.configured === true;
+  const detailParts = [];
+  if (typeof block.path === 'string' && block.path !== '') detailParts.push(block.path);
+  if (target === 'mcp' && typeof block.script === 'string' && block.script !== '') {
+    detailParts.push(`入口：${block.script}`);
+  }
+  if (target === 'mcp') {
+    if (typeof block.node === 'string' && block.node !== '') detailParts.push(`Node：${block.node}`);
+    else if (block.nodeResolved === false) detailParts.push('Node：未确定（不会写入桌面应用自身的 exe）');
+  }
+  return {
+    key: target,
+    label,
+    state,
+    tone: done ? 'on' : (state === 'conflict' || state === 'unreadable' || state === 'modified') ? 'warn' : 'off',
+    detail: CODEX_STATE_LABELS[state] ?? state,
+    path: typeof block.path === 'string' ? block.path : '',
+    paths: detailParts,
+  };
+}
+
+export function describeAntigravityOutcome(outcome) {
+  if (outcome === null || outcome === undefined) return '';
+  const names = { plugin: '插件与规则文件', mcp: 'MCP 配置' };
   const changed = Array.isArray(outcome.changed) ? outcome.changed.map((key) => names[key] ?? key) : [];
   const refused = Array.isArray(outcome.refused) ? outcome.refused : [];
   const parts = [];
@@ -2197,6 +2268,15 @@ export function describeError(error) {
     CLEANUP_REVIEW_WRITE: '该任务的审查意见正在写入，未删除任何记录；请稍后重试。',
     CLEANUP_UNAVAILABLE: '当前宿主不提供记录清理能力（或记录暂时无法读取），未删除任何记录。',
     CLEANUP_FAILED: '记录写入失败，未删除任何记录；旧记录仍会显示。',
+    CODEX_INTEGRATION_UNAVAILABLE: '当前宿主未提供 Codex 集成接口。',
+    CODEX_HOME_INVALID: 'Codex 配置目录路径不合法（必须为绝对路径）。',
+    CODEX_ACTION_INVALID: '不支持的 Codex 集成操作。',
+    CODEX_CONFIG_UNSUPPORTED: 'Codex 配置文件存在冲突或不受支持的格式，插件未改动。',
+    ANTIGRAVITY_INTEGRATION_UNAVAILABLE: '当前宿主未提供 Antigravity 集成接口。',
+    ANTIGRAVITY_HOME_INVALID: 'Antigravity 配置目录路径不合法（必须为绝对路径）。',
+    ANTIGRAVITY_HOME_UNUSABLE: 'Antigravity 配置目录不可用（非普通目录或链接无法解析）。',
+    ANTIGRAVITY_ACTION_INVALID: '不支持的 Antigravity 集成操作。',
+    ANTIGRAVITY_PATH_CONFLICT: 'Antigravity 插件目录存在冲突或符号链接边界，插件未写入。',
   };
   const known = messages[code];
   if (known !== undefined) return `${known}（${code}）`;
@@ -2590,6 +2670,9 @@ export function createStore(options = {}) {
     codex: null,
     codexError: null,
     codexOutcome: null,
+    antigravity: null,
+    antigravityError: null,
+    antigravityOutcome: null,
   };
   /** @type {Set<() => void>} */
   const listeners = new Set();
@@ -3351,6 +3434,65 @@ export function createStore(options = {}) {
       });
     },
 
+    /** Read the Antigravity integration status. Strictly read-only. */
+    async refreshAntigravityStatus() {
+      if (typeof api.getAntigravityStatus !== 'function') {
+        patch({
+          antigravity: null,
+          antigravityError: '当前宿主未提供 Antigravity 集成接口（插件版本可能较旧）。',
+        });
+        return { ok: false };
+      }
+      return await track('antigravityStatus', async () => {
+        try {
+          const body = await api.getAntigravityStatus();
+          patch({ antigravity: body.antigravity ?? null, antigravityError: null });
+          return { ok: true, antigravity: body.antigravity ?? null, switch: body.switch ?? null };
+        } catch (error) {
+          const unavailable = error?.code === 'HTTP_404' || error?.code === 'USER_PLANE_UNKNOWN_ROUTE';
+          patch({
+            antigravity: null,
+            antigravityError: unavailable
+              ? '当前宿主未提供 Antigravity 集成接口（插件版本可能较旧）。'
+              : describeError(error),
+          });
+          return { ok: false, error };
+        }
+      });
+    },
+
+    /** Perform one explicit Antigravity integration action (`install`, `repair`, `remove`). */
+    async runAntigravityAction(action) {
+      if (!ANTIGRAVITY_ACTIONS.includes(action)) {
+        notify('error', `未知的 Antigravity 操作：${String(action)}`);
+        return { ok: false };
+      }
+      if (typeof api.runAntigravityAction !== 'function') {
+        notify('error', '当前宿主未提供 Antigravity 集成接口。');
+        return { ok: false };
+      }
+      return await track('antigravityAction', async () => {
+        try {
+          const body = await api.runAntigravityAction(action);
+          const outcome = {
+            action: body.action ?? action,
+            changed: Array.isArray(body.changed) ? body.changed : [],
+            refused: Array.isArray(body.refused) ? body.refused : [],
+          };
+          const antigravity = body.antigravity ?? state.antigravity;
+          patch({ antigravity, antigravityError: null, antigravityOutcome: outcome });
+          const summary = describeAntigravityOutcome(outcome);
+          const failed = outcome.refused.length > 0;
+          notify(failed ? 'error' : 'success', summary === '' ? '操作完成。' : summary);
+          return { ok: !failed, outcome, antigravity };
+        } catch (error) {
+          patch({ antigravityOutcome: null });
+          notify('error', describeError(error));
+          return { ok: false, error };
+        }
+      });
+    },
+
     /**
      * Replace the silence thresholds, the progress-check cadence and the repeated-failure count.
      *
@@ -3686,6 +3828,7 @@ export function createStore(options = {}) {
       // Diagnostic read only. `init` must never perform a Codex write: installing
       // files is an explicit operator action, not a side effect of opening a page.
       void store.refreshCodexStatus();
+      void store.refreshAntigravityStatus();
       void store.loadCatalog();
     },
 

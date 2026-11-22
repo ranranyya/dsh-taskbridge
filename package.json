@@ -1,7 +1,7 @@
 {
   "name": "dsh-taskbridge",
-  "version": "1.7.1",
-  "description": "让 Codex 指挥 DSH：在插件里选择已有 API、执行模型与思考强度，完成派工、静默等待、权限审批、集中审查和原会话续接。支持一键配置 Codex 智能体与设置自动保存。Claude Code / Claude Desktop 接入预计在 2.0 上线。",
+  "version": "1.8.0",
+  "description": "让 Codex 与 Antigravity 指挥 DSH 落地代码：在插件内统一选择已有 API、执行模型与思考强度，提供一键客户端集成、静默等待、单次权限审批、集中审查与原会话续接。Claude Code / Claude Desktop 接入计划于 2.0 上线。",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -52,6 +52,8 @@
     "bin/dsh-delegate-control.js",
     "bin/dsh-delegate-control.d.ts",
     "codex/dsh-taskbridge.toml",
+    "antigravity/skills/dsh-taskbridge/SKILL.md",
+    "antigravity/agents/dsh-taskbridge.md",
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
@@ -59,6 +61,7 @@
     "CHANGELOG.md",
     "docs/auth-contract.md",
     "docs/codex-integration.md",
+    "docs/antigravity-integration.md",
     "docs/conversation-placement.md",
     "docs/contracts-stage-b.md",
     "docs/redaction-contract.md",
@@ -76,7 +79,8 @@
     "docs/plugin-market.md",
     "docs/taskbridge-upgrade.md",
     "docs/releases/1.6.0.zh.md",
-    "docs/releases/1.7.0.zh.md"
+    "docs/releases/1.7.0.zh.md",
+    "docs/releases/1.8.0.zh.md"
   ],
   "dsh": {
     "manifestVersion": 1,
@@ -135,6 +139,7 @@
     "deepseek-harness",
     "taskbridge",
     "codex",
+    "antigravity",
     "claude-code",
     "mcp",
     "delegation"

@@ -476,8 +476,11 @@ export declare function planCreateRequest(
  */
 export declare const CODEX_ACTIONS: readonly ['install', 'repair', 'remove'];
 
-/** The user-plane path the Codex panel uses (`GET` diagnoses, `POST` acts). */
-export declare const ROUTES: Readonly<Record<string, string>> & { codex: '/api/dsh-delegate/codex' };
+/** The user-plane paths the integration panels use (`GET` diagnoses, `POST` acts). */
+export declare const ROUTES: Readonly<Record<string, string>> & {
+  codex: '/api/dsh-delegate/codex';
+  antigravity: '/api/dsh-delegate/antigravity';
+};
 
 /**
  * One target's presentation state: agent file, MCP entry or DSH switch.
@@ -505,6 +508,30 @@ export declare function codexTargetView(
 
 /** Chinese one-line summary of an action outcome (`changed` / `refused`). */
 export declare function describeCodexOutcome(outcome: unknown): string;
+
+/** Actions the Antigravity panel may send (`status` is always `GET`). */
+export declare const ANTIGRAVITY_ACTIONS: readonly ['install', 'repair', 'remove'];
+
+/** One Antigravity target's presentation state: plugin bundle, MCP config or DSH switch. */
+export interface DelegateAntigravityTargetView {
+  key: 'plugin' | 'mcp' | 'switch';
+  label: string;
+  state: string;
+  tone: 'on' | 'off' | 'warn';
+  detail: string;
+  path?: string;
+  paths?: string[];
+}
+
+/** Map a served Antigravity status document onto one target's presentation state. */
+export declare function antigravityTargetView(
+  antigravity: unknown,
+  switchState: unknown,
+  target: 'plugin' | 'mcp' | 'switch',
+): DelegateAntigravityTargetView;
+
+/** Chinese one-line summary of an Antigravity action outcome (`changed` / `refused`). */
+export declare function describeAntigravityOutcome(outcome: unknown): string;
 
 /**
  * One execution chain as the cleanup surface sees it.
@@ -630,6 +657,13 @@ export interface DelegateClientModule {
   documentFromDraft: typeof documentFromDraft;
   describeError: typeof describeError;
   exportDocument: typeof exportDocument;
+  ROUTES: typeof ROUTES;
+  CODEX_ACTIONS: typeof CODEX_ACTIONS;
+  codexTargetView: typeof codexTargetView;
+  describeCodexOutcome: typeof describeCodexOutcome;
+  ANTIGRAVITY_ACTIONS: typeof ANTIGRAVITY_ACTIONS;
+  antigravityTargetView: typeof antigravityTargetView;
+  describeAntigravityOutcome: typeof describeAntigravityOutcome;
   /** G09 batch plan creation: the pure form-draft → request projection. */
   planCreateRequest: typeof planCreateRequest;
   /** Task-record cleanup: the chain projection, selection and confirmation text. */

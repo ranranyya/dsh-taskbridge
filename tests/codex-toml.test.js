@@ -296,69 +296,48 @@ function templateText() {
 }
 
 test('the template puts the agentTeams default under USER control, with a per-task override', () => {
-  const text = templateText();
-  assert.match(text, /the user controls in the\s+plugin's settings page/u);
-  assert.match(text, /新任务默认开启智能体\s*协作/u, 'the setting is named as the user sees it');
-  assert.match(text, /An explicit value always wins over the/u, 'a per-task choice wins over the default');
-  assert.match(text, /OMIT the field/u, 'with no user choice, the field is omitted');
-  assert.match(text, /settings-default/u, 'the default-applied case is named');
-  assert.match(text, /never overrides them/u, 'the team choice never overrides provider/model/effort');
-  assert.match(text, /never fake success/u, 'an older tool must not be pretended to work');
-  assert.match(text, /A continuation does not re-decide it/u);
-  // The retired blanket rule must not come back.
+  const text = templateText().replace(/\s+/gu, ' ');
+  assert.match(text, /pass `true` or `false` ONLY when the user explicitly stated a choice/u);
+  assert.match(text, /otherwise omit it/u, 'with no user choice, the field is omitted');
+  assert.match(text, /new tasks follow the TaskBridge default/u);
+  assert.match(text, /continuations inherit the chain's choice/u);
+  assert.match(text, /Never override the configured provider, model or reasoning effort/u);
   assert.doesNotMatch(text, /AGENT TEAMS IS YOUR DECISION, NOT THE OPERATOR'S/u);
 });
 
-// OMITTING the field is NOT "off": on a new task it now means "follow the user's
-// TaskBridge default", and on a follow-up it keeps the chain's mode. The template once
-// said "omit the field, or send false" as if both meant off, which is wrong; it then went
-// the other way and told the commander to send `false` by habit, which silently overrode
-// the user's default. Neither phrasing may return.
 test('the template never presents OMITTING agentTeams as equivalent to turning it off', () => {
-  const text = templateText();
-  assert.match(text, /If the user stated no choice, OMIT the field and do not set it in `overrides`/u);
-  assert.match(text, /A NEW task follows the user's TaskBridge default/u);
-  assert.match(text, /An omitted value keeps the parent's mode/u);
-  assert.match(text, /Send an explicit value only for the user's choice for this dispatch/u);
-  assert.match(text, /Surface any conflict with the user's choice\s+before dispatch/u);
-  // The removed, wrong phrasings must not come back.
-  assert.doesNotMatch(text, /leave it off \(omit the field, or\s+send `false`\)/u);
-  assert.doesNotMatch(text, /omit the field[^.]*is the default|that is the default[^.]*omit/u);
-  assert.doesNotMatch(text, /turn it OFF EXPLICITLY with[\s\S]{0,40}`agentTeams: false`/u,
-    'the old blanket "send false by default" instruction is gone');
+  const text = templateText().replace(/\s+/gu, ' ');
+  assert.match(text, /new tasks follow the TaskBridge default/u);
+  assert.match(text, /continuations inherit the chain's choice/u);
+  assert.match(text, /if that task recorded no choice at all, the plugin writes nothing/u);
+  assert.doesNotMatch(text, /leave it off \(omit the field, or send `false`\)/u);
+  assert.doesNotMatch(text, /turn it OFF EXPLICITLY with[\s\S]{0,40}`agentTeams: false`/u);
 });
 
-test('rule 4b defers preflight to 2a instead of demanding it every round', () => {
-  const text = templateText();
-  assert.match(text, /re-run `delegate_preflight` only when needed under 2a/u);
-  assert.match(text, /NOT\s+preflighted mechanically every round/u);
-  assert.doesNotMatch(text, /For an explicit follow-up, use the parent's original source `workspacePath` for\s+preflight and/u);
+test('continuation defers preflight instead of demanding it every round', () => {
+  const text = templateText().replace(/\s+/gu, ' ');
+  assert.match(text, /PREFLIGHT \(new task chains only\)/u);
+  assert.match(text, /Reuse verified preflight facts for a same-chain `continueFromTaskId` continuation/u);
+  assert.doesNotMatch(text, /For an explicit follow-up, use the parent's original source `workspacePath` for preflight and/u);
 });
 
 test('the template makes preflight per chain, and does not demand it again for a verified continuation', () => {
-  const text = templateText();
-  assert.match(text, /PREFLIGHT IS PER CHAIN, NOT PER DISPATCH/u);
-  assert.match(text, /reuse the\s+already-verified preflight facts/u);
-  assert.match(text, /engine still re-checks ownership, paths, the\s+original checkout and the\s+Session/u);
-  // The old unconditional demand is gone: step 1 now says "FOR A NEW TASK".
-  assert.match(text, /1\. PREFLIGHT FACTS FIRST — FOR A NEW TASK/u);
-  assert.doesNotMatch(text, /1\. PREFLIGHT FACTS FIRST\. Call/u);
+  const text = templateText().replace(/\s+/gu, ' ');
+  assert.match(text, /PREFLIGHT \(new task chains only\)/u);
+  assert.match(text, /Reuse verified preflight facts/u);
+  assert.match(text, /unless the source changed or the engine reports a mismatch/u);
 });
 
 test('the template requires a durable review write and one consolidated correction round', () => {
-  const text = templateText();
-  assert.match(text, /THE REVIEW WRITE IS THE RECORD/u);
-  assert.match(text, /ONE ROUND PER DELIVERY/u);
-  assert.match(text, /`reviewPersistence`\s*`state: "saved"`/u);
+  const text = templateText().replace(/\s+/gu, ' ');
+  assert.match(text, /confirm `reviewPersistence\.state === "saved"`/u);
+  assert.match(text, /Consolidate defects into ONE follow-up via `continueFromTaskId`/u);
 });
 
-test('the template keeps approval anchored on the concrete operation, and reading source needs none', () => {
-  const text = templateText();
-  assert.match(text, /CLAIM awaiting verification/u);
-  assert.match(text, /Reading source does not need approval/u);
-  assert.match(text, /plain PowerShell built-in/u);
-  assert.match(text, /must not start\s+`node`, Electron/u);
-  assert.match(text, /A test writing into its own temporary directory is NOT a source commit/u);
-  assert.match(text, /worker implements/u);
-  assert.match(text, /your only operation is `delegate_wait`/u);
+test('the template keeps approval anchored on the concrete operation and forbids local edits', () => {
+  const text = templateText().replace(/\s+/gu, ' ');
+  assert.match(text, /inspect the complete concrete operation, paths and bounds/u);
+  assert.match(text, /Quote the exact `fingerprint`/u);
+  assert.match(text, /Each allow covers one call only/u);
+  assert.match(text, /Do not edit files or implement anything locally/u);
 });

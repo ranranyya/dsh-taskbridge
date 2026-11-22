@@ -36,6 +36,7 @@ import { discoverProviderModels } from '../model/discovery.js';
 import { checkProviderConnectivity } from '../model/connectivity.js';
 import { MAX_CREDENTIAL_VALUE_CHARS } from '../credentials/seam.js';
 import { CODEX_ACTIONS, publicCodexStatus, runCodexAction } from '../codex/installer.js';
+import { ANTIGRAVITY_ACTIONS, publicAntigravityStatus } from '../antigravity/installer.js';
 import { classifyError, HttpError, jsonResponse, readJsonRequest } from '../http/respond.js';
 import { sameRecordedDirectory } from '../jobs/continuation-identity.js';
 import { buildTaskTree } from '../jobs/task-tree.js';
@@ -817,6 +818,41 @@ export function userPlaneRoutes(deps) {
       },
     },
 
+    // ---- Antigravity integration -------------------------------------------
+    // Same authenticated operator plane contract as `/codex`:
+    //   GET  /antigravity — read-only diagnosis (never writes);
+    //   POST /antigravity — explicit `install`, `repair` or `remove`.
+    {
+      path: `${USER_PLANE_PREFIX}/antigravity`,
+      methods: ['GET', 'POST'],
+      requestBody: BODY_MODE,
+      fetch: async (request) => {
+        const method = String(request.method ?? 'GET').toUpperCase();
+        if (method === 'GET') {
+          const outcome = await runAntigravityIntegration(deps, 'status');
+          return jsonResponse(200, { ok: true, ...outcome });
+        }
+        if (method !== 'POST') return methodRefusal(request, ['GET', 'POST']);
+        const body = await readJsonRequest(request);
+        const action = typeof body.action === 'string' ? body.action.trim() : '';
+        if (!ANTIGRAVITY_ACTIONS.includes(action) || action === 'status') {
+          throw new HttpError(
+            400,
+            'ANTIGRAVITY_ACTION_INVALID',
+            `action must be one of ${ANTIGRAVITY_ACTIONS.filter((entry) => entry !== 'status').join(', ')}`,
+            { allowed: ANTIGRAVITY_ACTIONS.filter((entry) => entry !== 'status') },
+          );
+        }
+        const outcome = await runAntigravityIntegration(deps, action);
+        deps.logger?.info?.('dsh-delegate: Antigravity integration action applied', {
+          action,
+          changed: outcome.changed,
+          refused: outcome.refused.map((entry) => entry.code),
+        });
+        return jsonResponse(200, { ok: true, ...outcome });
+      },
+    },
+
     // ---- layered connectivity ---------------------------------------------
     // One provider per request. The report is the four-layer structure documented
     // in `docs/native-integration-audit.md`; a layer that was not attempted is
@@ -900,6 +936,42 @@ async function runCodexIntegration(deps, action) {
     // for the installer's own compare-before-write step.
     codex: redactDeep(publicCodexStatus(outcome?.status ?? {})),
     // Reported, never written: installing the agent must not authorize dispatch.
+    switch: {
+      authorized: switchPosture?.authorized === true,
+      mode: switchPosture?.mode ?? 'switch',
+      reason: switchPosture?.reason ?? null,
+      changedByThisAction: false,
+    },
+  };
+}
+
+async function runAntigravityIntegration(deps, action) {
+  const seam = deps.antigravity;
+  if (seam === null || seam === undefined || typeof seam.run !== 'function' || typeof seam.status !== 'function') {
+    throw new HttpError(
+      503,
+      'ANTIGRAVITY_INTEGRATION_UNAVAILABLE',
+      'this host does not expose the Antigravity integration, so nothing can be installed or reported',
+    );
+  }
+  let outcome;
+  try {
+    outcome = action === 'status' ? await seam.status() : await seam.run(action);
+  } catch (error) {
+    const code = typeof error?.code === 'string' ? error.code : 'ANTIGRAVITY_INTEGRATION_FAILED';
+    throw new HttpError(
+      code === 'ANTIGRAVITY_HOME_INVALID' ? 400 : code === 'ANTIGRAVITY_PATH_CONFLICT' ? 409 : 500,
+      code,
+      typeof error?.message === 'string' ? error.message : 'the Antigravity integration action failed',
+      error?.details !== undefined && error.details !== null ? error.details : {},
+    );
+  }
+  const switchPosture = typeof deps.engine?.posture === 'function' ? deps.engine.posture() : null;
+  return {
+    action,
+    changed: Array.isArray(outcome?.changed) ? outcome.changed : [],
+    refused: Array.isArray(outcome?.refused) ? outcome.refused : [],
+    antigravity: redactDeep(publicAntigravityStatus(outcome?.status ?? {})),
     switch: {
       authorized: switchPosture?.authorized === true,
       mode: switchPosture?.mode ?? 'switch',

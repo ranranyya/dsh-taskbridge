@@ -58,6 +58,7 @@ import { diagnostic } from './runtime/agent-runner.js';
 import { ensureWorkspace, SessionStore, liveControllerAccessor } from './runtime/session-placement.js';
 import { publishRuntimeEndpoint, resolveDefaultEndpointDiscoveryPath } from './runtime/endpoint-discovery.js';
 import { resolveCodexActionSeam } from './codex/seam.js';
+import { resolveAntigravityActionSeam } from './antigravity/seam.js';
 import { configureDelegatedSession, policyServicesOf } from './runtime/sandbox.js';
 import { PermissionBridge, PERMISSION_DEFAULT_TIMEOUT_MS } from './runtime/permissions.js';
 import { QuestionBridge } from './runtime/questions.js';
@@ -267,6 +268,9 @@ export async function apply(ctx, config = {}) {
       // always has a place to keep the original bytes.
       backupDir: join(dataDir, 'codex-config-backup'),
     }),
+    antigravity: resolveAntigravityActionSeam({
+      version: pluginVersion,
+    }),
     configureDelegatedSession,
     // `ctx.sandboxPolicy` and `ctx.approval` own the two facts the delegated
     // policy writes, so the runner reads them back through these live services
@@ -330,6 +334,27 @@ export async function apply(ctx, config = {}) {
     }
   } catch (error) {
     logger?.warn?.(`dsh-delegate: Codex integration refresh check failed (${diagnostic(error?.message ?? error, 200)})`);
+  }
+
+  try {
+    const agyTarget = await deps.antigravity?.startupTarget?.();
+    let agyMigration = null;
+    if (agyTarget?.home) {
+      agyMigration = await deps.antigravity?.refreshManagedIntegration({ startupTarget: agyTarget });
+    } else if (agyTarget !== undefined && agyTarget !== null) {
+      logger?.info?.(`dsh-delegate: Antigravity integration check skipped (${agyTarget.reason})`);
+    }
+    if (agyMigration?.changed.includes('plugin')) {
+      logger?.info?.(`dsh-delegate: refreshed a managed Antigravity plugin bundle to ${pluginVersion}`);
+    }
+    if (agyMigration?.changed.includes('mcp')) {
+      logger?.info?.('dsh-delegate: upgraded a stale managed Antigravity MCP entry in place');
+    }
+    for (const refusal of agyMigration?.refused ?? []) {
+      logger?.warn?.(`dsh-delegate: Antigravity integration refresh was refused (${refusal.code})`);
+    }
+  } catch (error) {
+    logger?.warn?.(`dsh-delegate: Antigravity integration refresh check failed (${diagnostic(error?.message ?? error, 200)})`);
   }
 
   /**

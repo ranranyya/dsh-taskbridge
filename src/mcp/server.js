@@ -2,7 +2,7 @@
 //
 // Design rule taken from SPEC §10–11: an external MCP client may *exercise* an
 // authorization the operator already created, and may do nothing else. So this
-// server exposes eight tools and maps each one onto one execution-plane route:
+// server exposes eleven tools and maps each execution tool onto one execution-plane route:
 //
 //   delegate_status            → GET  /dsh-delegate/x/status
 //   delegate_submit            → POST /dsh-delegate/x/tasks
@@ -10,8 +10,11 @@
 //   delegate_wait              → POST /dsh-delegate/x/tasks/observe  (repeated)
 //   delegate_cancel            → POST /dsh-delegate/x/tasks/cancel
 //   delegate_permission_decide → POST /dsh-delegate/x/tasks/permission
+//   delegate_question_answer   → POST /dsh-delegate/x/tasks/question
 //   delegate_review            → POST /dsh-delegate/x/tasks/review
+//   delegate_plan              → POST /dsh-delegate/x/plans
 //   delegate_preflight         → POST /dsh-delegate/x/workspace/preflight
+//   delegate_metrics           → local process census (no plane route)
 //
 // `delegate_wait` is a read like `delegate_result`, and it is the one tool whose
 // single call may take a long time: it composes several BOUNDED observation

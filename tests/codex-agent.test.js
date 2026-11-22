@@ -278,10 +278,12 @@ test('the shipped companion states the normal wait contract: omit waitSeconds, s
   assert.match(template, /cannot\s+wait longer than that/u);
   // A short explicit wait stays legal, but only for a requested one-off diagnostic.
   assert.match(template, /one-off diagnostic the\s+operator explicitly asked for/u);
-  // `attention` is the NO-PROGRESS interval — not an ordinary wait ending, and not a
+  // `attention` is the delivery progress-check interval — not an ordinary wait ending, and not a
   // function of how long the task has been running.
-  assert.match(template, /It is NOT reported because the task\s+has been running a long time/u);
-  assert.match(template, /A task that keeps working\s+for hours never produces\s+this/u);
+  assert.match(template, /It is NOT reported because the\s+task has been running a long time/u);
+  assert.match(template, /nothing new has been\s+delivered back to the host/u);
+  assert.match(template, /operator-configured progress-check interval/u);
+  assert.match(template, /do NOT reset the delivery\s+clock/u);
   assert.doesNotMatch(template, /OR the wait ended because the run\s+is still going/u);
   // `wait-limit` is non-actionable; a client-side timeout proves nothing about the run.
   assert.match(template, /`actionable: false` and `terminal: false`/u);
@@ -327,7 +329,7 @@ test('the shipped companion names the five different expiry and reminder kinds, 
   // interval; (d) the repeated-failure reminder; (e) an EXPLICIT per-job cap.
   assert.match(shipped, /`wait-limit` — THIS call's own wait budget ran out/u);
   assert.match(shipped, /An OUTER limit — your client handed the call back/u);
-  assert.match(shipped, /`attention` — the run produced NO REAL PROGRESS/u);
+  assert.match(shipped, /`attention` — the run progress check/u);
   assert.match(shipped, /repeated-tool-failure reminder/u);
   assert.match(shipped, /There is NO default total execution timeout/u);
   // There is exactly ONE notification interval: no third scheduled cadence.
