@@ -3904,6 +3904,7 @@ export class JobEngine {
         taskId: task.taskId,
         connectionId: task.connectionId,
         sourcePath: task.sourcePath,
+        isolation: task.effective?.worker?.isolation ?? null,
         // Worker sessions are writable only inside their current DSH workspace.
         // Wider sandbox requests are refused when no bridge is armed, and decided
         // per call by the commander when one is. The services that own both facts

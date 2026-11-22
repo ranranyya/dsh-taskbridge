@@ -129,9 +129,11 @@ import {
 import { registerSessionRowMarker } from './workspaces-browser.jsx';
 import {
   cleanupCandidates,
+  cleanupConfirmText,
   cleanupProjection,
   cleanupSelectionSummary,
   cleanupWarningText,
+  selectCleanupCandidatesByPreset,
   toggleCleanupSelection,
   withSelectionState,
 } from './task-cleanup.js';
@@ -1510,12 +1512,15 @@ function PresetsCard({ store, snapshot }) {
 }
 
 /**
- * Monitoring controls: the two no-progress reminders and the repeated-failure reminder.
+ * Monitoring controls: the start-elapsed local self-check, the commander delivery
+ * progress check, and the repeated-failure reminder.
  *
- * There is exactly ONE time base — consecutive time without real progress — and TWO
- * duration controls on it: the local self-check (default 10 minutes) and the run progress
- * check reported to the dispatcher (default 40 minutes). A task that keeps working never
- * reaches either, whatever its total runtime; a run's length is never itself a reminder.
+ * `selfCheckSeconds` runs one read-only local inspection after execution starts
+ * (default 10 minutes; active work does not postpone it). `attentionSeconds` reports a
+ * run progress check to the commander when nothing new has been returned for that span
+ * (default 40 minutes; internal activity, heartbeats, and self-checks do not reset it).
+ * Neither reminder is a total-runtime cap and neither can cancel, restart, or resubmit
+ * a task.
  *
  * What this card deliberately does NOT do: it does not submit work, does not read a
  * task, does not call a model, and does not create a monitoring process of its own. It
@@ -1808,7 +1813,7 @@ function ExecutionPanel({ store, snapshot }) {
             store.editDraft((current) => { current.worker.maxParallelism = value; });
           }}
         />
-        <Field label="工作区隔离" htmlFor="dshdg-worker-isolation" hint="默认独立工作树；共享工作区需要你明确选择。">
+        <Field label="工作区隔离" htmlFor="dshdg-worker-isolation" hint="默认独立工作树；共享工作区需要你明确选择。两种模式均要求目标目录为已初始化且至少有 1 次 commit 的 Git 仓库根目录。">
           <select
             id="dshdg-worker-isolation"
             value={worker.isolation ?? ISOLATION_MODES[0]}
@@ -2642,6 +2647,7 @@ function TaskTreeItem({ node, store, snapshot, collapsed, setCollapsed, expanded
 }
 
 function TaskTreePanel({ store, snapshot, onOpen }) {
+  const nav = useContext(SessionNavigation);
   const view = snapshot.tree ?? null;
   const [recordView, setRecordView] = useState('recent');
   const [collapsed, setCollapsed] = useState(() => new Set());
@@ -2658,6 +2664,11 @@ function TaskTreePanel({ store, snapshot, onOpen }) {
   const [cleanupMode, setCleanupMode] = useState(false);
   const [cleanupSelection, setCleanupSelection] = useState({});
   const [cleanupConfirm, setCleanupConfirm] = useState(false);
+  const [cleanupOptions, setCleanupOptions] = useState({
+    archiveSessions: false,
+    removeWorktrees: false,
+    cleanPlans: false,
+  });
   if (view === null) {
     return <p className="dshdg-faint" data-dshdg-tree-unavailable="">
       {snapshot.tasksError ? '任务树读取失败，下面显示已有记录。' : '当前宿主按列表显示任务。'}
@@ -2680,13 +2691,27 @@ function TaskTreePanel({ store, snapshot, onOpen }) {
     : groups.flatMap((group) => group.roots);
   const candidates = cleanupCandidates({ roots });
   const canCleanup = view.cleanupAvailable === true && (view.counts?.taskChains ?? 0) > 0;
+  const canSweepOrphans = view.cleanupAvailable === true && typeof store?.cleanupOrphans === 'function';
   const cleanupActive = cleanupMode && canCleanup;
   const cleanupBusy = snapshot.loading?.cleanup === true;
+  const orphanSweepBusy = snapshot.loading?.cleanupOrphans === true;
   const summary = cleanupSelectionSummary(cleanupSelection, candidates);
   const mayDelete = dateError === null && !cleanupBusy && summary.executable;
   function clearSelection() {
     setCleanupSelection({});
     setCleanupConfirm(false);
+  }
+  function applyPresetSelection(preset) {
+    setCleanupSelection(selectCleanupCandidatesByPreset(candidates, preset));
+    setCleanupConfirm(false);
+  }
+  function toggleCleanupOption(key) {
+    setCleanupOptions((prev) => ({ ...prev, [key]: !prev[key] }));
+    setCleanupConfirm(false);
+  }
+  async function runOrphanSweep() {
+    if (orphanSweepBusy || cleanupBusy) return;
+    await store.cleanupOrphans({ hostWorkspaces: nav?.workspaces });
   }
   const updateFilter = (setter) => (event) => {
     setter(event.target.value);
@@ -2708,6 +2733,7 @@ function TaskTreePanel({ store, snapshot, onOpen }) {
   function leaveCleanup() {
     setCleanupMode(false);
     clearSelection();
+    setCleanupOptions({ archiveSessions: false, removeWorktrees: false, cleanPlans: false });
   }
   function onToggleChain(candidate) {
     setCleanupSelection((old) => toggleCleanupSelection(old, withSelectionState(candidate, old[candidate.chainId])));
@@ -2715,7 +2741,10 @@ function TaskTreePanel({ store, snapshot, onOpen }) {
   }
   async function confirmCleanup() {
     if (!mayDelete) return;
-    const result = await store.cleanupTasks(cleanupSelection);
+    const result = await store.cleanupTasks(cleanupSelection, {
+      ...cleanupOptions,
+      hostWorkspaces: nav?.workspaces,
+    });
     if (result.ok) leaveCleanup();
     setCleanupConfirm(false);
   }
@@ -2772,6 +2801,17 @@ function TaskTreePanel({ store, snapshot, onOpen }) {
             项目树
           </button>
         </div>
+        {canSweepOrphans ? (
+          <button
+            type="button"
+            data-dshdg-cleanup-orphans=""
+            disabled={orphanSweepBusy || cleanupBusy}
+            title="扫描并清理任务记录已删除后残留的隔离工作树目录、DSH 临时工作区及已删记录对应的派工对话（绝不触碰共享工作区与源码）"
+            onClick={() => { void runOrphanSweep(); }}
+          >
+            {orphanSweepBusy ? '正在清理残留…' : '清理残留工作区与对话'}
+          </button>
+        ) : null}
         {canCleanup ? (
           <button
             type="button"
@@ -2830,6 +2870,65 @@ function TaskTreePanel({ store, snapshot, onOpen }) {
           <p className="dshdg-hint" data-dshdg-cleanup-counts="">
             {`已选 ${summary.chains} 条执行链 / 共 ${summary.rounds} 轮`}
           </p>
+          <div className="dshdg-row" data-dshdg-cleanup-presets="">
+            <span className="dshdg-hint">快捷选择（当前筛选视图）：</span>
+            <button
+              type="button"
+              data-dshdg-cleanup-preset="all"
+              disabled={cleanupBusy}
+              onClick={() => applyPresetSelection('all')}
+            >
+              全选可清理
+            </button>
+            <button
+              type="button"
+              data-dshdg-cleanup-preset="accepted"
+              disabled={cleanupBusy}
+              onClick={() => applyPresetSelection('accepted')}
+            >
+              全选已审查通过
+            </button>
+            <button
+              type="button"
+              data-dshdg-cleanup-preset="failed-cancelled"
+              disabled={cleanupBusy}
+              onClick={() => applyPresetSelection('failed-cancelled')}
+            >
+              全选已失败/已取消
+            </button>
+          </div>
+          <div className="dshdg-cleanup-options" data-dshdg-cleanup-options="">
+            <label className="dshdg-check">
+              <input
+                type="checkbox"
+                data-dshdg-cleanup-opt="archiveSessions"
+                checked={cleanupOptions.archiveSessions}
+                disabled={cleanupBusy}
+                onChange={() => toggleCleanupOption('archiveSessions')}
+              />
+              <span>同时归档对应的 DSH 派工对话（共享与隔离模式均适用，不影响你自己的普通对话）</span>
+            </label>
+            <label className="dshdg-check">
+              <input
+                type="checkbox"
+                data-dshdg-cleanup-opt="removeWorktrees"
+                checked={cleanupOptions.removeWorktrees}
+                disabled={cleanupBusy}
+                onChange={() => toggleCleanupOption('removeWorktrees')}
+              />
+              <span>同时删除隔离任务的工作树目录与 DSH 临时工作区（仅作用于独立工作树，绝不删除共享工作区与源文件）</span>
+            </label>
+            <label className="dshdg-check">
+              <input
+                type="checkbox"
+                data-dshdg-cleanup-opt="cleanPlans"
+                checked={cleanupOptions.cleanPlans}
+                disabled={cleanupBusy}
+                onChange={() => toggleCleanupOption('cleanPlans')}
+              />
+              <span>同时清理已无关联任务的空规划节点</span>
+            </label>
+          </div>
           {cleanupConfirm ? null : <p className="dshdg-warn">{cleanupWarningText()}</p>}
           {Object.keys(cleanupSelection).length === 0 ? null : summary.problems.map((problem) => (
             <p className="dshdg-warn" role="alert" key={problem} data-dshdg-cleanup-problem="">{problem}</p>
@@ -2837,7 +2936,7 @@ function TaskTreePanel({ store, snapshot, onOpen }) {
           {cleanupConfirm ? (
             <div className="dshdg-row" data-dshdg-cleanup-confirm-dialog="" role="alertdialog" aria-label="确认永久删除记录">
               <span>
-                {`确认永久删除 ${summary.chains} 条执行链、共 ${summary.rounds} 轮的任务记录及审查意见？删除后无法按任务编号查询或续接。DSH 会话、工作区与源文件不会被删除。`}
+                {cleanupConfirmText(summary, cleanupOptions)}
               </span>
               <button
                 type="button"
@@ -3678,9 +3777,11 @@ export {
 };
 
 export {
+  CLEANUP_PRESETS,
   MAX_CLEANUP_CHAINS,
   cleanupBlockerLabel,
   cleanupCandidates,
+  cleanupConfirmText,
   cleanupOutcome,
   cleanupProjection,
   cleanupRequest,
@@ -3688,7 +3789,9 @@ export {
   cleanupSelectionSummary,
   cleanupWarningText,
   describeCleanupOutcome,
+  describeOrphanCleanupOutcome,
   pruneCleanupSelection,
+  selectCleanupCandidatesByPreset,
   toggleCleanupSelection,
   withSelectionState,
 } from './task-cleanup.js';

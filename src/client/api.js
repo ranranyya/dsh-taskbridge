@@ -33,9 +33,11 @@
 // `createStore`'s caller in `index.jsx` to `cleanupProjection()`).
 export {
   CLEANUP_BLOCKER_LABELS,
+  CLEANUP_PRESETS,
   MAX_CLEANUP_CHAINS,
   cleanupBlockerLabel,
   cleanupCandidates,
+  cleanupConfirmText,
   cleanupOutcome,
   cleanupProjection,
   cleanupRequest,
@@ -43,7 +45,9 @@ export {
   cleanupSelectionSummary,
   cleanupWarningText,
   describeCleanupOutcome,
+  describeOrphanCleanupOutcome,
   pruneCleanupSelection,
+  selectCleanupCandidatesByPreset,
   toggleCleanupSelection,
   withSelectionState,
 } from './task-cleanup.js';
@@ -96,6 +100,7 @@ export const ROUTES = Object.freeze({
   // execution chains. It is a `POST`, never a load-time or refresh-time write, and it
   // only ever names chains and their exact rounds.
   tasksCleanup: `${USER_PLANE_PREFIX}/tasks/cleanup`,
+  tasksCleanupOrphans: `${USER_PLANE_PREFIX}/tasks/cleanup-orphans`,
   // The one planning write the page has: a batch of planning nodes. It creates
   // records only — it cannot dispatch, authorize or review anything.
   plans: `${USER_PLANE_PREFIX}/plans`,
@@ -357,7 +362,17 @@ export function createApi(options = {}) {
      */
     async cleanupTasks(body) {
       const chains = Array.isArray(body?.chains) ? body.chains : [];
-      return await request('POST', ROUTES.tasksCleanup, { confirm: true, chains });
+      const payload = { confirm: true, chains };
+      if (body?.archiveSessions === true) payload.archiveSessions = true;
+      if (body?.removeWorktrees === true) payload.removeWorktrees = true;
+      if (body?.cleanPlans === true) payload.cleanPlans = true;
+      return await request('POST', ROUTES.tasksCleanup, payload);
+    },
+    async cleanupOrphans(options = {}) {
+      const payload = { confirm: true };
+      if (typeof options?.archiveSessions === 'boolean') payload.archiveSessions = options.archiveSessions;
+      if (typeof options?.removeWorktrees === 'boolean') payload.removeWorktrees = options.removeWorktrees;
+      return await request('POST', ROUTES.tasksCleanupOrphans, payload);
     },
     /**
      * Create a batch of planning nodes.
@@ -3786,10 +3801,10 @@ export function createStore(options = {}) {
     },
 
     /** Remove a confirmed selection whose exact rounds still match the current tree. */
-    async cleanupTasks(selection) {
+    async cleanupTasks(selection, options = {}) {
       const view = cleanup;
       const candidates = view.candidates(state.tree ?? null);
-      const prepared = view.request(selection ?? {}, candidates);
+      const prepared = view.request(selection ?? {}, candidates, options);
       if (prepared.problems.length > 0) {
         notify('error', prepared.problems[0]);
         return { ok: false, error: new ApiError('CLEANUP_INVALID', prepared.problems[0]) };
@@ -3797,6 +3812,9 @@ export function createStore(options = {}) {
       return await track('cleanup', async () => {
         try {
           const outcome = await api.cleanupTasks(prepared.body);
+          if (outcome?.cleaned && options?.hostWorkspaces) {
+            await reconcileHostWorkspacesWithCleaned(options.hostWorkspaces, outcome.cleaned);
+          }
           const deleted = view.outcome(outcome);
           const sentence = view.describe(outcome);
           if (sentence === '') throw new ApiError('CLEANUP_RESULT_UNCONFIRMED', '宿主未确认删除结果');
@@ -3822,6 +3840,34 @@ export function createStore(options = {}) {
       });
     },
 
+    /** Sweep residual worktrees and dispatched sessions whose task records were already removed. */
+    async cleanupOrphans(options = {}) {
+      if (typeof api.cleanupOrphans !== 'function') {
+        notify('error', '当前宿主未提供残留清理接口。');
+        return { ok: false };
+      }
+      return await track('cleanupOrphans', async () => {
+        try {
+          const outcome = await api.cleanupOrphans({
+            archiveSessions: options?.archiveSessions !== false,
+            removeWorktrees: options?.removeWorktrees !== false,
+          });
+          if (outcome?.cleaned && options?.hostWorkspaces) {
+            await reconcileHostWorkspacesWithCleaned(options.hostWorkspaces, outcome.cleaned);
+          }
+          const sentence = typeof cleanup.describeOrphans === 'function'
+            ? cleanup.describeOrphans(outcome)
+            : '已完成残留隔离工作树与已删记录派工对话清理。';
+          notify('success', sentence || '已完成残留清理。');
+          await store.refreshTasks('manual');
+          return { ok: true, outcome };
+        } catch (error) {
+          notify('error', describeError(error));
+          return { ok: false, error };
+        }
+      });
+    },
+
     /** Load everything the page needs; the catalog is loaded but not awaited. */
     async init() {
       await Promise.all([store.refreshStatus(), store.loadSettings(), store.loadNativeProviders(), store.loadTasks()]);
@@ -3842,4 +3888,78 @@ export function createStore(options = {}) {
   };
 
   return store;
+}
+
+function normalizeClientPathKey(pathValue) {
+  if (typeof pathValue !== 'string') return '';
+  const trimmed = pathValue.trim().replace(/[\\/]+$/u, '');
+  return trimmed.toLowerCase();
+}
+
+async function reconcileHostWorkspacesWithCleaned(hostWorkspacesOrGetter, cleaned) {
+  if (!cleaned || typeof cleaned !== 'object') return;
+  let wsService = null;
+  try {
+    wsService = typeof hostWorkspacesOrGetter === 'function' ? hostWorkspacesOrGetter() : hostWorkspacesOrGetter;
+  } catch {
+    wsService = null;
+  }
+  if (!wsService || typeof wsService !== 'object') return;
+
+  if (typeof wsService.archiveSession === 'function' && Array.isArray(cleaned.archivedSessionIds)) {
+    for (const sessionId of cleaned.archivedSessionIds) {
+      if (typeof sessionId === 'string' && sessionId !== '') {
+        try {
+          await wsService.archiveSession(sessionId);
+        } catch {
+          // Best-effort client-side session archive.
+        }
+      }
+    }
+  }
+
+  let snapshot = null;
+  try {
+    snapshot = wsService.list?.getSnapshot?.() ?? null;
+  } catch {
+    snapshot = null;
+  }
+  const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
+  const itemById = new Map();
+  for (const item of items) {
+    if (typeof item?.workspaceId === 'string' && item.workspaceId !== '') {
+      itemById.set(item.workspaceId, item);
+    }
+  }
+
+  const removedWorkspaceIds = Array.isArray(cleaned.removedWorkspaceIds) ? cleaned.removedWorkspaceIds : [];
+  const workspaceSet = new Set(removedWorkspaceIds);
+
+  if (Array.isArray(cleaned.removedWorktreePaths) && cleaned.removedWorktreePaths.length > 0 && items.length > 0) {
+    const removedPathKeys = new Set(cleaned.removedWorktreePaths.map(normalizeClientPathKey).filter(Boolean));
+    for (const item of items) {
+      const key = normalizeClientPathKey(item?.path);
+      if (key !== '' && removedPathKeys.has(key) && typeof item.workspaceId === 'string' && !workspaceSet.has(item.workspaceId)) {
+        workspaceSet.add(item.workspaceId);
+        removedWorkspaceIds.push(item.workspaceId);
+      }
+    }
+    cleaned.removedWorkspaceIds = removedWorkspaceIds;
+  }
+
+  if (typeof wsService.delete === 'function' && removedWorkspaceIds.length > 0) {
+    for (const workspaceId of removedWorkspaceIds) {
+      if (typeof workspaceId !== 'string' || workspaceId === '') continue;
+      const item = itemById.get(workspaceId) ?? null;
+      if (item !== null && typeof item.path === 'string' && /[\\/]worktrees[\\/]*$/iu.test(item.path.trim())) {
+        // Never remove the parent TaskBridge worktrees root container workspace itself.
+        continue;
+      }
+      try {
+        await wsService.delete(workspaceId);
+      } catch {
+        // Best-effort client-side workspace removal.
+      }
+    }
+  }
 }

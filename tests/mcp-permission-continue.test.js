@@ -1122,7 +1122,7 @@ test('returned bytes are the FINAL tool text, measured once by the server', asyn
   // The census answer is the SECOND return. Its own final text is measured here
   // independently — by re-rendering the payload the server published — so the assertion is
   // against two real texts, never against the answer's own claim about itself.
-  const censusBytes = Buffer.byteLength(JSON.stringify({ ok: true, metrics: census }, null, 2), 'utf8');
+  const censusBytes = Buffer.byteLength(JSON.stringify({ ok: true, metrics: census }), 'utf8');
   assert.equal(census.returnedText.unit, 'utf8-bytes-of-serialized-tool-text');
   assert.equal(census.returnedText.count, 1,
     'the census is built before its own text exists, so it counts the decision answer only');
@@ -1131,7 +1131,7 @@ test('returned bytes are the FINAL tool text, measured once by the server', asyn
     'the total equals the final tool text, measured with Buffer.byteLength');
   // The next read DOES include the previous census answer: the count is of real returns.
   const second = (await call(server, 'delegate_metrics', {})).body.metrics;
-  const secondBytes = Buffer.byteLength(JSON.stringify({ ok: true, metrics: second }, null, 2), 'utf8');
+  const secondBytes = Buffer.byteLength(JSON.stringify({ ok: true, metrics: second }), 'utf8');
   assert.equal(second.returnedText.count, 2);
   assert.equal(second.returnedText.bytes, firstBytes + censusBytes,
     'and the total is now exactly the sum of both final texts');

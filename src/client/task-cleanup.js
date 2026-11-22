@@ -95,6 +95,12 @@ export function cleanupCandidates(view) {
         parentNodeId: typeof chain.parentNodeId === 'string' ? chain.parentNodeId : null,
         nodeId: typeof node?.nodeId === 'string' ? node.nodeId : null,
         nodeKind: typeof node?.kind === 'string' ? node.kind : 'unknown',
+        nodeStatus: typeof chain.nodeStatus === 'string'
+          ? chain.nodeStatus
+          : (typeof node?.nodeStatus === 'string' ? node.nodeStatus : null),
+        isolation: typeof chain.isolation === 'string'
+          ? chain.isolation
+          : (Array.isArray(chain.rounds) && typeof chain.rounds[0]?.isolation === 'string' ? chain.rounds[0].isolation : null),
         selectable,
         blockers,
         reason: selectable
@@ -179,6 +185,49 @@ export function toggleCleanupSelection(selection, candidate) {
 }
 
 /**
+ * Which status group one preset shortcut selects.
+ *
+ * `all` takes every selectable chain of the current view, `accepted` only the chains
+ * the host marked `accepted`, and `failed-cancelled` the chains that ended badly:
+ * `failed`, `cancelled`, and `interrupted` (a chain a host restart left in a terminal
+ * state no round can resume).
+ */
+export const CLEANUP_PRESETS = Object.freeze(['all', 'accepted', 'failed-cancelled']);
+
+/**
+ * Batch-select up to {@link MAX_CLEANUP_CHAINS} selectable candidates matching a preset,
+ * optionally restricted to the chains currently visible under the active UI filters.
+ * @param {object[]} candidates - entries from {@link cleanupCandidates}.
+ * @param {'all'|'accepted'|'failed-cancelled'} [preset] - which status group to select.
+ * @param {Set<string>|string[]|null} [visibleChainIds] - optional visible chain id filter.
+ * @returns {object} `{ [chainId]: taskIds }` selection map.
+ */
+export function selectCleanupCandidatesByPreset(candidates, preset = 'all', visibleChainIds = null) {
+  const visibleSet = visibleChainIds instanceof Set
+    ? visibleChainIds
+    : (Array.isArray(visibleChainIds) ? new Set(visibleChainIds) : null);
+  const next = {};
+  let count = 0;
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    if (count >= MAX_CLEANUP_CHAINS) break;
+    if (candidate === null || typeof candidate !== 'object' || candidate.selectable !== true) continue;
+    if (visibleSet !== null && !visibleSet.has(candidate.chainId)) continue;
+    if (preset === 'accepted' && candidate.nodeStatus !== 'accepted') continue;
+    if (
+      preset === 'failed-cancelled'
+      && candidate.nodeStatus !== 'failed'
+      && candidate.nodeStatus !== 'cancelled'
+      && candidate.nodeStatus !== 'interrupted'
+    ) {
+      continue;
+    }
+    next[candidate.chainId] = candidate.taskIds.slice();
+    count += 1;
+  }
+  return next;
+}
+
+/**
  * What the confirmation says BEFORE anything is sent.
  *
  * The numbers are computed from the selection and the current tree, so the text can
@@ -222,16 +271,20 @@ export function cleanupSelectionSummary(selection, candidates) {
  * @param {object[]} candidates - current candidates.
  * @returns {{ body: { chains: Array<{ chainId: string, taskIds: string[] }> }, problems: string[] }} request.
  */
-export function cleanupRequest(selection, candidates) {
+export function cleanupRequest(selection, candidates, options = {}) {
   const byId = new Map(candidates.map((candidate) => [candidate.chainId, candidate]));
   const summary = cleanupSelectionSummary(selection, candidates);
   if (!summary.executable) return { body: { chains: [] }, problems: summary.problems };
   const chains = [];
-  for (const [chainId, ids] of Object.entries(selection)) {
+  for (const [chainId] of Object.entries(selection)) {
     const candidate = byId.get(chainId);
     chains.push({ chainId: candidate.chainId, taskIds: candidate.taskIds.slice() });
   }
-  return { body: { chains }, problems: [] };
+  const body = { chains };
+  if (options?.archiveSessions === true) body.archiveSessions = true;
+  if (options?.removeWorktrees === true) body.removeWorktrees = true;
+  if (options?.cleanPlans === true) body.cleanPlans = true;
+  return { body, problems: [] };
 }
 
 /**
@@ -272,8 +325,76 @@ export function cleanupOutcome(outcome) {
 export function describeCleanupOutcome(outcome) {
   const summary = cleanupOutcome(outcome);
   if (summary.chains === 0 && summary.rounds === 0) return '';
+  const cleaned = outcome?.cleaned ?? null;
+  const retained = outcome?.retained ?? null;
+  const hasLinkedOption = cleaned !== null
+    || (retained !== null && (
+      retained.sessions === false
+      || retained.worktrees === false
+      || retained.workspaces === false
+      || retained.plans === false
+    ));
+  if (!hasLinkedOption) {
+    return `已永久删除 ${summary.chains} 条执行链、共 ${summary.rounds} 轮的任务记录与审查意见；`
+      + 'DSH 会话、工作区与源文件均未删除。';
+  }
+  const archivedCount = Array.isArray(cleaned?.archivedSessionIds) ? cleaned.archivedSessionIds.length : 0;
+  const worktreeCount = Array.isArray(cleaned?.removedWorktreePaths) ? cleaned.removedWorktreePaths.length : 0;
+  const workspaceCount = Array.isArray(cleaned?.removedWorkspaceIds) ? cleaned.removedWorkspaceIds.length : 0;
+  const planCount = Array.isArray(cleaned?.removedPlanNodeIds) ? cleaned.removedPlanNodeIds.length : 0;
+  const extras = [];
+  if (archivedCount > 0) extras.push(`归档 ${archivedCount} 个派工对话`);
+  if (worktreeCount > 0) extras.push(`清理 ${worktreeCount} 个隔离工作树`);
+  if (workspaceCount > 0) extras.push(`移除 ${workspaceCount} 个临时工作区`);
+  if (planCount > 0) extras.push(`清理 ${planCount} 个空规划节点`);
+  const linkedClause = extras.length > 0
+    ? `同步${extras.join('、')}；`
+    : '无额外需归档的派工对话或隔离工作树；';
   return `已永久删除 ${summary.chains} 条执行链、共 ${summary.rounds} 轮的任务记录与审查意见；`
-    + 'DSH 会话、工作区与源文件均未删除。';
+    + `${linkedClause}主项目源文件与共享工作区均未删除。`;
+}
+
+/**
+ * Plain-Chinese description of one completed orphan worktree/session sweep.
+ * @param {object | null} outcome - the host's orphan cleanup body.
+ * @returns {string} summary sentence.
+ */
+export function describeOrphanCleanupOutcome(outcome) {
+  if (outcome === null || typeof outcome !== 'object') return '';
+  const cleaned = outcome.cleaned ?? {};
+  const archivedCount = Array.isArray(cleaned.archivedSessionIds) ? cleaned.archivedSessionIds.length : 0;
+  const worktreeCount = Array.isArray(cleaned.removedWorktreePaths) ? cleaned.removedWorktreePaths.length : 0;
+  const workspaceCount = Array.isArray(cleaned.removedWorkspaceIds) ? cleaned.removedWorkspaceIds.length : 0;
+  const forgottenCount = Number.isFinite(outcome.orphanSessionsForgotten) ? outcome.orphanSessionsForgotten : 0;
+  if (archivedCount === 0 && worktreeCount === 0 && workspaceCount === 0 && forgottenCount === 0) {
+    return '未发现残留的隔离工作树或已删记录的派工对话；主项目源文件与共享工作区均未改动。';
+  }
+  const parts = [];
+  if (archivedCount > 0) parts.push(`归档 ${archivedCount} 个已删记录的派工对话`);
+  else if (forgottenCount > 0) parts.push(`清理 ${forgottenCount} 条残留会话映射`);
+  if (worktreeCount > 0) parts.push(`清理 ${worktreeCount} 个残留隔离工作树`);
+  if (workspaceCount > 0) parts.push(`移除 ${workspaceCount} 个临时工作区`);
+  return `已完成残留清理：${parts.join('、')}；主项目源文件与共享工作区均未删除。`;
+}
+
+/**
+ * Build the confirmation dialog text before deletion is executed.
+ * @param {{ chains: number, rounds: number }} summary - selection counts.
+ * @param {{ archiveSessions?: boolean, removeWorktrees?: boolean, cleanPlans?: boolean }} [options] - linked cleanup choices.
+ * @returns {string} confirmation sentence.
+ */
+export function cleanupConfirmText(summary, options = {}) {
+  const archiveSessions = options?.archiveSessions === true;
+  const removeWorktrees = options?.removeWorktrees === true;
+  const cleanPlans = options?.cleanPlans === true;
+  if (!archiveSessions && !removeWorktrees && !cleanPlans) {
+    return `确认永久删除 ${summary.chains} 条执行链、共 ${summary.rounds} 轮的任务记录及审查意见？删除后无法按任务编号查询或续接。DSH 会话、工作区与源文件不会被删除。`;
+  }
+  const linked = [];
+  if (archiveSessions) linked.push('归档对应的 DSH 派工对话（不影响你自己的普通对话）');
+  if (removeWorktrees) linked.push('删除隔离任务的工作树目录与临时工作区（共享工作区绝不删除）');
+  if (cleanPlans) linked.push('清理已无关联任务的空规划节点');
+  return `确认永久删除 ${summary.chains} 条执行链、共 ${summary.rounds} 轮的任务记录及审查意见，并同时${linked.join('、')}？删除后无法按任务编号查询或续接；主项目源文件与共享工作区不会被删除。`;
 }
 
 /**
@@ -286,7 +407,7 @@ export function cleanupWarningText() {
 
 /**
  * A detached copy of the projection, for one caller that must not see bindings change.
- * @returns {object} the seven functions plus the bound.
+ * @returns {object} the projection functions plus the bound.
  */
 export function cleanupProjection() {
   return {
@@ -294,11 +415,15 @@ export function cleanupProjection() {
     request: cleanupRequest,
     outcome: cleanupOutcome,
     describe: describeCleanupOutcome,
+    describeOrphans: describeOrphanCleanupOutcome,
+    confirmText: cleanupConfirmText,
+    selectByPreset: selectCleanupCandidatesByPreset,
     selectionSummary: cleanupSelectionSummary,
     prune: pruneCleanupSelection,
     toggle: toggleCleanupSelection,
     blockerLabel: cleanupBlockerLabel,
     warning: cleanupWarningText,
     MAX_CHAINS: MAX_CLEANUP_CHAINS,
+    PRESETS: CLEANUP_PRESETS,
   };
 }

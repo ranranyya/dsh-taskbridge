@@ -42,7 +42,7 @@ import { sameRecordedDirectory } from '../jobs/continuation-identity.js';
 import { buildTaskTree } from '../jobs/task-tree.js';
 import { findDisplayNode } from '../jobs/task-display.js';
 import { MAX_PLAN_BATCH, PLAN_CODES } from '../jobs/plan-store.js';
-import { cleanupOverview, runCleanup } from '../jobs/record-cleanup.js';
+import { cleanupOverview, runCleanup, runOrphanCleanup } from '../jobs/record-cleanup.js';
 
 /**
  * Route prefix, already below `/api` because the native exact-route registry
@@ -591,6 +591,16 @@ export function userPlaneRoutes(deps) {
       fetch: async (request) => {
         const body = await readJsonRequest(request);
         const outcome = await runCleanup(deps, body);
+        return jsonResponse(200, { ok: true, ...outcome });
+      },
+    },
+    {
+      path: `${USER_PLANE_PREFIX}/tasks/cleanup-orphans`,
+      methods: ['POST'],
+      requestBody: BODY_MODE,
+      fetch: async (request) => {
+        const body = await readJsonRequest(request);
+        const outcome = await runOrphanCleanup(deps, body);
         return jsonResponse(200, { ok: true, ...outcome });
       },
     },

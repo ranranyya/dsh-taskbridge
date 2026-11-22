@@ -167,18 +167,31 @@ const SETTLED_STATE_REASONS = Object.freeze({
 });
 
 /**
+ * Fields dropped from `compactTask` during an interactive pause (`permission` / `question`).
+ * The host only needs the task identity and live pending request/question to decide and continue;
+ * repeating static routing, monitoring history, and empty review persistence on every approval
+ * turn wastes commander context tokens. All of them remain present on `attention`, terminal
+ * returns, and `delegate_result`.
+ */
+const INTERACTIVE_PAUSE_DROP = new Set(['route', 'hostAcceptance']);
+
+/**
  * Compact one observation's task view into what a wait answer carries.
  *
  * Anything not named in {@link TASK_FIELDS} is dropped, which is what keeps a wait
  * answer small and keeps a diff from reaching a host through the one tool that is
  * supposed to be cheap.
  * @param {object | null | undefined} task - observation `task`.
+ * @param {{ interactivePause?: boolean }} [options] - `interactivePause`: omit bulky monitoring
+ *   and static routing fields on live `permission` / `question` turns.
  * @returns {object} the compact task.
  */
-export function compactTask(task) {
+export function compactTask(task, options = {}) {
   if (task === null || typeof task !== 'object' || Array.isArray(task)) return {};
+  const interactivePause = options?.interactivePause === true;
   const out = {};
   for (const key of TASK_FIELDS) {
+    if (interactivePause && INTERACTIVE_PAUSE_DROP.has(key)) continue;
     if (task[key] !== undefined) out[key] = task[key];
   }
   // A wait NEVER carries the review note body: the conclusion's state, time and length are
@@ -203,15 +216,17 @@ export function compactTask(task) {
         : {}),
     };
   }
-  if (task.reviewPersistence !== undefined) out.reviewPersistence = task.reviewPersistence;
-  // Activity and self-check are small, bounded summaries the engine produced for
-  // exactly this purpose; they are carried whole rather than re-projected here — EXCEPT
-  // the fields a wait must never carry whatever depth they arrive at. An engine (or a
-  // fixture) that nested a diff or execution prose inside `activity` would otherwise put
-  // evidence on the one answer that is supposed to be cheap, so evidence keys are
-  // dropped at any depth.
-  if (task.activity !== undefined) out.activity = stripEvidenceFields(task.activity);
-  if (task.selfCheck !== undefined) out.selfCheck = stripEvidenceFields(task.selfCheck);
+  if (!interactivePause) {
+    if (task.reviewPersistence !== undefined) out.reviewPersistence = task.reviewPersistence;
+    // Activity and self-check are small, bounded summaries the engine produced for
+    // exactly this purpose; they are carried whole rather than re-projected here — EXCEPT
+    // the fields a wait must never carry whatever depth they arrive at. An engine (or a
+    // fixture) that nested a diff or execution prose inside `activity` would otherwise put
+    // evidence on the one answer that is supposed to be cheap, so evidence keys are
+    // dropped at any depth.
+    if (task.activity !== undefined) out.activity = stripEvidenceFields(task.activity);
+    if (task.selfCheck !== undefined) out.selfCheck = stripEvidenceFields(task.selfCheck);
+  }
   return out;
 }
 
@@ -310,9 +325,11 @@ function instructionFor(reason, facts = {}) {
           + 'a real drift from the goal. Nothing was cancelled, restarted, resubmitted or re-queued, and this '
           + 'interval will not be reported again.';
       }
-      return 'Nothing has been reported back for the configured no-progress threshold (ten minutes by default) '
-        + 'while the task is still running. The run may be stuck. Check the current tool and idle time; cancel '
-        + 'or follow up deliberately rather than assuming completion.';
+      return 'Nothing new has been returned to the host for the operator-configured delivery interval in DSH '
+        + 'settings (40 minutes by default; internal worker activity does not reset this clock) while the task '
+        + 'is still running. This is a progress check, not a verdict that the run is stuck: inspect the current '
+        + 'activity and elapsed state, and keep waiting on the same taskId unless you find a concrete error or '
+        + 'drift from the goal.';
     case 'ready':
       return 'The run ended and is awaiting host review. Read delegate_result for the diff and evidence; '
         + 'completion is not host acceptance.';
@@ -736,14 +753,16 @@ export async function waitForTask(options) {
    * @returns {object} compact answer.
    */
   function answer(reason, observation, facts = {}) {
-    const task = compactTask(observation?.task);
+    const task = compactTask(observation?.task, {
+      interactivePause: reason === 'permission' || reason === 'question',
+    });
     // A resolved interruption carries the state and terminal flag its resolution decided;
     // every other answer derives them from the reason and the published task.
     const state = facts.resolved === true
       ? (facts.resolvedState ?? null)
       : resolvedTaskState(task, reason);
     // The repeated-failure diagnostic, when THAT is what the reminder was about. It is
-    // what lets a host tell "silent for ten minutes" from "kept failing the same call",
+    // what lets a host tell the run progress check from "kept failing the same call",
     // which need different decisions. Only the bounded fields the engine produced travel.
     const failure = reason === 'attention' && observation?.failure !== null
       && typeof observation?.failure === 'object'

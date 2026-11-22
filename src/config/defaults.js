@@ -102,27 +102,23 @@ export const LIMITS = Object.freeze({
 });
 
 /**
- * Default activity-monitoring thresholds, in seconds of *inactivity*.
+ * Default progress-and-monitoring thresholds, in seconds.
  *
- * There is exactly ONE time base: consecutive time without real progress. Real progress
- * — model output, a reasoning step, a tool call or a tool result — resets it; a
- * heartbeat, a result poll, the self-check itself and a plain state read do not.
+ * `selfCheckSeconds` measures elapsed time from run start for one read-only local
+ * inspection (default 10 minutes; does not require a host to be waiting).
  *
- * Two reminders are measured on that clock, and each can be switched off with `0`:
- *
- *  * `selfCheckSeconds` — one read-only local inspection (default 10 minutes);
- *  * `attentionSeconds` — one notification to the commander asking it to check the
- *    run's progress (default 40 minutes).
- *
- * Neither depends on total runtime, so a task that keeps working for hours produces
- * neither. Nothing here ever ends, cancels or restarts a run: a reminder is a REPORT,
- * never a verdict.
+ * `attentionSeconds` measures how long nothing new has been RETURNED to the commander
+ * (default 40 minutes). Internal model/tool activity, heartbeats, permission/question
+ * waits, and local self-checks do NOT reset this delivery clock; only a real stage
+ * result or terminal delivery moves it. Neither threshold ever ends, cancels, or restarts
+ * a run: a reminder is a progress checkpoint, never a verdict.
  */
 export const MONITORING_DEFAULTS = Object.freeze({
-  /** No-progress span after which one read-only local self-check is performed (0 = off). */
+  /** Elapsed seconds from run start after which one read-only local self-check runs (0 = off). */
   selfCheckSeconds: 10 * 60,
   /**
-   * No-progress span after which the wait reports the run progress check (0 = off).
+   * Seconds without returning a new result to the commander before the wait reports a
+   * run progress check (0 = off).
    *
    * This is the ONE notification interval: it doubles as the point at which a host is
    * asked to confirm the goal, so there is no second duration to configure.

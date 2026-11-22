@@ -522,6 +522,9 @@ export const KNOWN_AGENT_TEMPLATES = [
   // Published 1.7.1 companion before the 1.8.0 black-box simplification, in LF and CRLF.
   { version: '1.7.1', sha256: '5a55b978c3de4f7cec8922d1af5302ef46b0bcbda867bfe53faebac1980eb1b3' },
   { version: '1.7.1', sha256: '026157837e2a99c5a265badb2ca6dc77be1ddcac28871e5949b80e61c949bfa0' },
+  // Published 1.8.0 companion before the 1.8.1 dual-client symmetry and Q&A boundary refinement, in LF and CRLF.
+  { version: '1.8.0', sha256: 'ba3c964cad6b9ae395dbe0d74971a430795fd8927a4a5daeb6a45617823a9cab' },
+  { version: '1.8.0', sha256: '6f732230068f3230f9ad1c6a92d30d677f717dd0b0ebd92abb73ed7578f956dd' },
 ];
 
 /** The `version = "…"` line of an agent file, at column 0. */

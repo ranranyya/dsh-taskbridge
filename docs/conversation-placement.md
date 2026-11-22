@@ -23,12 +23,13 @@ conversation is ever continued.
 
 `delegate_submit.title` is an optional, short description of the actual work in
 the operator's language. The engine derives a title from the prompt's goal when
-older callers omit it. Only newly created Workspace groups are renamed through
-`workspaceController.rename({ workspaceId, title })`; an existing Workspace or
-an explicit follow-up retains its current name. Conflicting names receive a short
-task-id suffix. Naming needs no model call and does not change the execution
-directory, Git branch or task identity. Historical Workspaces are not renamed in
-bulk.
+older callers omit it. Only newly created **worktree** Workspace groups are renamed
+through `workspaceController.rename({ workspaceId, title })`; a shared-mode run
+executes inside the project's native source Workspace and preserves the project's
+own Workspace name, and an existing Workspace or explicit follow-up retains its
+current name. Conflicting names receive a short task-id suffix. Naming needs no
+model call and does not change the execution directory, Git branch or task identity.
+Historical Workspaces are not renamed in bulk.
 
 ## The two questions, and the two services that answer them
 

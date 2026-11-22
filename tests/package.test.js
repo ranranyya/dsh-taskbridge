@@ -41,7 +41,7 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
  * so asserting itself would pass for any value. `1.5.0` adds question handling and combined waits.
  */
-const DELIVERABLE_VERSION = '1.8.0';
+const DELIVERABLE_VERSION = '1.8.1';
 
 /**
  * The published build this release upgrades *from*.
@@ -50,7 +50,7 @@ const DELIVERABLE_VERSION = '1.8.0';
  * current version must be strictly newer than this baseline,
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.7.1';
+const PREVIOUS_VERSION = '1.8.0';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -781,10 +781,12 @@ test('the packed size stays bounded and contains no single-file outlier', () => 
   const GROUPED_WORKSPACES_GROWTH_BYTES = 64_000;
   // Antigravity self-contained plugin integration (installer, seam, templates, UI tab, contract doc).
   const ANTIGRAVITY_INTEGRATION_GROWTH_BYTES = 48_000;
+  // Isolation-aware linked cleanup (archiveSessions, removeWorktrees, cleanPlans), preset shortcuts and orphan sweep.
+  const LINKED_CLEANUP_GROWTH_BYTES = 80_000;
   const growth = TASK_RECORDS_GROWTH_BYTES + MONITORING_GROWTH_BYTES
     + AGENT_TEAMS_DEFAULT_GROWTH_BYTES + AGENT_TEAMS_CHOICE_FIDELITY_BYTES
     + CONCURRENT_ISOLATION_GROWTH_BYTES + GROUPED_WORKSPACES_GROWTH_BYTES
-    + ANTIGRAVITY_INTEGRATION_GROWTH_BYTES;
+    + ANTIGRAVITY_INTEGRATION_GROWTH_BYTES + LINKED_CLEANUP_GROWTH_BYTES;
   assert.ok(total < 3_120_000 + growth, `unpacked size grew unexpectedly: ${total} bytes`);
   const RELEASE_BUDGET_BYTES = 3_080_000;
   const budget = RELEASE_BUDGET_BYTES + growth;

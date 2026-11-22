@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "DSH TaskBridge",
-    "description": "Let Codex and Antigravity direct DSH with your chosen API, worker model and reasoning effort. Includes one-click client setup, quiet waiting, per-operation approvals, host review and same-session follow-ups. Claude Code and Claude Desktop support is planned for 2.0.",
+    "description": "Let Codex and Antigravity direct DSH through a clean black-box bridge: centralized API/model/effort routing, worktree isolation, one-click client setup, low-overhead quiet waiting, per-call approvals, host review, same-session follow-ups and linked cleanup. Claude Code / Claude Desktop support is planned for 2.0.",
     "detail": "docs/INTRODUCTION.md"
   }
 }

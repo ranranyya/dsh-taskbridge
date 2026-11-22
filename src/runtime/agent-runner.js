@@ -552,6 +552,7 @@ async function resolvePlacement(deps, request) {
     taskId: request?.taskId,
     connectionId: request?.connectionId,
     sourcePath: request?.sourcePath,
+    isolation: request?.isolation,
     presetId: request?.placementPresetId,
   });
   return placement;

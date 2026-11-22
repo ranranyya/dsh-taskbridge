@@ -653,7 +653,7 @@ test('a small result passes through byte-for-byte with no truncation marker', as
   const { text } = await callTool(server, 'delegate_result', { taskId: answer.task.taskId });
   // Unchanged values must not be rewritten: a caller diffing two reads of the same
   // task must see identical text.
-  assert.equal(text, JSON.stringify(answer, null, 2));
+  assert.equal(text, JSON.stringify(answer));
   assert.equal('truncation' in JSON.parse(text), false);
 });
 
@@ -1470,8 +1470,10 @@ test('delegate_result retrieves the intended task through the real execution pla
       assert.equal(body.task.connectionId, 'local-mcp');
       assert.equal(body.task.execution.text, 'implemented the change');
       assert.equal(body.task.title, '修复授权界面');
-      assert.equal(body.task.execution.conversation.workspaceTitle, '修复授权界面');
-      assert.deepEqual(plane.workspaces.renames, [{ workspaceId: body.task.execution.conversation.workspaceId, title: '修复授权界面' }]);
+      // Shared-mode runs execute directly inside the project's native source Workspace, so they
+      // keep the project's default Workspace name instead of overwriting it with one task's title.
+      assert.equal(body.task.execution.conversation.workspaceTitle, 'workspace');
+      assert.deepEqual(plane.workspaces.renames, []);
 
       // The wire, not just the answer: the plane's own routes received the calls.
       assert.deepEqual(wire, [

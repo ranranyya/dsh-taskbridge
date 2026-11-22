@@ -317,10 +317,12 @@ test('client store and built bundle expose Antigravity integration tab and actio
   assert.match(describeAntigravityOutcome({ action: 'install', changed: ['plugin', 'mcp'], refused: [] }), /插件与规则文件、MCP 配置/u);
 });
 
-test('worker-prompt automatically protects uncommitted changes for shared or dirty checkouts and cleans temp logs', () => {
+test('worker-prompt automatically protects uncommitted changes for shared or dirty checkouts, prefers native file tools, and cleans temp logs', () => {
   const shared = buildWorkerPrompt({ taskId: 't1', prompt: 'Fix bug', workspacePath: '/repo', isolation: 'shared' });
   assert.match(shared, /Preserve existing uncommitted changes and unrelated files/u);
   assert.match(shared, /remove those untracked temporary log files before finishing/u);
+  assert.match(shared, /Always prefer native file\/search\/edit tools/u);
+  assert.match(shared, /Do not install packages or make external network requests/u);
   const dirty = buildWorkerPrompt({ taskId: 't2', prompt: 'Fix bug', workspacePath: '/repo', isolation: 'worktree', baseline: { dirtyBaseline: true } });
   assert.match(dirty, /Preserve existing uncommitted changes and unrelated files/u);
   const clean = buildWorkerPrompt({ taskId: 't3', prompt: 'Fix bug', workspacePath: '/repo', isolation: 'worktree', baseline: { dirtyBaseline: false } });
@@ -364,4 +366,18 @@ test('published 1.7.1 Codex companion fixture upgrades cleanly to 1.8.0 in both 
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test('antigravity subagent omits call_mcp_tool from tools frontmatter (auto-injected via mcp_config.json) and SKILL defaults to flash subagent', () => {
+  const agent = readFileSync(join(ROOT, 'antigravity', 'agents', 'dsh-taskbridge.md'), 'utf8');
+  const skill = readFileSync(join(ROOT, 'antigravity', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
+  // Listing `call_mcp_tool` in Antigravity YAML `tools:` causes executor startup failure:
+  // "unknown component: tool \"call_mcp_tool\" not found in registry". Antigravity injects
+  // MCP tools automatically from the plugin's `mcp_config.json`.
+  assert.doesNotMatch(agent, /^\s*-\s*call_mcp_tool\s*$/mu);
+  assert.match(agent, /^\s*-\s*read_file\s*$/mu);
+  assert.match(agent, /^\s*-\s*send_message\s*$/mu);
+  assert.match(skill, /Model:\s*"flash"/u);
+  assert.match(skill, /PREFLIGHT_NO_COMMITS/u);
+  assert.match(skill, /answerReceipt\.applied === true/u);
 });

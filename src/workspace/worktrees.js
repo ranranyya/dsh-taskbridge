@@ -20,7 +20,7 @@
 // rather than implied by the word "isolated".
 
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, realpath } from 'node:fs/promises';
+import { lstat, mkdir, readdir, realpath, rm } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 
 import { AUDIT_CODES, AUDIT_LIMITS, AuditError, probeRepository, readRepositoryTopLevel, readStatus } from './audit.js';
@@ -630,6 +630,160 @@ export class WorktreeManager {
     record.state = WORKTREE_STATES.disposed;
     record.reviewedByHost = options.reviewed === true;
     return this.view(record);
+  }
+
+  /**
+   * Check whether a candidate path is syntactically a direct managed child directory
+   * of {@link WorktreeManager#rootDir} and never the root directory or the source
+   * checkout itself.
+   * @param {unknown} workspacePath - candidate worktree path.
+   * @param {unknown} [sourcePath] - optional source checkout path.
+   * @returns {boolean} true when the path is a managed child worktree path.
+   */
+  isManagedChildPath(workspacePath, sourcePath = null) {
+    if (typeof workspacePath !== 'string' || workspacePath.trim() === '' || !isAbsolute(workspacePath.trim())) {
+      return false;
+    }
+    const resolvedRoot = resolve(this.rootDir);
+    const resolvedTarget = resolve(workspacePath.trim());
+    const rootKey = normalizeKey(resolvedRoot);
+    const targetKey = normalizeKey(resolvedTarget);
+    if (targetKey === rootKey) return false;
+    if (typeof sourcePath === 'string' && sourcePath.trim() !== '' && isAbsolute(sourcePath.trim())) {
+      if (targetKey === normalizeKey(resolve(sourcePath.trim()))) return false;
+    }
+    if (normalizeKey(dirname(resolvedTarget)) !== rootKey) return false;
+    const folderName = basename(resolvedTarget);
+    return /^[A-Za-z0-9._-]+-[A-Za-z0-9]{1,12}$/.test(folderName);
+  }
+
+  /**
+   * Safely remove one plugin-managed worktree directory for a cleaned isolated task,
+   * including after a host restart when the in-memory tree map no longer holds it.
+   *
+   * Strictly refuses any path that is not a direct child of {@link WorktreeManager#rootDir},
+   * any path equal to `sourcePath`, or any symbolic link at the target location.
+   * @param {{ taskId?: string, sourcePath?: string | null, workspacePath?: string | null }} request
+   * @returns {Promise<{ removed: boolean, workspacePath: string | null, reason?: string }>}
+   */
+  async removeManagedTree(request = {}) {
+    const rawTarget = typeof request?.workspacePath === 'string' ? request.workspacePath.trim() : '';
+    const rawSource = typeof request?.sourcePath === 'string' && request.sourcePath.trim() !== ''
+      ? request.sourcePath.trim()
+      : null;
+    if (!this.isManagedChildPath(rawTarget, rawSource)) {
+      return { removed: false, workspacePath: null, reason: 'not-managed-worktree' };
+    }
+    const resolvedTarget = resolve(rawTarget);
+    const targetKey = normalizeKey(resolvedTarget);
+    const tracked = this.trees.get(targetKey) ?? null;
+    if (tracked !== null && tracked.state === WORKTREE_STATES.active) {
+      return { removed: false, workspacePath: resolvedTarget, reason: 'tree-active' };
+    }
+
+    const existedOnDisk = await pathExists(resolvedTarget).catch(() => false);
+    if (existedOnDisk) {
+      const statInfo = await lstat(resolvedTarget).catch(() => null);
+      if (statInfo === null || statInfo.isSymbolicLink() || !statInfo.isDirectory()) {
+        return { removed: false, workspacePath: resolvedTarget, reason: 'not-regular-directory' };
+      }
+      const [realRoot, realParent] = await Promise.all([
+        realpath(this.rootDir).catch(() => resolve(this.rootDir)),
+        realpath(dirname(resolvedTarget)).catch(() => null),
+      ]);
+      if (realParent === null || normalizeKey(realParent) !== normalizeKey(realRoot)) {
+        return { removed: false, workspacePath: resolvedTarget, reason: 'parent-mismatch' };
+      }
+    }
+
+    const effectiveSource = tracked?.sourcePath ?? (rawSource !== null && isAbsolute(rawSource) && !rawSource.includes('***') ? resolve(rawSource) : null);
+    let disposedViaGit = false;
+    if (tracked !== null && tracked.state !== WORKTREE_STATES.disposed) {
+      try {
+        await this.dispose(resolvedTarget, { reviewed: true });
+        disposedViaGit = true;
+      } catch {
+        tracked.state = WORKTREE_STATES.disposed;
+      }
+    } else if (effectiveSource !== null) {
+      try {
+        await this.deps.runGit(effectiveSource, ['worktree', 'remove', '--force', resolvedTarget]);
+        disposedViaGit = true;
+      } catch {
+        // Fallback to direct directory removal inside rootDir below.
+      }
+      try {
+        await this.deps.runGit(effectiveSource, ['worktree', 'prune']);
+      } catch {
+        // Best-effort git worktree administrative prune.
+      }
+    }
+
+    if (await pathExists(resolvedTarget).catch(() => false)) {
+      await rm(resolvedTarget, { recursive: true, force: true }).catch(() => {});
+      if (effectiveSource !== null) {
+        await this.deps.runGit(effectiveSource, ['worktree', 'prune']).catch(() => {});
+      }
+    }
+
+    const stillExists = await pathExists(resolvedTarget).catch(() => false);
+    if (stillExists) {
+      return { removed: false, workspacePath: resolvedTarget, reason: 'remove-failed' };
+    }
+    if (tracked !== null) {
+      tracked.state = WORKTREE_STATES.disposed;
+    }
+    if (!existedOnDisk && !disposedViaGit) {
+      return { removed: false, workspacePath: resolvedTarget, reason: 'already-absent' };
+    }
+    return { removed: true, workspacePath: resolvedTarget };
+  }
+
+  /**
+   * Sweep orphan managed worktree directories under {@link WorktreeManager#rootDir}
+   * that are no longer referenced by any live or retained historical task.
+   * @param {{ activePaths?: string[], sourcePaths?: string[] }} [options]
+   * @returns {Promise<{ removedWorktreePaths: string[] }>}
+   */
+  async sweepOrphanTrees(options = {}) {
+    const activeKeys = new Set();
+    for (const candidate of Array.isArray(options?.activePaths) ? options.activePaths : []) {
+      if (typeof candidate === 'string' && candidate.trim() !== '' && isAbsolute(candidate.trim())) {
+        activeKeys.add(normalizeKey(resolve(candidate.trim())));
+      }
+    }
+    for (const [key, record] of this.trees.entries()) {
+      if (record.state === WORKTREE_STATES.active) activeKeys.add(key);
+    }
+
+    let entries = [];
+    try {
+      entries = await readdir(this.rootDir, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { removedWorktreePaths: [] };
+      throw error;
+    }
+
+    const removedWorktreePaths = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      if (!/^[A-Za-z0-9._-]+-[A-Za-z0-9]{1,12}$/.test(entry.name)) continue;
+      const fullPath = resolve(join(this.rootDir, entry.name));
+      if (activeKeys.has(normalizeKey(fullPath))) continue;
+      const outcome = await this.removeManagedTree({ workspacePath: fullPath });
+      if (outcome.removed) removedWorktreePaths.push(fullPath);
+    }
+
+    const uniqueSources = new Set(
+      (Array.isArray(options?.sourcePaths) ? options.sourcePaths : [])
+        .filter((p) => typeof p === 'string' && p.trim() !== '' && isAbsolute(p.trim()) && !p.includes('***'))
+        .map((p) => resolve(p.trim())),
+    );
+    for (const source of uniqueSources) {
+      await this.deps.runGit(source, ['worktree', 'prune']).catch(() => {});
+    }
+
+    return { removedWorktreePaths };
   }
 
   /**

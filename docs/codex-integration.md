@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.8.0 (Antigravity integration added alongside Codex; Codex companion streamlined into a clean black-box contract while keeping full 1.7.1 upgrade recognition). This automatic installer covers Codex; Antigravity integration is documented in `docs/antigravity-integration.md`, and Claude Code / Claude Desktop integration is planned for 2.0.
+Status: implemented in 1.8.1 (Codex and Antigravity integrations both supported, with full 1.8.0 and earlier upgrade recognition). This automatic installer covers Codex; Antigravity integration is documented in `docs/antigravity-integration.md`, and Claude Code / Claude Desktop integration is planned for 2.0.
 
 The 1.7.0 release also makes future managed upgrades self-recognising: the two exact
 companions this machine really held (`1.6.1` in both terminator spellings and the local
@@ -562,7 +562,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.8.0",
+  "packageVersion": "1.8.1",
   "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
   "agent": {
     "path": "…", "state": "installed", "installed": true, "managed": true,

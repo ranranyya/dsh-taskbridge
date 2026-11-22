@@ -1,5 +1,7 @@
 # DSH TaskBridge
 
+> **1.8.1** 新增任务记录联动清理、快捷预设、`interrupted` 清理与孤儿扫除，落地三重指挥端省 Token 优化（轻量 `flash` 后台子智能体 + 原生文件工具优先 + 紧凑 JSON 载荷裁剪），保护共享工作区原名并上线全新中英文黑盒架构图。详见 [1.8.1 更新说明](docs/releases/1.8.1.zh.md)。
+
 > **1.8.0** 新增 Antigravity 一键集成（自包含插件包 + Skill + 后台子智能体 + MCP），并将 Codex 派工规则瘦身为三层黑盒契约。详见 [1.8.0 更新说明](docs/releases/1.8.0.zh.md)。
 
 > **1.7.1** 由指挥端在派工前确定实施路径、复用方案和验收方法，DSH 按收到的方案执行。
@@ -17,28 +19,28 @@ TaskBridge 是面向 **DeepSeek Harness（DSH）** 的多端任务派工插件�
 
 整个执行过程对指挥端是**黑盒**的——API 连接、执行模型、思考强度、Git 工作树隔离和 DSH 原生会话管理都在插件内统一收口，指挥端只管派工、审批和验收。
 
-![TaskBridge 任务流程：指挥端规划与审查，插件连接与等待，DSH 执行；修正续接原任务](https://raw.githubusercontent.com/ranranyya/dsh-taskbridge/v1.5.2/docs/assets/taskbridge-workflow.zh.png)
+![DSH TaskBridge 多端指挥与黑盒执行架构：Codex 与 Antigravity 规划审批，TaskBridge 黑盒封装 MCP、路由、隔离与静默等待，DSH 沙箱落地并闭环续接](https://raw.githubusercontent.com/ranranyya/dsh-taskbridge/v1.8.1/docs/assets/taskbridge-workflow.zh.png)
 
 ## 它解决什么问题
 
 当你更信任 Codex / Antigravity 的架构规划和代码审查能力，同时想用 DSH 里接入的高性价比或专属模型来跑具体实现时，手工来回粘贴需求和代码很快就会失控。TaskBridge 直接打通两边：
 
-- **黑盒分层，各司其职**：在 DSH 插件里选一次提供方、模型和思考强度，所有指挥端共用同一套 MCP 服务接口，不需要在提示词里反复交代模型或环境细节。
-- **先定方案再派工**：指挥端先读代码、定步骤和验收标准，复杂目标可先建任务树再拆包派发；DSH 按方案落地，遇到现场前提冲突先回报证据，不瞎改。
-- **静默等待，不反复查岗**：执行期间由本机程序盯进度，只在需要单次权限审批、回答提问、出现异常或任务交付时回调指挥端，省去无意义的中间轮询开销。
+- **黑盒分层，各司其职**：在 DSH 插件里选一次提供方、模型和思考强度，所有指挥端共用同一套标准 MCP 接口（11 个有界工具、紧凑 JSON 载荷），不需要在提示词里反复交代模型或环境细节。
+- **先定方案再派工**：指挥端先读代码、定步骤和验收标准，复杂目标可先建任务树再拆包派发；DSH 按方案落地，优先使用原生文件/搜索工具，遇到现场前提冲突先回报证据，不瞎改。
+- **静默等待，省指挥端上下文**：执行期间由本机程序盯进度，Antigravity 默认由轻量 `flash` 后台子智能体承载静默等待与常规审批，避免多轮中间载荷灌入主旗舰模型上下文。
 - **同会话续接，返工不丢上下文**：交付后由指挥端集中看 diff 和测试结果并落盘审查结论；需要修改时直接续接原来的 DSH 会话和工作树，不必从头讲一遍背景。
-- **独立隔离，同项目可并行**：默认从 Git 基线拉出独立工作树执行，互不干扰；同一项目可以同时跑多个独立工作包，任务记录与原 DSH 会话一一对应。
+- **独立隔离与联动清理**：默认从 Git 基线拉出独立工作树并行执行，互不干扰；任务完成后可在「任务记录」按执行链一键联动清理历史、派工会话、隔离工作树与空规划节点。
 
 ## 核心能力
 
 | 能力 | 说明 |
 | --- | --- |
-| **Codex & Antigravity 一键集成** | 设置页分别提供 Codex（子智能体 + MCP）和 Antigravity（自包含插件包 + Skill + 后台子智能体 + MCP）的安装、更新、仅修复 MCP 与卸载入口，完整保留用户自定义修改。 |
+| **Codex & Antigravity 一键集成** | 设置页分别提供 Codex（托管子智能体 + MCP）和 Antigravity（自包含插件包 + Skill + 轻量后台子智能体 + MCP）的安装、更新、仅修复 MCP 与卸载入口，按文件哈希完整保留用户自定义修改。 |
 | **复用 DSH 已有 API 与模型** | 直接选用 DSH 已启用的接口、执行模型与思考强度；密钥仍由 DSH 托管，不导出、不回显。 |
-| **多层任务树与任务记录** | 支持规划总目标与子任务；所有任务在插件设置页「任务记录」集中展示，可按日期筛选、查看完整审查意见、一键跳转原 DSH 会话，以及按执行链清理历史记录。 |
-| **隔离并行与原生工作区整合** | 默认独立 Git 工作树隔离（支持同项目多会话并行），也支持显式共享目录执行；隔离任务自然折叠在 DSH 原生工作区树下，派工会话带轻量标识。 |
-| **分级静默监控** | 普通任务无总执行时长上限；默认 DSH 开始运行满 10 分钟本机自检一次、指挥端连续 40 分钟未收到新成果时提醒检查，重复失败自动提醒并支持事件确认（均可调或关闭）。 |
-| **逐次权限审批与原生提问** | 超出常规工作区权限的命令需经指挥端核验具体命令与路径后单次放行；DSH 原生提问直传指挥端，答复或审批后同调用无缝续等。 |
+| **多层任务树、任务记录与联动清理** | 支持规划总目标与子任务；「任务记录」支持日期筛选、快捷勾选预设（全部 / 仅已通过 / 仅失败·取消·中断）、查看完整审查意见与一键跳转原会话，并支持按需联动归档派工会话、移除隔离工作树/临时工作区、清理空规划父节点及扫除历史孤儿残留（主项目源码与共享工作区受保护绝不误删）。 |
+| **隔离并行与原生工作区整合** | 默认独立 Git 工作树隔离（支持同项目多会话并行，自动折叠在 DSH 侧栏 `TaskBridge` 节点下并按任务标题命名），也支持显式共享目录执行（沿用项目原生工作区并保留项目原名）；派工会话带轻量标识。 |
+| **分级静默监控** | 普通任务无默认总执行时长上限；默认 DSH 开始运行满 10 分钟本机自检一次、指挥端连续 40 分钟未收到新成果时提醒检查，重复失败自动提醒并支持事件确认（均可调或关闭）。 |
+| **逐次权限审批与原生提问** | 超出常规工作区权限的命令需经指挥端核验具体命令与路径后单次放行（审批暂停自动裁剪冗余监控字段以降低开销）；DSH 原生提问直传指挥端，答复或审批后同调用无缝续等。 |
 | **可选智能体团队协作** | 默认关闭，可在执行设置调整新任务默认开关，也可单次派工显式覆盖；续接沿用原会话选择。 |
 | **设置自动保存与项目覆盖** | 选项改动即时保存，文本输入自动防抖落盘；支持保存常用预设和按项目路径单独覆盖执行配置。 |
 
@@ -62,8 +64,8 @@ dsh-taskbridge
 
 ### 3. 一键接入指挥端
 
-- **接入 Codex**：切到 **Codex 集成**，点击 **安装 / 更新 TaskBridge 智能体**，完成后重启或新开 Codex 会话即可通过 `@dsh-taskbridge` 派工。
-- **接入 Antigravity**：切到 **Antigravity 集成**，点击 **安装 / 更新 Antigravity 插件**。插件会写入独立的 `~/.gemini/config/plugins/dsh-taskbridge/`（内含 `SKILL.md`、后台子智能体和插件内 `mcp_config.json`，不碰全局配置），Antigravity 加载后即可通过 `@dsh-taskbridge` 或明确指令派工。
+- **接入 Codex**：切到 **Codex 集成**，点击 **安装 / 更新 TaskBridge 智能体**，完成后重启或新开 Codex 会话，即可在指令中点名 `dsh-taskbridge`（或明确说明“交给 DSH / TaskBridge”）派工。
+- **接入 Antigravity**：切到 **Antigravity 集成**，点击 **安装 / 更新 Antigravity 插件**。插件会写入独立的 `~/.gemini/config/plugins/dsh-taskbridge/`（内含 `SKILL.md`、轻量后台子智能体和插件内 `mcp_config.json`，不碰全局配置），Antigravity 加载后即可通过 `@[plugin:dsh-taskbridge]` / `@dsh-taskbridge` 或明确指令派工。首次调用 `delegate_*` MCP 工具时若弹出外部工具确认框，建议勾选 **Always Allow**，避免打断静默等待与审批续等。
 
 ### 4. 打开总开关，派发第一个任务
 
@@ -79,12 +81,12 @@ dsh-taskbridge
 
 ### 独立工作树 vs 共享工作区
 
-| 模式 | 修改位置 | 适用场景 |
+| 模式 | 修改位置与侧栏落点 | 适用场景 |
 | --- | --- | --- |
-| **独立工作树（默认）** | 从已提交的 Git 基线拉出隔离 worktree | 希望改动与主目录隔离，或同一项目同时并行跑多个独立任务，验收后再决定如何合入。 |
-| **共享工作区** | 直接在授权的项目目录内修改 | 当前目录已有未提交改动，且明确希望 DSH 基于现状继续修改（预检确认后才允许）。 |
+| **独立工作树（默认）** | 从已提交的 Git 基线拉出隔离 worktree；在 DSH 侧栏自动折叠于 `TaskBridge` 节点下并按任务标题命名 | 希望改动与主目录隔离，或同一项目同时并行跑多个独立任务，验收后再决定如何合入；清理时可连同工作树与临时工作区一并移除。 |
+| **共享工作区** | 直接在授权的项目目录内修改；沿用项目自己的原生工作区并保留项目原名称（不落入 `TaskBridge` 节点下） | 当前目录已有未提交改动，且明确希望 DSH 基于现状继续修改（预检确认后才允许）；联动清理绝不删除项目源码目录与共享工作区。 |
 
-> 审查通过只记录结论，不会自动合并工作树、创建提交或推送代码。
+> **仓库硬性前提**：无论是独立工作树还是共享工作区，都要求授权目录是**已初始化且至少有 1 次 commit 的 Git 仓库根目录**（普通聊天问答或非仓库临时目录不走 TaskBridge）。审查通过只记录结论，不会自动合并工作树、创建提交或推送代码。
 
 ### 静默等待与分级监控
 
@@ -108,7 +110,7 @@ dsh-taskbridge
 ## 常见问题
 
 **安装后，Codex 或 Antigravity 会偷偷把所有活都派给 DSH 吗？**
-不会。必须同时满足两个条件：顶部本机调用开关已打开，且你在对话中明确指派交给 DSH / TaskBridge 执行。日常聊天、代码解读或本地改动都不会触发派工。
+不会。必须同时满足两个条件：顶部本机调用开关已打开，且你在对话中明确指派将 Git 仓库中的代码实现或验证任务交给 DSH / TaskBridge 执行。普通问答（哪怕提到了 `@dsh-taskbridge`）、代码解读或未指派的本地改动都不会触发派工。
 
 **我手工改过 `dsh-taskbridge.toml` 或 `SKILL.md`，升级插件会被覆盖吗？**
 不会。TaskBridge 按文件内容哈希判定所有权：只有未改动过的托管文件才会在升级时自动刷新；你编辑过的文件会被标记为自定义并原样保留。如果只更新连接路径，点「仅修复 MCP 配置」即可。
@@ -116,8 +118,8 @@ dsh-taskbridge
 **Antigravity 集成会修改我的全局 `mcp_config.json` 或 `config.json` 吗？**
 不会。所有文件都收敛在 `~/.gemini/config/plugins/dsh-taskbridge/` 独立插件目录中，你可以在 Antigravity 插件页随时一键开关，卸载时也只清理插件自己写入的文件。
 
-**静默等待是不是完全不消耗指挥端 token？**
-规划方案、处理权限审批、回答提问和最终审查仍需要指挥端模型介入；静默等待省掉的是执行期间反复查状态、拉中间代码造成的浪费。历史测量见 [等待阶段用量对照](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.0-token-benchmark.zh.md)。
+**静默等待与 `1.8.1` 的低耗设计是怎么省指挥端 token 的？**
+规划方案、处理权限审批、回答提问和最终审查仍需要指挥端模型介入；TaskBridge 从三层压低额外消耗：① 执行期间静默等待，不反复查状态或拉中间代码；② Antigravity 默认使用轻量 `flash` 后台子智能体隔离等待和常规审批，只将精简摘要回传主旗舰模型；③ 底层提示 DSH 优先使用原生文件工具减少不必要的 Shell 审批弹窗，并采用单行紧凑 JSON 载荷及审批期裁剪。历史测量见 [等待阶段用量对照](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.0-token-benchmark.zh.md)。
 
 ## 客户端支持路线
 
@@ -125,13 +127,13 @@ dsh-taskbridge
 | --- | --- | --- |
 | **Codex** | 已支持 | 一键安装托管子智能体（`agents/dsh-taskbridge.toml`）+ MCP 配置 |
 | **Antigravity** | 已支持 | 一键安装独立插件包（`plugins/dsh-taskbridge/`，含 Skill + 后台子智能体 + MCP） |
-| **Claude Code / Claude Desktop** | 计划中（预计 2.0） | 复用同一套标准 MCP 服务接口，规划见 [Claude 接入规划](docs/) |
+| **Claude Code / Claude Desktop** | 计划中（预计 2.0） | 复用同一套标准 MCP 服务接口，规划见 [Claude 接入规划](docs/claude-code.md) |
 
 ## 更多文档
 
-- [Codex 集成契约](docs/) · [Antigravity 集成契约](docs/) · [Claude 接入规划](docs/)
-- [静默等待说明](docs/) · [工作区与隔离](docs/) · [会话放置与续接](docs/)
-- [运行时兼容性](docs/) · [插件发现与更新](docs/) · [旧名称迁移](docs/)
+- [Codex 集成契约](docs/codex-integration.md) · [Antigravity 集成契约](docs/antigravity-integration.md) · [Claude 接入规划](docs/claude-code.md)
+- [静默等待说明](docs/silent-wait.md) · [工作区与隔离](docs/workspace-contract.md) · [会话放置与续接](docs/conversation-placement.md)
+- [运行时兼容性](docs/runtime-compatibility.md) · [插件发现与更新](docs/plugin-market.md) · [旧名称迁移](docs/taskbridge-upgrade.md)
 
 遇到问题或有功能建议，欢迎到 [GitHub Issues](https://github.com/ranranyya/dsh-taskbridge/issues) 反馈（附上插件版本、复现步骤与脱敏日志，注意不要泄露 API 密钥）。
 
@@ -175,7 +177,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
    ```bash
    npm pack
-   #    → dsh-taskbridge-1.8.0.tgz
+   #    → dsh-taskbridge-1.8.1.tgz
    ```
 
 2. 使用本地包时，通过 **添加插件**入口选择下载或生成的 `.tgz`（或本仓库目录）完成安装。
@@ -189,7 +191,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-taskbridge-1.8.0.tgz && dsh plugin --profile web why dsh-taskbridge
+dsh plugin --profile web add ./dsh-taskbridge-1.8.1.tgz && dsh plugin --profile web why dsh-taskbridge
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -202,7 +204,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.8.0.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.8.1.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -231,11 +233,12 @@ dsh --profile web
 它**不是**设置对话框里的独立导航项：旧的 `settings.section`（设置 → 「DSH 委托」）已
 移除。页面分区：
 
-1. **本机调用授权**——单一开关。关闭后拒绝新提交并请求停止运行中的任务。
-2. **API 管理**——从 DSH 已注册的接口中选择；模型和推理强度由 DSH 当前目录同步。
-3. **执行设置**——provider / 模型 / 推理强度 / 超时 / 最大并发 / 工作区隔离。
-4. **任务记录**——状态、实际 provider/model/effort、变更文件、diff、验证证据。
+1. **本机调用授权**——顶部单一开关。关闭后拒绝新提交并请求停止运行中的任务。
+2. **接口管理**——从 DSH 已启用的接口中选择；模型和推理强度由 DSH 当前目录同步。
+3. **执行设置**——提供方 / 执行模型 / 思考强度 / 最大并发 / 工作区隔离 / 智能体协作 / 进度与静默监控 / 项目覆盖。
+4. **任务记录**——任务树与历史列表、日期筛选、完整审查意见、跳转原会话与按执行链联动清理。
 5. **Codex 集成**——一键安装 Codex 子智能体文件并登记 MCP 条目（见 6.1）；三种状态分开显示。
+6. **Antigravity 集成**——一键安装自包含插件包（`~/.gemini/config/plugins/dsh-taskbridge/`，含 `SKILL.md`、轻量后台子智能体与插件内 `mcp_config.json`，详见 [`docs/antigravity-integration.md`](./docs/antigravity-integration.md)）。
 
 界面只负责切换本机调用能力和配置；任务由 MCP 宿主提交。
 
@@ -245,7 +248,7 @@ dsh --profile web
 `continueFromTaskId` 的**跟进任务**才会续接那一条任务会话（同 Workspace、同 Session）。
 详见 `docs/conversation-placement.md`。
 
-**工作区按内容命名。** 派工时通过 `delegate_submit.title` 提供简短任务名称，例如“制作潘德 G 版装备表”。新建的 DSH Workspace 使用这个名称；旧客户端未提供标题时从任务目标中提取，不会额外调用模型。名称重合时追加短标识。续接任务及已有 Workspace 保持原名称，磁盘中的工作树路径仍使用任务 ID。
+**隔离工作区按任务内容命名。** 派工时通过 `delegate_submit.title` 提供简短任务名称，例如“制作潘德 G 版装备表”。新建的隔离工作树（`worktree`）DSH Workspace 使用这个名称（旧客户端未提供标题时从任务目标中提取，不会额外调用模型；名称重合时追加短标识）；共享模式（`shared`）直接复用项目原生工作区，保留项目原工作区名称而不被单次任务标题覆盖。续接任务及已有 Workspace 保持原名称，磁盘中的工作树路径仍使用任务 ID。
 
 ## 4. 本机调用开关
 
@@ -266,9 +269,9 @@ dsh --profile web
 
 ## 6. MCP（stdio）接入
 
-包内可执行文件 `bin/dsh-delegate-mcp.js`（bin 名 `dsh-delegate-mcp`）实现了八个工具：
+包内可执行文件 `bin/dsh-delegate-mcp.js`（bin 名 `dsh-delegate-mcp`）实现了十一个工具：
 `delegate_status` / `delegate_preflight` / `delegate_submit` / `delegate_wait` / `delegate_result` / `delegate_cancel` /
-`delegate_permission_decide` / `delegate_review`。
+`delegate_permission_decide` / `delegate_question_answer` / `delegate_review` / `delegate_plan` / `delegate_metrics`。
 它**不提供**授权、配置写入或凭据读写工具。`delegate_permission_decide` 是唯一一条窄例外：
 它只能回答一个**已经挂起**的「单次调用授权请求」，给 `allow-once`（仅这一次调用可继续）或
 `reject`。它不能创建或扩大任何**长期有效**的授权，不能修改设置、凭据、本机开关、提供方/模型或隔离方式，
@@ -297,8 +300,8 @@ dsh --profile web
   每次工具调用前都会重新读取，因此 DSH 重启并更换端口后无需改 Codex 配置。
 - 默认发现路径使用 `DSH_HOME`，未设置时为 `~/.dsh`。若 DSH 和 MCP 宿主使用不同的 DSH_HOME，
   可通过 `DSH_DELEGATE_DISCOVERY_FILE` 指向该发现文件。`DSH_DELEGATE_BASE_URL` 仅作为手动固定地址覆盖。
-- 工具为 `delegate_status`、`delegate_preflight`、`delegate_submit`、`delegate_wait`、`delegate_result`、
-  `delegate_cancel`、`delegate_permission_decide` 和 `delegate_review`。
+- 工具共 11 个：`delegate_status`、`delegate_preflight`、`delegate_submit`、`delegate_wait`、`delegate_result`、
+  `delegate_cancel`、`delegate_permission_decide`、`delegate_question_answer`、`delegate_review`、`delegate_plan` 与 `delegate_metrics`。
 - 开关关闭时，`delegate_submit` 与 `delegate_permission_decide` 返回 `DELEGATION_DISABLED`；状态、
   预检、结果和取消工具仍可使用。`delegate_preflight` 只读取工作区事实，不创建任何东西，因此不受
   开关和并发上限限制。
@@ -361,9 +364,10 @@ Codex 支持一键安装集成。**「Codex 集成」**分页提供一个明确�
 1. 安装自定义子智能体文件 `CODEX_HOME/agents/dsh-taskbridge.toml`（未设置 `CODEX_HOME`
    时为 `%USERPROFILE%\.codex\agents\dsh-taskbridge.toml`）；
 2. 在 `CODEX_HOME/config.toml` 里登记本包自带的 stdio MCP 服务
-   `mcp_servers.dsh-delegate`，让子智能体可以使用 `delegate_status` /
-   `delegate_preflight` / `delegate_submit` / `delegate_wait` / `delegate_result` / `delegate_cancel` /
-   `delegate_permission_decide`。
+   `mcp_servers.dsh-delegate`，让子智能体可以使用全套 11 个 `delegate_*` 工具
+   （`delegate_status` / `delegate_preflight` / `delegate_submit` / `delegate_wait` / `delegate_result` /
+   `delegate_cancel` / `delegate_permission_decide` / `delegate_question_answer` / `delegate_review` /
+   `delegate_plan` / `delegate_metrics`）。
 
 需要说明的边界（分页里也有同样的提示）：
 
@@ -413,8 +417,8 @@ Codex 支持一键安装集成。**「Codex 集成」**分页提供一个明确�
   的 **worktree** 隔离派发；**脏仓库不会被自动降级**，指挥官根据任务和变更路径判断能否安全共享，
   并在派工前说明事实与理由；归属或风险不清时才暂停询问。决定共享后用 `allowShared: true` 再预检，
   并在提交任务时只覆盖 `{ isolation: "shared" }`；无法判断或其他原因导致 `block` 时停止并报告。
-  派工说明里要带上工作区事实与隔离理由。provider / 模型 / 推理强度 / 超时仍由插件设置决定，
-  再轮询**同一个**任务，把状态、实际 provider/model/effort、
+  派工说明里要带上工作区事实与隔离理由。provider / 模型 / 推理强度仍由插件设置决定（普通任务无默认总时长上限），
+  再通过 `delegate_wait` 静默等待**同一个**任务，把状态、实际 provider/model/effort、
   变更文件、验证证据交回 Codex。子智能体不得为了“让预检通过”去提交、stash、清理或回滚工作区。
   执行完成不等于验收：验收仍由 Codex 负责。
   **跟进规则**同样写在 agent 文件里：只有属于同一个先前任务的修改/纠正/重试才带上最新的那个
@@ -465,19 +469,14 @@ node bin/dsh-delegate-codex-agent.js remove    # 只删除插件托管项
   插件不按版本号分支，而是按**实际探测到的能力**分支：能力存在的运行时走现代路径，能力缺失的
   运行时走旧路径；读回失败在任何路径上都是投递提示词之前的严格失败，不会以“未声明的路线”运行。
   细节与逐版本对照见 [`docs/runtime-compatibility.md`](./docs/runtime-compatibility.md)。
-- 续接的会话身份规则见第 6 节（同一已验证 `connectionId`、重启后与持久 history 互证）。这条
-  能力已包含在插件中；本文件**不声称** DSH Desktop 真实安装
-  已通过，也不声称做过真实攻击复现。
-- DSH Desktop 正式版本上的真实安装与真实模型执行验收尚未完成；`0.2.2-rc.1` 的原生全量加载
-  已在隔离夹具通过，具体范围见运行时兼容文档，不能等同于生产环境端到端验收。
+- 续接的会话身份规则见第 6 节（同一已验证 `connectionId`、重启后与持久 history 互证）。
+- 运行时兼容细节与宿主能力矩阵见 [`docs/runtime-compatibility.md`](./docs/runtime-compatibility.md)。
 
 详见 `docs/worker-permissions.md`。
 
 ## 7.2 逐次调用授权桥（1.0.0）
 
-> **状态：** 本项目内测试通过，但**生产验收尚未完成**。安装后必须在 Desktop 插件管理器中升级本插件，
-> 再重连 MCP 或开启新会话，才能看到 `delegate_permission_decide`；真实的 provider → 指挥官 → 恢复执行
-> 端到端验收仍需在目标 Desktop profile 中完成。任何单元测试数量或 mock 都不能替代那次验收。
+> 安装或升级本插件后，若 MCP 宿主已保持旧会话，请重连 MCP 或新开会话以刷新工具清单。
 
 worker 请求把**某一次调用**的沙箱权限提升时，那次调用会暂停执行，请求出现在
 `delegate_result` 的 `permission.pending` 里：任务状态仍是 `running`，阶段为
@@ -523,7 +522,7 @@ worker 请求把**某一次调用**的沙箱权限提升时，那次调用会暂
 - 连接心跳、结果轮询、页面刷新都不算进展；否则真正卡住的执行器会永远"看起来在动"。
 - 提醒有冷却：同一次静默里到点报一次，之后要再过同样的间隔才会再报。
 - 间隔是全局设置（`monitoring.selfCheckSeconds` / `monitoring.attentionSeconds`，存成整秒），
-  项目覆盖和单任务覆盖都不能改它。设置页在「执行设置」里的**进阶：静默监控间隔**卡片，
+  项目覆盖和单任务覆盖都不能改它。设置页在「执行设置」里的**进度与静默监控**卡片，
   以分钟呈现、按秒保存，修改后自动保存，无需再点击底部按钮。
 - 修改只影响**之后新提交**的任务；运行中的任务保留它开始时冻结的那份间隔快照。
 - 任务记录页在有进行中任务、且页面可见时每 5 秒只读刷新一次；终端状态的任务不会触发刷新。
@@ -623,8 +622,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 
 - 没有再次执行 DSH Desktop 正式 profile 上的端到端真实模型运行，也没有实测宿主串行时控制通道的
   现场行为（自动测试用的是本机 mock 执行面与真实 stdio 夹具，不依赖真实模型）。
-- 上述是 1.2.0 的历史验收边界。当前 1.3.1 已发布到 GitHub 和 npm；分发核验结果见
-  [发布报告](docs/releases/1.3.1.zh.md)，不代表额外完成了真实模型或 Desktop 客户端验收。
+- 上述为早期 `1.2.0` 的历史记录；后续各正式版本的完整发布与验收说明见 [`CHANGELOG.md`](./CHANGELOG.md) 与 `docs/releases/`。
 
 ## 8. 升级 / 导出 / 卸载 / 回滚
 
@@ -634,7 +632,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-taskbridge-1.8.0.tgz
+dsh plugin --profile web add ./dsh-taskbridge-1.8.1.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings
@@ -651,13 +649,13 @@ dsh plugin --profile web remove dsh-taskbridge
 - 回滚：把旧 `.tgz` 重新 `add` 回去即可；数据目录 `$DSH_HOME/data/dsh-delegate`
   保存设置与任务历史，升级/回滚都不会自动删除它。schema 带版本号，读取时会校验。
 - 插件卸载或禁用后，其路由和运行中的任务会随生命周期清理；持久化开关值仍保存在插件数据目录。
-- 插件卸载**不会**自动删除它写进 Codex 的托管项：请在卸载前于「Codex 集成」分页点
-  「移除插件托管项」（或运行 `dsh-delegate-codex-agent remove`）。卸载后包已不在，
-  那条 MCP 条目就会指向不存在的文件。
+- 插件卸载**不会**自动删除已写入各指挥端的托管集成：请在卸载前分别于「Codex 集成」分页点
+  「移除插件托管项」（或运行 `dsh-delegate-codex-agent remove`）以及在「Antigravity 集成」分页点
+  「移除插件托管项」。卸载后包已不在，未清理的 MCP 条目会指向不存在的文件。
 
 ## 9. 限制（请如实理解）
 
-- **发布渠道**：1.3.1 已通过 npm、GitHub Release 和本项目自定义插件索引分发。索引不是官方默认
+- **发布渠道**：已通过 npm（`dsh-taskbridge`）、GitHub Release 与本项目自定义插件索引分发。索引不是官方默认
   市场收录；更新能力取决于 DSH 客户端，插件没有独立的自动更新程序，也未提供作者签名或构建来源证明。
 - **按实际接口工作**：1.4.2 起不按 DSH 版本号筛选。若宿主缺少所需模型路由、审批等接口，相关操作仍会报告具体能力不足；默认通用不表示所有宿主版本都已做过端到端实测。旧插件包仍保留它们自己的声明，遇到旧版兼容性提示应先升级插件。
 - **本机开关不是进程身份认证**：开关开启时，能连接本机 DSH 端口的同机进程可以提交任务。
@@ -671,7 +669,7 @@ dsh plugin --profile web remove dsh-taskbridge
   一个非常安静但确实在工作的长步骤，也可能到达提醒阈值。
 - **不承诺省多少 token**：`1.1.0` 起改变的是"什么时候把什么告诉派工方"。Codex 自己的上下文、
   思考与工具往返开销不由本插件控制，本插件也不做节省量的估算或承诺。
-- **只在有人观察时运行**：没有派工方在等待时，监控不启动定时器、不消耗资源，也不会提醒。
+- **本机自检与回调分工**：开始运行满 10 分钟（默认）的只读本机自检随任务启动独立计时，不依赖指挥端是否正在等待；连续 40 分钟（默认）未向指挥端回传新成果的进度检查则在指挥端调用 `delegate_wait` 观察时回报。
 - **等待中断不等于执行中断**：`delegate_wait` 返回的 `interrupted` 只描述这次等待；任务仍在
   `pending`/`running` 时它是非终态，答案里带着真实任务状态。只有任务记录本身是 `interrupted`
   （重启历史）才是终态。不要把这两个概念混为一谈，也不要把非终态答案当作执行结束。
@@ -682,12 +680,11 @@ dsh plugin --profile web remove dsh-taskbridge
   仍是 `workspace-write`；它不能创建或扩大任何账号/工作区/会话授权，不能改设置/凭据/开关/
   提供方/模型/隔离，也不能预先批准后续调用。它是本机指挥官的决定，不是自动放行规则、不是
   第二个模型审查、也不依赖人工点击。
-- **工作树隔离需要 git**：默认 `worktree` 隔离要求源目录是已提交的 git 仓库；
-  否则显式拒绝。`shared` 模式不是隔离，界面会如实标注。
+- **Git 仓库前提**：无论是默认 `worktree` 隔离还是 `shared` 共享模式，都要求授权目标目录是已初始化且至少有 1 次 commit 的 Git 仓库根目录，否则预检会显式拒绝（`block`）。`shared` 模式不是隔离，界面会如实标注。
 - **交付与验收分开**：执行交付后等待宿主审查，由指挥端明确写回结论，
   任务页才显示“审查通过”或“需要修正”。
 - **Codex 集成的限制**：
-  - 当前接入端仅支持 Codex；Claude Code 与 Claude Desktop 接入预计在 2.0 上线。
+  - 当前已支持 Codex 与 Antigravity 接入；Claude Code 与 Claude Desktop 接入预计在 2.0 上线。
   - **不宣称**当前 Codex 桌面版/CLI 支持用 `@dsh-taskbridge` 在输入框直接选中该子智能体：
     这取决于 Codex 版本自身是否提供提及选择，仓库内没有官方文档或运行时证据支持该说法。
     插件只保证子智能体文件与 MCP 条目存在；安装后必须让 Codex 重新载入。

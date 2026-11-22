@@ -588,6 +588,23 @@ async function classifyMcpFile({ mcpPath, desired, recordedDigest }) {
   };
 }
 
+/**
+ * Exact LF SHA-256 digests of prior published Antigravity managed files.
+ * Allows an untouched published installation (such as 1.8.0) to be recognized as
+ * `outdated` and upgraded cleanly even if the local ownership sidecar is absent,
+ * while any operator-edited file still classifies as `modified` and is preserved.
+ */
+const KNOWN_PRIOR_ANTIGRAVITY_FILES = Object.freeze({
+  'skills/dsh-taskbridge/SKILL.md': Object.freeze([
+    // Published 1.8.0 SKILL.md (LF)
+    '9e83135ece937dbc0b73f5098509daac2fe4b973fe4dcd2ed75186745cf3cfee',
+  ]),
+  'agents/dsh-taskbridge.md': Object.freeze([
+    // Published 1.8.0 agents/dsh-taskbridge.md (LF)
+    'df1418abe2c58c535734ecf6619bd027ca251d2dd6043cec9f41561d8e0a432b',
+  ]),
+});
+
 function isManagedAntigravityManifest(contents) {
   try {
     const parsed = JSON.parse(contents);
@@ -624,7 +641,12 @@ async function classifyPluginFiles({ paths, templates, recordedFiles }) {
       continue;
     }
     const recorded = recordedFiles?.[key] ?? null;
-    if (typeof recorded === 'string' && digestLf(file.contents) === recorded) {
+    const lfDigest = digestLf(file.contents);
+    if (typeof recorded === 'string' && lfDigest === recorded) {
+      details[key] = { path: targetPath, state: 'outdated', expectDigest: rawDigest };
+      continue;
+    }
+    if (Array.isArray(KNOWN_PRIOR_ANTIGRAVITY_FILES[key]) && KNOWN_PRIOR_ANTIGRAVITY_FILES[key].includes(lfDigest)) {
       details[key] = { path: targetPath, state: 'outdated', expectDigest: rawDigest };
       continue;
     }

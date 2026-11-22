@@ -548,6 +548,17 @@ export interface DelegateCleanupCandidate {
   parentNodeId: string | null;
   nodeId: string | null;
   nodeKind: string;
+  /**
+   * The host's status for the chain (`accepted`, `failed`, `cancelled`, …), or `null`
+   * when the projection stated none. It is what the preset shortcuts read; the page
+   * never derives it from a title or a time.
+   */
+  nodeStatus?: string | null;
+  /**
+   * The chain's isolation (`worktree` or `shared`), when the projection stated one.
+   * It is descriptive only: the browser half never decides what may be deleted from it.
+   */
+  isolation?: string | null;
   selectable: boolean;
   blockers: string[];
   reason: string | null;
@@ -605,7 +616,63 @@ export declare function cleanupSelectionSummary(
 export declare function cleanupRequest(
   selection: Record<string, string[]>,
   candidates: DelegateCleanupCandidate[],
-): { body: { chains: DelegateCleanupChain[] }; problems: string[] };
+  options?: DelegateCleanupOptions,
+): { body: DelegateCleanupRequest; problems: string[] };
+
+/**
+ * The linked cleanup choices of one batch. Each flag is independently opt-in and is
+ * absent from the request body unless it is `true`; the host treats an absent flag as
+ * "leave that alone".
+ *
+ * - `archiveSessions` archives the dispatched DSH conversation of each removed round.
+ * - `removeWorktrees` removes a `worktree`-isolated task's managed tree and its
+ *   temporary Workspace; a `shared` task's directory and the source checkout are
+ *   never touched.
+ * - `cleanPlans` removes planning nodes that no remaining task still references.
+ */
+export interface DelegateCleanupOptions {
+  archiveSessions?: boolean;
+  removeWorktrees?: boolean;
+  cleanPlans?: boolean;
+}
+
+/** The request body of `POST /api/dsh-delegate/tasks/cleanup`. */
+export interface DelegateCleanupRequest {
+  chains: DelegateCleanupChain[];
+  archiveSessions?: true;
+  removeWorktrees?: true;
+  cleanPlans?: true;
+}
+
+/** Which status group one preset shortcut selects. */
+export declare const CLEANUP_PRESETS: readonly ['all', 'accepted', 'failed-cancelled'];
+
+/**
+ * Batch-select the selectable chains matching a preset, optionally restricted to the
+ * chain ids currently visible under the page's own filters.
+ * @param candidates - current candidates.
+ * @param preset - `all`, `accepted` (chains the host accepted) or `failed-cancelled`.
+ * @param visibleChainIds - optional set/array of chain ids the filter leaves visible.
+ * @returns the selection map, bounded to `MAX_CLEANUP_CHAINS`.
+ */
+export declare function selectCleanupCandidatesByPreset(
+  candidates: DelegateCleanupCandidate[],
+  preset?: 'all' | 'accepted' | 'failed-cancelled',
+  visibleChainIds?: Set<string> | string[] | null,
+): Record<string, string[]>;
+
+/**
+ * The confirmation sentence drawn above the confirm button, before anything is sent.
+ * @param summary - the selection's chain/round counts.
+ * @param options - the linked cleanup choices currently ticked.
+ */
+export declare function cleanupConfirmText(
+  summary: { chains: number; rounds: number },
+  options?: DelegateCleanupOptions,
+): string;
+
+/** Plain-Chinese description of one completed orphan worktree/session sweep. */
+export declare function describeOrphanCleanupOutcome(outcome: unknown): string;
 
 /** Stable fingerprint of a selection, for change detection across refreshes. */
 export declare function cleanupSelectionKey(
@@ -679,6 +746,10 @@ export interface DelegateClientModule {
   cleanupOutcome: typeof cleanupOutcome;
   describeCleanupOutcome: typeof describeCleanupOutcome;
   cleanupWarningText: typeof cleanupWarningText;
+  /** Linked cleanup: preset shortcuts, confirmation text and the orphan sweep summary. */
+  selectCleanupCandidatesByPreset: typeof selectCleanupCandidatesByPreset;
+  cleanupConfirmText: typeof cleanupConfirmText;
+  describeOrphanCleanupOutcome: typeof describeOrphanCleanupOutcome;
   /** Execution choices: the new-task Agent Teams default and its origin labels. */
   executionOf: typeof executionOf;
   AGENT_TEAMS_DEFAULT_FOR_NEW_TASKS: typeof AGENT_TEAMS_DEFAULT_FOR_NEW_TASKS;

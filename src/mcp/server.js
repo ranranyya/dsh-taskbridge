@@ -473,9 +473,12 @@ export const TOOLS = Object.freeze([
     title: 'Wait for a task to need you',
     description: 'Follow ONE task this connection submitted and return as soon as it needs the host. '
       + 'A single call blocks for up to waitSeconds (default 3600) and returns a COMPACT answer: '
-      + '`reason` is `permission` (a per-call request is pending), `attention` (the run has been silent for '
-      + 'the configured inactivity threshold, ten minutes by default, so it may be stuck), `ready` (the run '
-      + 'ended and is awaiting host review), `failed`, `cancelled` or `interrupted`. '
+      + '`reason` is `permission` (a per-call request is pending), `question` (the worker asked a native '
+      + 'question that needs `delegate_question_answer`), `attention` (a progress check because nothing new was '
+      + 'returned to the host for the operator-configured delivery interval in DSH settings — 40 minutes by '
+      + 'default; internal worker activity does not reset this clock and it does NOT imply the run is stuck — '
+      + 'or a `repeated-tool-failure` reminder), `ready` (the run ended and is awaiting host review), `failed`, '
+      + '`cancelled` or `interrupted`. '
       + 'An `attention` answer may instead carry a `failure` block (kind `repeated-tool-failure`, with '
       + 'a stable `eventId`, toolName/failureCode/consecutive): the worker repeated the SAME operation and failed the same way '
       + 'several times in a row. It is a question for the host, and it is REDELIVERED until you acknowledge it with '
@@ -1401,19 +1404,16 @@ function compactJson(value) {
 }
 
 /**
- * Whether a projected value fits the tool-text bound in either encoding.
+ * Whether a projected value fits the tool-text bound when serialized compactly.
  *
- * The bound must hold for *both* the compact and the two-space encoding because
- * the published answer alone is not the whole JSON a client parses: a client that
- * re-serializes it, or a host that pretty-prints the envelope, must not be able to
- * push past {@link MAX_TOOL_TEXT_CHARS}.
+ * Compact JSON (no indentation whitespace) is what {@link boundedJson} publishes to MCP
+ * clients so wait, permission, and result turns avoid wasting commander context tokens
+ * on formatting spaces.
  * @param {unknown} value - projected JSON value.
  * @returns {boolean} true when the value fits.
  */
 function fitsBound(value) {
-  const compact = compactJson(value);
-  if (compact.length > MAX_TOOL_TEXT_CHARS) return false;
-  return JSON.stringify(value, null, 2).length <= MAX_TOOL_TEXT_CHARS;
+  return compactJson(value).length <= MAX_TOOL_TEXT_CHARS;
 }
 
 /**
@@ -2300,7 +2300,7 @@ function boundedJson(value) {
   } catch {
     return refuseResult('MCP_RESULT_UNSERIALIZABLE', 'the delegated call answered with a value that could not be serialized');
   }
-  if (fitsBound(value)) return { text: JSON.stringify(redactDeepStrings(value), null, 2), isError: false };
+  if (fitsBound(value)) return { text: JSON.stringify(redactDeepStrings(value)), isError: false };
 
   const stages = [
     { executionText: TRUNCATED_FIELD_CAPS.executionTextChars, reviewText: TRUNCATED_FIELD_CAPS.reviewTextChars, lists: 50, permissionEvidence: 8 },
@@ -2343,7 +2343,7 @@ function boundedJson(value) {
       projected.questionAnswerable = isQuestionAnswerable(projected.question);
       projected.grantsAccess = false;
     }
-    return JSON.stringify(redactDeepStrings(projected), null, 2);
+    return JSON.stringify(redactDeepStrings(projected));
   };
   for (const stage of stages) {
     const text = apply(stage);
@@ -2493,8 +2493,6 @@ function rescueQuestion(value, fullTextChars) {
       payload.failureAck = questionRescueAck;
     }
     const redacted = redactDeepStrings(payload);
-    const pretty = JSON.stringify(redacted, null, 2);
-    if (pretty.length <= MAX_TOOL_TEXT_CHARS) return { text: pretty, isError: false };
     const compact = JSON.stringify(redacted);
     if (compact.length <= MAX_TOOL_TEXT_CHARS) return { text: compact, isError: false };
   }
@@ -2613,7 +2611,7 @@ function permissionRescue(value, fullTextChars) {
         permissionDecidable: false,
         truncation: truncationBlock(records, fullTextChars, entries),
       });
-      return JSON.stringify(redactDeepStrings(payload), null, 2);
+      return JSON.stringify(redactDeepStrings(payload));
     }
     if (entries.length === 0) {
       // A RECEIPT-ONLY rescue: no live request survived to publish, but the decision must
@@ -2627,7 +2625,7 @@ function permissionRescue(value, fullTextChars) {
         actionable: true,
         truncation: truncationBlock(records, fullTextChars, entries),
       });
-      return JSON.stringify(redactDeepStrings(payload), null, 2);
+      return JSON.stringify(redactDeepStrings(payload));
     }
     const tasks = entries.map((entry) => {
       const pending = render(entry);
@@ -2643,7 +2641,7 @@ function permissionRescue(value, fullTextChars) {
     const payload = withReceipt(entries.length === 1 && entries[0].path === 'task'
       ? { ok: value.ok, task: tasks[0], truncation: truncationBlock(records, fullTextChars, entries) }
       : { ok: value.ok, tasks, truncation: truncationBlock(records, fullTextChars, entries) });
-    return JSON.stringify(redactDeepStrings(payload), null, 2);
+    return JSON.stringify(redactDeepStrings(payload));
   };
 }
 
@@ -2702,13 +2700,13 @@ function refuseResult(code, message, extra = {}) {
     ok: false,
     error: { code, message, ...extra },
     truncation: { truncated: true, fullResultIncluded: false },
-  }), null, 2);
+  }));
   if (text.length <= MAX_TOOL_TEXT_CHARS) return { text, isError: true };
   // The refusal itself is larger than the bound, which only happens if the bound
   // is configured absurdly small. This minimal form is still valid JSON and still
   // says the answer was refused rather than delivered.
   return {
-    text: JSON.stringify({ ok: false, error: { code, truncated: true }, truncation: { truncated: true, fullResultIncluded: false } }, null, 2),
+    text: JSON.stringify({ ok: false, error: { code, truncated: true }, truncation: { truncated: true, fullResultIncluded: false } }),
     isError: true,
   };
 }
@@ -3362,8 +3360,9 @@ export function createMcpServer(options) {
               + 'When an APPLIED decision\'s follow-up wait fails or is cancelled, the call still succeeds with that '
               + 'receipt, `reason: null` and a `waitError` block: only the waiting ended, the execution was not '
               + 'stopped, and the decision must not be resent. To follow a task without polling, use '
-              + 'delegate_wait({ taskId }): one call blocks until the task needs you (permission, ready, failed, '
-              + 'cancelled, interrupted) or until its own one-hour deadline, in which case it answers reason '
+              + 'delegate_wait({ taskId }): one call blocks until the task needs you (permission, question, '
+              + 'attention, ready, failed, cancelled, interrupted) or until its own one-hour deadline, in which '
+              + 'case it answers reason '
               + '`wait-limit` with `actionable: false` and you call it again with the same taskId instead of '
               + 'reviewing or resubmitting anything. Omit waitSeconds for normal waiting: the default already '
               + 'covers an hour, it cannot be raised above 3600, and a shorter value is only for a one-off '
@@ -3379,9 +3378,13 @@ export function createMcpServer(options) {
               + 'time limit is an OUTER limit: the observation did not end and the worker did not stop, so continue '
               + 'the SAME exec cell and ask for the longest yield the host supports (roughly 1200000 ms when a '
               + 'yield/pragmas parameter exists, not a minute) instead of re-issuing every second. (c) `attention` '
-              + 'is genuine inactivity: no activity for the configured threshold (ten minutes by default) while the '
-              + 'task still runs. (d) The task\'s total execution timeout is the worker\'s own budget, reported as a '
-              + 'terminal state — it is not `wait-limit`, not `attention` and not a client-side event. A real '
+              + 'is either a run progress check (nothing new was delivered back to the host for the operator-configured '
+              + 'delivery interval in DSH settings — 40 minutes by default; internal worker activity, heartbeats, '
+              + 'permission/question waits and the local self-check do not reset it, and it does NOT imply the run is '
+              + 'stuck) or a `repeated-tool-failure` reminder while the task still runs. (d) There is NO default total '
+              + 'execution timeout: an execution timeout (`JOB_TIMEOUT`, reported as a terminal state) only applies when '
+              + 'an explicit cap is supplied via `overrides.timeoutSeconds` — it is not `wait-limit`, not `attention` '
+              + 'and not a client-side event. A real '
               + 'failure is worth one de-duplicated reminder; an ordinary single failing test inside the worker is '
               + 'the worker\'s job to fix and is not a host event. '
               + '`interrupted` never means the execution stopped by itself: this call returns it at once '
@@ -3404,7 +3407,8 @@ export function createMcpServer(options) {
               + 'PROGRAM, not the host model: the host\'s own turns, token usage and cost are reported as '
               + '`not-integrated` because this process cannot observe them. '
               + 'When a task reaches `ready`/`awaiting-host-review`, finish YOUR review and record it with '
-              + 'delegate_review ({ taskId, decision: "accepted" | "changes-requested", note }): that call is the '
+              + 'delegate_review ({ taskId, decision: "accepted" | "changes-requested", note, completionSummary? }): '
+              + 'that call is the '
               + 'only thing that records host acceptance, and until it is made the task stays unreviewed. '
               + 'Completion is never acceptance on its own, and a review cannot approve permissions, change '
               + 'settings or models, merge the diff or create work. The first decision is final for that task; '

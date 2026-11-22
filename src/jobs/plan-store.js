@@ -130,6 +130,89 @@ export class PlanStore {
     return await this.enqueue(async () => action(await this.load()));
   }
 
+  /**
+   * Remove planning nodes in `seedNodeIds` (and their ancestors) that no longer have
+   * any remaining execution tasks or child plan nodes after a task cleanup.
+   *
+   * Never removes an unrelated empty planning node that was not in the cleaned tasks'
+   * own plan ancestry.
+   * @param {Iterable<string>} seedNodeIds - plan node ids referenced by the deleted tasks.
+   * @param {object[]} remainingTasks - all remaining live and archived task records.
+   * @returns {Promise<string[]>} removed plan node ids.
+   */
+  async deleteEmptyAncestors(seedNodeIds, remainingTasks = []) {
+    if (this.disposed) throw this.disposedError();
+    this.throwIfRefused();
+    const seeds = new Set();
+    for (const id of Array.isArray(seedNodeIds) || seedNodeIds instanceof Set ? seedNodeIds : []) {
+      if (typeof id === 'string' && id.trim() !== '') seeds.add(id.trim());
+    }
+    if (seeds.size === 0) return [];
+
+    return await this.enqueue(async () => {
+      this.throwIfRefused();
+      const state = await this.ensureLoaded();
+      const byId = new Map(state.nodes.map((node) => [node.nodeId, node]));
+
+      // Collect the candidate scope: seed nodes and their plan ancestors.
+      const candidateScope = new Set();
+      for (const seedId of seeds) {
+        let cur = seedId;
+        const seen = new Set();
+        while (typeof cur === 'string' && cur !== '' && !seen.has(cur)) {
+          seen.add(cur);
+          const node = byId.get(cur);
+          if (!node) break;
+          candidateScope.add(node.nodeId);
+          cur = node.parentNodeId ?? null;
+        }
+      }
+      if (candidateScope.size === 0) return [];
+
+      const referencedByTasks = new Set();
+      for (const task of Array.isArray(remainingTasks) ? remainingTasks : []) {
+        if (typeof task?.planNodeId === 'string' && task.planNodeId.trim() !== '') {
+          referencedByTasks.add(task.planNodeId.trim());
+        }
+        if (typeof task?.parentNodeId === 'string' && task.parentNodeId.trim() !== '') {
+          referencedByTasks.add(task.parentNodeId.trim());
+        }
+      }
+
+      let draft = state.nodes.map((node) => structuredClone(node));
+      const removedIds = [];
+      let changed = true;
+      while (changed) {
+        changed = false;
+        const parentIdsWithPlanChildren = new Set(
+          draft
+            .map((node) => node.parentNodeId)
+            .filter((id) => typeof id === 'string' && id !== ''),
+        );
+        const next = [];
+        for (const node of draft) {
+          if (
+            candidateScope.has(node.nodeId)
+            && !referencedByTasks.has(node.nodeId)
+            && !parentIdsWithPlanChildren.has(node.nodeId)
+          ) {
+            removedIds.push(node.nodeId);
+            changed = true;
+          } else {
+            next.push(node);
+          }
+        }
+        draft = next;
+      }
+
+      if (removedIds.length === 0) return [];
+      const now = Date.now();
+      await this.writeDocument(draft, state.lastSequence, now);
+      this.nodes = draft;
+      return removedIds;
+    });
+  }
+
   async get(nodeId, connectionId) {
     if (typeof nodeId !== 'string' || nodeId.trim() === '') return null;
     if (typeof connectionId !== 'string' || connectionId.trim() === '') return null;

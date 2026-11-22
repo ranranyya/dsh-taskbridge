@@ -16,7 +16,10 @@
 //   5. confirming sends exactly the selected chains with their exact rounds, then
 //      re-reads the list through the normal refresh;
 //   6. a refused batch is reported as a failure with nothing removed, and the page
-//      re-reads rather than pretending the rows went away.
+//      re-reads rather than pretending the rows went away;
+//   7. the status shortcuts and the three linked-cleanup ticks narrow and widen the
+//      same selection, and the request carries a flag only when it was ticked;
+//   8. the residual sweep is its own explicit request to its own route.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -130,12 +133,12 @@ function hostSettings() {
 
 /**
  * A store over a scripted user-plane double.
- * @param {object} [options] - `listTasks`, `cleanupResponse`.
+ * @param {object} [options] - `listTasks`, `cleanupResponse`, `orphanResponse`.
  * @returns {Promise<object>} `{ store, calls }`.
  */
 async function makeStore(options = {}) {
   const apiModule = await import('../src/client/api.js');
-  const calls = { cleanup: [], listTasks: 0 };
+  const calls = { cleanup: [], cleanupOrphans: [], listTasks: 0 };
   const api = {
     async getStatus() { return { ok: true }; },
     async getSettings() { return { ok: true, settings: hostSettings() }; },
@@ -166,6 +169,24 @@ async function makeStore(options = {}) {
         });
       },
     }).cleanupTasks,
+    cleanupOrphans: apiModule.createApi({
+      fetchImpl: async (url, init) => {
+        assert.equal(url, 'api/dsh-delegate/tasks/cleanup-orphans');
+        assert.equal(init.method, 'POST');
+        calls.cleanupOrphans.push(JSON.parse(init.body));
+        if (options.orphanResponse) return options.orphanResponse;
+        return Response.json({
+          ok: true,
+          orphanSessionsForgotten: 1,
+          cleaned: {
+            archivedSessionIds: ['sess-orphan-1'],
+            removedWorktreePaths: ['C:\\worktrees\\task-orphan-1234abcd'],
+            removedWorkspaceIds: ['ws-orphan-temp'],
+          },
+          retained: { sourceFiles: true },
+        });
+      },
+    }).cleanupOrphans,
   };
   // The cleanup projection `index.jsx` injects into the real store; the store itself
   // keeps no copy of the selection rules.
@@ -384,6 +405,137 @@ test('DOM cleanup: changing a date while confirming clears the selection and lim
     await page.click(page.root.querySelector('[data-dshdg-cleanup-review]'));
     await page.click(page.root.querySelector('[data-dshdg-cleanup-confirm]'));
     assert.deepEqual(calls.cleanup, [{ confirm: true, chains: [{ chainId: 'task-legacy', taskIds: ['task-legacy'] }] }]);
+  } finally {
+    await page?.unmount();
+    store.dispose();
+    dom.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Linked cleanup in the real page: the shortcut buttons, the three flags and the
+// residual sweep. What matters is the ORDER an operator works in — the shortcut
+// narrows the selection, each tick widens what will be touched, and the confirmation
+// restates both — and that every request body is exactly what the page showed.
+// ---------------------------------------------------------------------------
+
+test('DOM cleanup: a preset fills the selection, the linked ticks widen it, and the request carries both', async () => {
+  const dom = installDom();
+  const { store, calls } = await makeStore();
+  let page;
+  try {
+    page = await renderPage(store);
+    await page.openTasksTab();
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-toggle]'));
+
+    // 1. The three shortcuts exist, and the standard fixture has exactly two accepted
+    //    chains (task-debounce and the three-round task-ui-1 chain) and one failed one
+    //    (task-missing-plan). task-ui-twin is still running, so no shortcut reaches it.
+    const presets = page.all('[data-dshdg-cleanup-preset]').map((button) => button.getAttribute('data-dshdg-cleanup-preset'));
+    assert.deepEqual(presets.sort(), ['accepted', 'all', 'failed-cancelled']);
+    assert.equal(page.root.querySelector('[data-dshdg-cleanup-check="task-ui-twin"]').disabled, true);
+
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-preset="accepted"]'));
+    assert.deepEqual(
+      page.all('[data-dshdg-cleanup-check]').filter((input) => input.checked).map((input) => input.getAttribute('data-dshdg-cleanup-check')).sort(),
+      ['task-debounce', 'task-ui-1'],
+      'the accepted shortcut selects only the chains the host accepted',
+    );
+    assert.match(page.text('[data-dshdg-cleanup-counts]'), /已选 2 条执行链 \/ 共 4 轮/u);
+    // A shortcut REPLACES the selection rather than adding to it.
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-preset="failed-cancelled"]'));
+    assert.deepEqual(
+      page.all('[data-dshdg-cleanup-check]').filter((input) => input.checked).map((input) => input.getAttribute('data-dshdg-cleanup-check')),
+      ['task-missing-plan'],
+    );
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-preset="all"]'));
+    assert.deepEqual(
+      page.all('[data-dshdg-cleanup-check]').filter((input) => input.checked).map((input) => input.getAttribute('data-dshdg-cleanup-check')).sort(),
+      ['task-debounce', 'task-legacy', 'task-missing-plan', 'task-ui-1'],
+      '全选可清理 takes every selectable chain and never the running one',
+    );
+    assert.equal(calls.cleanup.length, 0, 'choosing a shortcut sends nothing');
+
+    // 2. Narrow back to one single-round chain, then tick all three linked choices.
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-preset="failed-cancelled"]'));
+    const options = page.all('[data-dshdg-cleanup-opt]').map((input) => input.getAttribute('data-dshdg-cleanup-opt'));
+    assert.deepEqual(options.sort(), ['archiveSessions', 'cleanPlans', 'removeWorktrees']);
+    for (const flag of ['archiveSessions', 'removeWorktrees', 'cleanPlans']) {
+      const box = page.root.querySelector(`[data-dshdg-cleanup-opt="${flag}"]`);
+      assert.equal(box.checked, false, `${flag} starts unticked: linked deletion is opt-in`);
+      await page.toggle(box);
+      assert.equal(page.root.querySelector(`[data-dshdg-cleanup-opt="${flag}"]`).checked, true);
+    }
+    assert.equal(calls.cleanup.length, 0, 'ticking a linked choice sends nothing');
+
+    // 3. The confirmation restates BOTH the batch and the linked consequences.
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-review]'));
+    const dialog = page.text('[data-dshdg-cleanup-confirm-dialog]');
+    assert.match(dialog, /确认永久删除 1 条执行链、共 1 轮/u);
+    assert.match(dialog, /归档对应的 DSH 派工对话/u);
+    assert.match(dialog, /删除隔离任务的工作树目录与临时工作区/u);
+    assert.match(dialog, /共享工作区绝不删除/u);
+    assert.match(dialog, /清理已无关联任务的空规划节点/u);
+
+    // 4. One request, carrying the chains and exactly those three booleans.
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-confirm]'));
+    assert.deepEqual(calls.cleanup, [{
+      confirm: true,
+      chains: [{ chainId: 'task-missing-plan', taskIds: ['task-missing-plan'] }],
+      archiveSessions: true,
+      removeWorktrees: true,
+      cleanPlans: true,
+    }]);
+    // The mode closed on success and the linked choices reset, so a second batch can
+    // never inherit an irreversible choice by accident.
+    assert.equal(page.all('[data-dshdg-cleanup-check]').length, 0);
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-toggle]'));
+    for (const flag of ['archiveSessions', 'removeWorktrees', 'cleanPlans']) {
+      assert.equal(page.root.querySelector(`[data-dshdg-cleanup-opt="${flag}"]`).checked, false, `${flag} was reset`);
+    }
+
+    // 5. Unticked, the body is the pre-flag shape: no boolean is sent at all.
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-preset="failed-cancelled"]'));
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-review]'));
+    await page.click(page.root.querySelector('[data-dshdg-cleanup-confirm]'));
+    assert.deepEqual(calls.cleanup[1], { confirm: true, chains: [{ chainId: 'task-missing-plan', taskIds: ['task-missing-plan'] }] });
+  } finally {
+    await page?.unmount();
+    store.dispose();
+    dom.restore();
+  }
+});
+
+test('DOM cleanup: the residual sweep is one explicit request to its own route', async () => {
+  const dom = installDom();
+  const { store, calls } = await makeStore();
+  let page;
+  try {
+    page = await renderPage(store);
+    await page.openTasksTab();
+    const readsBefore = calls.listTasks;
+
+    const sweep = page.root.querySelector('[data-dshdg-cleanup-orphans]');
+    assert.ok(sweep !== null, 'the residual sweep is offered beside the cleanup action');
+    assert.match(sweep.textContent, /清理残留工作区与对话/u);
+    assert.match(sweep.getAttribute('title') ?? '', /绝不触碰共享工作区与源码/u);
+    assert.equal(calls.cleanupOrphans.length, 0, 'opening the page sweeps nothing');
+
+    await page.click(sweep);
+
+    // Exactly one POST, to the orphan route, carrying the two opt-out flags as `true`.
+    assert.equal(calls.cleanupOrphans.length, 1);
+    assert.deepEqual(calls.cleanupOrphans[0], { confirm: true, archiveSessions: true, removeWorktrees: true });
+    assert.deepEqual(calls.cleanup, [], 'the residual sweep never uses the record-cleanup route');
+
+    // The outcome is stated from the host's counts, and the list is re-read.
+    const notices = store.getSnapshot().notices.map((notice) => notice.text).join('\n');
+    assert.match(notices, /已完成残留清理/u);
+    assert.match(notices, /归档 1 个已删记录的派工对话/u);
+    assert.match(notices, /清理 1 个残留隔离工作树/u);
+    assert.match(notices, /移除 1 个临时工作区/u);
+    assert.match(notices, /主项目源文件与共享工作区均未删除/u);
+    assert.ok(calls.listTasks > readsBefore, 'a sweep re-reads the task list');
   } finally {
     await page?.unmount();
     store.dispose();

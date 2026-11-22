@@ -417,7 +417,13 @@ export async function placeSession(deps, request) {
   const execPath = request.path;
   const continueFromTaskId = continuationOf(request?.continueFromTaskId);
 
-  const workspace = await ensureWorkspace(workspaces, execPath, continueFromTaskId === null ? request?.title : null, request?.taskId ?? deps.taskId ?? '');
+  // Only a newly created dedicated worktree Workspace is named after a single task's title.
+  // A shared-mode run executes directly inside the project's native source Workspace, which is
+  // shared across runs and manual conversations and must keep the project's own Workspace name.
+  const workspaceTitleForCreate = continueFromTaskId === null && request?.isolation !== 'shared'
+    ? request?.title
+    : null;
+  const workspace = await ensureWorkspace(workspaces, execPath, workspaceTitleForCreate, request?.taskId ?? deps.taskId ?? '');
   if (workspace.namingError) deps.logger?.warn?.(`TaskBridge workspace title: ${workspace.namingError}`);
 
   if (continueFromTaskId !== null) {
@@ -931,6 +937,35 @@ export class SessionStore {
       await this.writeDocument(next);
       this.records = next;
       return true;
+    });
+    return await run;
+  }
+
+  /**
+   * Forget the threads recorded for a batch of tasks in one atomic write.
+   * @param {Iterable<string>} taskIds - task ids to remove.
+   * @returns {Promise<object[]>} the removed records.
+   */
+  async forgetMany(taskIds) {
+    if (this.disposed) throw new Error('the session map has been disposed');
+    const keys = new Set();
+    for (const id of Array.isArray(taskIds) || taskIds instanceof Set ? taskIds : []) {
+      const key = typeof id === 'string' ? id.trim() : '';
+      if (key !== '') keys.add(key);
+    }
+    if (keys.size === 0) return [];
+    const run = this.enqueue(async () => {
+      const base = await this.ensureLoaded();
+      const removed = [];
+      const next = [];
+      for (const item of base) {
+        if (keys.has(item.taskId)) removed.push({ ...item });
+        else next.push(item);
+      }
+      if (removed.length === 0) return [];
+      await this.writeDocument(next);
+      this.records = next;
+      return removed;
     });
     return await run;
   }

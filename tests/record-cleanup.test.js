@@ -17,12 +17,15 @@
 //      document, the session map and the worktree directory keep their bytes, and no
 //      native agent or tool is created (counters stay at zero).
 //   5. A failed write is reported as a failure, and the old records stay visible.
+//   6. Linked cleanup (`archiveSessions`/`removeWorktrees`/`cleanPlans`) and the orphan
+//      sweep act per task isolation: a `worktree` task's own tree, Workspace and
+//      planning node may go; a `shared` task's directory and Workspace never do.
 //
 // No browser, no network, no native agent.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -37,10 +40,14 @@ import {
   MAX_CLEANUP_CHAINS,
   cleanupOverview,
   runCleanup,
+  runOrphanCleanup,
   validateCleanupRequest,
+  validateOrphanCleanupRequest,
 } from '../src/jobs/record-cleanup.js';
 import { buildTaskTree } from '../src/jobs/task-tree.js';
+import { SessionStore } from '../src/runtime/session-placement.js';
 import { WorkspaceLocks } from '../src/workspace/locks.js';
+import { WorktreeManager, WORKTREE_STATES } from '../src/workspace/worktrees.js';
 import { fakeAgents, fakeGit, fakeLlm, fakeToolRegistry, validSettings } from './helpers/fakes.js';
 
 const WORKSPACE = process.platform === 'win32' ? 'C:\\work\\cleanup' : '/work/cleanup';
@@ -337,8 +344,10 @@ test('the overview describes every chain of the unfiltered tree, and only finish
     assert.equal(byId.get('task-finished').eligible, true, 'a finished durable chain is removable');
     assert.equal(byId.get('task-live').eligible, false);
     assert.ok(byId.get('task-live').blockers.includes(CLEANUP_CODES.live));
-    assert.equal(byId.get('task-orphan').eligible, false);
-    assert.ok(byId.get('task-orphan').blockers.includes(CLEANUP_CODES.live), 'an interrupted record never ended');
+    // An `interrupted` record is terminal: a host restart ended it and no round can
+    // resume it, so it is finished for cleanup purposes.
+    assert.equal(byId.get('task-orphan').eligible, true, 'an interrupted record is a finished record');
+    assert.deepEqual(byId.get('task-orphan').blockers, [], 'an interrupted record is not live');
 
     // The same facts are published on the task list, per chain.
     const listed = await call(built.deps, 'GET', `${USER_PLANE_PREFIX}/tasks`);
@@ -347,6 +356,38 @@ test('the overview describes every chain of the unfiltered tree, and only finish
     const chains = chainsOfTree(listed.body.tree);
     assert.equal(chains.get('task-finished').cleanup.eligible, true);
     assert.deepEqual(chains.get('task-live').cleanup.blockers, [CLEANUP_CODES.live]);
+    await teardown(built);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an interrupted chain is eligible and removed cleanly from durable history', async () => {
+  const dir = await dataDir();
+  try {
+    const built = await buildDeps(dir);
+    await built.history.save(record('task-orphan', {
+      state: 'interrupted',
+      phase: 'interrupted',
+      endedAt: null,
+      execution: { workspacePath: WORKSPACE, outcome: null, text: '', usage: null, error: null },
+    }));
+    await built.history.save(record('task-keep', { createdAt: 1_700_000_100_000 }));
+
+    const overview = await cleanupOverview(built.deps);
+    const orphan = overview.chains.find((entry) => entry.chainId === 'task-orphan');
+    assert.equal(orphan.eligible, true, 'the overview offers an interrupted chain');
+    assert.deepEqual(orphan.blockers, []);
+
+    const response = await call(built.deps, 'POST', `${USER_PLANE_PREFIX}/tasks/cleanup`, {
+      confirm: true,
+      chains: [{ chainId: 'task-orphan', taskIds: orphan.taskIds }],
+    });
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.deepEqual(response.body.deletedTaskIds, ['task-orphan']);
+    assert.deepEqual((await built.history.load()).map((row) => row.taskId), ['task-keep']);
+    assert.equal(built.counters.agentCalls, 0, 'cleanup must not create an agent');
+    assert.equal(built.counters.toolCalls, 0, 'cleanup must not call a tool');
     await teardown(built);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -819,6 +860,396 @@ test('a continuation recorded ahead of a waiting delete invalidates the confirme
     allowSave.resolve();
     await queued;
     await deletion?.catch(() => {});
+    await teardown(built);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 10. Linked cleanup: sessions, worktrees and plans, decided per task isolation
+// ---------------------------------------------------------------------------
+//
+// The linked flags are opt-in, and `removeWorktrees` is the one that can destroy
+// something on disk. It is therefore filtered by the task's OWN recorded isolation:
+// a `worktree` task owns a managed tree under `worktrees.rootDir` (removable), while a
+// `shared` task names the source checkout itself (never removable). The shared case is
+// asserted as hard as the worktree case: the session is archived, and the directory,
+// its files and the project Workspace are all still there afterwards.
+
+/**
+ * A runner double that never really runs git, so nothing here depends on a git binary.
+ * @returns {Function} argv runner.
+ */
+function inertGit() {
+  return async () => ({ stdout: '', stderr: '', code: 0 });
+}
+
+/** Whether a path exists at all. */
+async function exists(target) {
+  try {
+    await access(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ensure a directory exists without touching what is already in it.
+ * @param {string} target - directory path.
+ * @returns {Promise<string>} the same path.
+ */
+async function directory(target) {
+  await mkdir(target, { recursive: true });
+  return target;
+}
+
+/**
+ * The task facts the linked cleanup reads, for one stored round.
+ * @param {string} taskId - task id.
+ * @param {object} overrides - fields to replace.
+ * @returns {object} view.
+ */
+function isolated(taskId, overrides = {}) {
+  const { isolation = 'worktree', executionPath = WORKSPACE, session, workspace, ...rest } = overrides;
+  return record(taskId, {
+    isolation,
+    executionWorkspacePath: executionPath,
+    execution: { workspacePath: executionPath, outcome: 'completed', text: 'done', usage: null, error: null },
+    ...(session === undefined ? {} : { sessionId: session }),
+    ...(workspace === undefined ? {} : { workspaceId: workspace }),
+    ...rest,
+  });
+}
+
+/** The archived session ids a host controller recorded, in call order. */
+function archiveRecorder() {
+  const archived = [];
+  return {
+    archived,
+    archiveSession: async (sessionId) => {
+      archived.push(typeof sessionId === 'string' ? sessionId : sessionId?.sessionId ?? '');
+    },
+  };
+}
+
+/**
+ * A host `workspaces` controller double.
+ *
+ * The cleanup module reaches a controller only for a session ARCHIVE
+ * (`archiveSession`); it plans Workspace removals (`removedWorkspaceIds`) and reports
+ * them, leaving the caller that owns the host service to perform them. So `delete` here
+ * records what WOULD have been removed — an assertion that it stayed empty is part of
+ * the proof that a shared checkout is never touched through this path.
+ * @returns {{ removed: string[], archiveSession: Function, delete: Function }} double.
+ */
+function workspaceRecorder() {
+  const removed = [];
+  return {
+    removed,
+    archiveSession: async () => {},
+    delete: async (target) => {
+      removed.push(typeof target === 'string' ? target : target?.workspaceId ?? '');
+    },
+  };
+}
+
+test('linked cleanup is per isolation: a worktree task loses its tree, a shared task loses nothing but its session', { timeout: 30000 }, async () => {
+  const dir = await dataDir();
+  const built = await buildDeps(dir);
+  try {
+    const rootDir = join(dir, 'worktrees');
+    await directory(rootDir);
+    const worktreePath = join(rootDir, 'task-wt-1-abc12345');
+    const sharedPath = await directory(join(dir, 'shared-project'));
+    const keepPath = join(rootDir, 'task-keep-1-abc12345');
+    const keepTreeFile = join(await directory(keepPath), 'kept.txt');
+    await writeFile(keepTreeFile, 'still here', 'utf8');
+    // The tree the cleaned task owned, with a file a careless `rm` of the parent would take.
+    await writeFile(join(await directory(worktreePath), 'owned.txt'), 'remove me', 'utf8');
+
+    const sessions = new SessionStore(dir);
+    await sessions.put({
+      taskId: 'task-wt-1',
+      sourcePath: WORKSPACE,
+      executionPath: worktreePath,
+      workspaceId: 'ws-wt-temp',
+      sessionId: 'sess-wt-1',
+      isolation: 'worktree',
+    });
+    await sessions.put({
+      taskId: 'task-shared-1',
+      sourcePath: sharedPath,
+      executionPath: sharedPath,
+      workspaceId: 'ws-shared-project',
+      sessionId: 'sess-shared-1',
+      isolation: 'shared',
+    });
+    await sessions.put({
+      taskId: 'task-keep',
+      sourcePath: WORKSPACE,
+      executionPath: keepPath,
+      workspaceId: 'ws-keep-temp',
+      sessionId: 'sess-keep',
+      isolation: 'worktree',
+    });
+
+    await built.plans.create({
+      connectionId: 'local-mcp',
+      nodes: [
+        { key: 'parent-plan', title: '父级规划' },
+        { key: 'empty-plan', parentKey: 'parent-plan', title: '只剩空规划' },
+      ],
+    });
+    const planNodes = await built.plans.load();
+    const parentPlan = planNodes.find((entry) => entry.title === '父级规划');
+    const emptyPlan = planNodes.find((entry) => entry.title === '只剩空规划');
+    assert.ok(parentPlan && emptyPlan, 'both planning nodes were created');
+    // A planning node no cleaned task ever named: it must survive the cleanup.
+    await built.plans.create({ connectionId: 'local-mcp', title: '无关规划' });
+    const unrelatedPlan = (await built.plans.load()).find((entry) => entry.title === '无关规划');
+    assert.ok(unrelatedPlan);
+    assert.equal((await built.plans.load()).length, 3);
+
+    await built.history.save(isolated('task-wt-1', {
+      executionPath: worktreePath, isolation: 'worktree', session: 'sess-wt-1', workspace: 'ws-wt-temp',
+      planNodeId: emptyPlan.nodeId, createdAt: 1_700_000_100_000,
+    }));
+    await built.history.save(isolated('task-shared-1', {
+      executionPath: sharedPath, isolation: 'shared', session: 'sess-shared-1', workspace: 'ws-shared-project',
+      createdAt: 1_700_000_200_000,
+    }));
+    await built.history.save(isolated('task-keep', {
+      executionPath: keepPath, isolation: 'worktree', session: 'sess-keep', workspace: 'ws-keep-temp',
+      createdAt: 1_700_000_300_000,
+    }));
+
+    const host = archiveRecorder();
+    const workspaces = workspaceRecorder();
+    const worktrees = new WorktreeManager({ runGit: inertGit() }, { rootDir });
+    // The in-memory registry knows the finished tree, as a running build would.
+    worktrees.trees.set(worktreePath.toLowerCase(), {
+      taskId: 'task-wt-1', workspacePath: worktreePath, sourcePath: WORKSPACE, baseHead: 'a'.repeat(40),
+      isolated: true, detachedVerified: true, state: WORKTREE_STATES.awaitingHostReview,
+      createdAt: 1, completedAt: 2, sourcePreexistingChanges: 0,
+    });
+    // The keep task's tree is still active: nothing may remove it, whatever the batch says.
+    worktrees.trees.set(keepPath.toLowerCase(), {
+      taskId: 'task-keep', workspacePath: keepPath, sourcePath: WORKSPACE, baseHead: 'b'.repeat(40),
+      isolated: true, detachedVerified: true, state: WORKTREE_STATES.active,
+      createdAt: 1, completedAt: null, sourcePreexistingChanges: 0,
+    });
+    const linked = {
+      ...built.deps,
+      sessionStore: sessions,
+      worktrees,
+      workspaces: host,
+      sessionController: null,
+    };
+
+    const response = await call(linked, 'POST', `${USER_PLANE_PREFIX}/tasks/cleanup`, {
+      confirm: true,
+      chains: [
+        { chainId: 'task-wt-1', taskIds: ['task-wt-1'] },
+        { chainId: 'task-shared-1', taskIds: ['task-shared-1'] },
+      ],
+      archiveSessions: true,
+      removeWorktrees: true,
+      cleanPlans: true,
+    });
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.chains, 2);
+    assert.equal(response.body.tasks, 2);
+
+    // 1. Sessions: both dispatched conversations are archived and forgotten, once each.
+    assert.deepEqual([...response.body.cleaned.archivedSessionIds].sort(), ['sess-shared-1', 'sess-wt-1']);
+    assert.deepEqual([...host.archived].sort(), ['sess-shared-1', 'sess-wt-1'], 'the host archived exactly the cleaned chains');
+    assert.deepEqual((await sessions.list()).map((row) => row.taskId), ['task-keep'], 'only the retained row stays in the map');
+    assert.equal(await sessions.get('task-wt-1'), null);
+    assert.equal(await sessions.get('task-shared-1'), null);
+
+    // 2. Worktrees: the managed tree of the WORKTREE task is gone…
+    assert.deepEqual(response.body.cleaned.removedWorktreePaths, [worktreePath]);
+    assert.equal(await exists(worktreePath), false, 'the managed worktree directory was removed');
+    // …and the retained task's tree is untouched.
+    assert.equal(await exists(keepTreeFile), true, 'a tree that still has a task is never swept');
+    assert.equal(await readFile(keepTreeFile, 'utf8'), 'still here');
+
+    // 3. The SHARED task's directory is never touched: it is the project itself.
+    assert.equal(await exists(sharedPath), true, 'a shared workspace directory must survive its record');
+
+    // 4. Temporary Workspaces: the worktree task's is dropped, the shared one is NOT.
+    //
+    // `runCleanup` plans the removals (the ids are reported) and the HOST performs them
+    // through the controller it was given; the record-cleanup module itself never calls
+    // the controller, so `workspaces.removed` is what the controller would delete, not
+    // proof that this call deleted it. What is proven here is that the shared project
+    // Workspace is never even planned for removal.
+    assert.deepEqual(response.body.cleaned.removedWorkspaceIds, ['ws-wt-temp']);
+    assert.ok(!response.body.cleaned.removedWorkspaceIds.includes('ws-keep-temp'), 'a retained task keeps its Workspace');
+    assert.deepEqual(workspaces.removed, [], 'a shared checkout never reaches the Workspace controller');
+    assert.equal(response.body.retained.sourceFiles, true);
+    assert.equal(response.body.retained.sessions, false);
+    assert.equal(response.body.retained.worktrees, false);
+    assert.equal(response.body.retained.plans, false);
+
+    // 5. Plans: the cleaned task's own now-empty node (and its empty ancestor) go; a
+    //    planning node the cleanup never named stays.
+    assert.deepEqual([...response.body.cleaned.removedPlanNodeIds].sort(), [emptyPlan.nodeId, parentPlan.nodeId].sort());
+    const remainingPlans = (await built.plans.load()).map((entry) => entry.nodeId);
+    assert.deepEqual(remainingPlans, [unrelatedPlan.nodeId], 'only the unrelated planning node remains');
+
+    // 6. Only the retained record is left behind.
+    assert.deepEqual((await built.history.load()).map((row) => row.taskId), ['task-keep']);
+    await sessions.dispose();
+  } finally {
+    await teardown(built);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the cleanup flags are optional booleans and an absent flag keeps the old behaviour', () => {
+  const chain = [{ chainId: 'task-a', taskIds: ['task-a'] }];
+  const bare = validateCleanupRequest({ confirm: true, chains: chain });
+  assert.deepEqual(bare.options, { archiveSessions: false, removeWorktrees: false, cleanPlans: false });
+  const all = validateCleanupRequest({
+    confirm: true, chains: chain, archiveSessions: true, removeWorktrees: true, cleanPlans: true,
+  });
+  assert.deepEqual(all.options, { archiveSessions: true, removeWorktrees: true, cleanPlans: true });
+  for (const flag of ['archiveSessions', 'removeWorktrees', 'cleanPlans']) {
+    for (const value of ['true', 1, null, {}, []]) {
+      assert.throws(
+        () => validateCleanupRequest({ confirm: true, chains: chain, [flag]: value }),
+        { code: CLEANUP_CODES.invalid },
+        `${flag}=${JSON.stringify(value)}`,
+      );
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 11. Orphan sweep: what no task record vouches for any more
+// ---------------------------------------------------------------------------
+
+test('the orphan sweep removes only what no task record vouches for, and never a shared checkout', { timeout: 30000 }, async () => {
+  const dir = await dataDir();
+  const built = await buildDeps(dir);
+  try {
+    const rootDir = join(dir, 'worktrees');
+    await directory(rootDir);
+    const sharedPath = await directory(join(dir, 'shared-project'));
+    const orphanTree = join(rootDir, 'task-orphan-1234abcd');
+    await writeFile(join(await directory(orphanTree), 'leftover.txt'), 'orphan', 'utf8');
+    // A residual directory nothing names at all, and a live task's tree.
+    const strayTree = join(rootDir, 'task-stray-9f8e7d6c');
+    await directory(strayTree);
+    const liveTree = join(rootDir, 'task-live-1-0a1b2c3d');
+    await writeFile(join(await directory(liveTree), 'live.txt'), 'in flight', 'utf8');
+
+    // Normal, still-existing tasks: they keep everything they own.
+    await built.history.save(isolated('task-live-1', {
+      executionPath: liveTree, isolation: 'worktree', session: 'sess-live-1', workspace: 'ws-live-temp',
+      createdAt: 1_700_000_100_000, state: 'awaiting-host-review',
+    }));
+    await built.history.save(isolated('task-shared-keep', {
+      executionPath: sharedPath, isolation: 'shared', session: 'sess-shared-keep', workspace: 'ws-shared-project',
+      createdAt: 1_700_000_200_000,
+    }));
+
+    const sessions = new SessionStore(dir);
+    // Rows whose records were already deleted — one isolated, one shared.
+    await sessions.put({
+      taskId: 'task-orphan',
+      sourcePath: WORKSPACE,
+      executionPath: orphanTree,
+      workspaceId: 'ws-orphan-temp',
+      sessionId: 'sess-orphan',
+      isolation: 'worktree',
+    });
+    await sessions.put({
+      taskId: 'task-orphan-shared',
+      sourcePath: sharedPath,
+      executionPath: sharedPath,
+      workspaceId: 'ws-shared-project',
+      sessionId: 'sess-orphan-shared',
+      isolation: 'shared',
+    });
+    // Rows of the tasks that still exist: they must not be touched.
+    await sessions.put({
+      taskId: 'task-live-1', sourcePath: WORKSPACE, executionPath: liveTree,
+      workspaceId: 'ws-live-temp', sessionId: 'sess-live-1', isolation: 'worktree',
+    });
+    await sessions.put({
+      taskId: 'task-shared-keep', sourcePath: sharedPath, executionPath: sharedPath,
+      workspaceId: 'ws-shared-project', sessionId: 'sess-shared-keep', isolation: 'shared',
+    });
+
+    const host = archiveRecorder();
+    const workspaces = workspaceRecorder();
+    const worktrees = new WorktreeManager({ runGit: inertGit() }, { rootDir });
+    worktrees.trees.set(liveTree.toLowerCase(), {
+      taskId: 'task-live-1', workspacePath: liveTree, sourcePath: WORKSPACE, baseHead: 'c'.repeat(40),
+      isolated: true, detachedVerified: true, state: WORKTREE_STATES.active,
+      createdAt: 1, completedAt: null, sourcePreexistingChanges: 0,
+    });
+    const linked = { ...built.deps, sessionStore: sessions, worktrees, workspaces: host, sessionController: null };
+
+    // The route is one POST, and it needs an explicit confirmation.
+    const routes = wrapUserPlaneRoutes(linked);
+    const orphanRoute = routes.filter((route) => route.path === `${USER_PLANE_PREFIX}/tasks/cleanup-orphans`);
+    assert.equal(orphanRoute.length, 1);
+    assert.deepEqual(orphanRoute[0].methods, ['POST']);
+    assert.equal(orphanRoute[0].requestBody, 'buffered');
+    assert.throws(() => validateOrphanCleanupRequest({ confirm: false }), { code: CLEANUP_CODES.invalid });
+    assert.throws(() => validateOrphanCleanupRequest({ confirm: true, cleanPlans: true }), { code: CLEANUP_CODES.invalid });
+    const unconfirmed = await call(linked, 'POST', `${USER_PLANE_PREFIX}/tasks/cleanup-orphans`, { confirm: false });
+    assert.ok(unconfirmed.status >= 400 && unconfirmed.status < 500, JSON.stringify(unconfirmed.body));
+    assert.equal(await exists(orphanTree), true, 'an unconfirmed request removes nothing');
+
+    const response = await call(linked, 'POST', `${USER_PLANE_PREFIX}/tasks/cleanup-orphans`, { confirm: true });
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.orphanSessionsForgotten, 2);
+
+    // 1. The two records that no longer exist had their conversations archived…
+    assert.deepEqual([...response.body.cleaned.archivedSessionIds].sort(), ['sess-orphan', 'sess-orphan-shared']);
+    // …and their map rows are gone, while the two existing tasks keep theirs.
+    assert.deepEqual(
+      (await sessions.list()).map((row) => row.taskId).sort(),
+      ['task-live-1', 'task-shared-keep'],
+    );
+
+    // 2. The residual tree under the plugin root is removed — both the one the deleted
+    //    record named and the one nothing names at all.
+    const removedPaths = response.body.cleaned.removedWorktreePaths.map((value) => value.replace(/[\\/]+$/u, ''));
+    assert.ok(removedPaths.includes(orphanTree.replace(/[\\/]+$/u, '')), JSON.stringify(removedPaths));
+    assert.ok(removedPaths.includes(strayTree.replace(/[\\/]+$/u, '')), JSON.stringify(removedPaths));
+    assert.equal(await exists(orphanTree), false);
+    assert.equal(await exists(strayTree), false);
+
+    // 3. The temporary Workspace of the orphaned isolated task is planned for removal;
+    //    the shared project Workspace and the live task's are never named, and nothing
+    //    was handed to the controller's `delete` at all.
+    assert.deepEqual(response.body.cleaned.removedWorkspaceIds, ['ws-orphan-temp']);
+    assert.deepEqual(workspaces.removed, [], 'a shared checkout never reaches the Workspace controller');
+
+    // 4. Nothing a remaining task owns was touched.
+    assert.equal(await exists(liveTree), true, 'a live task keeps its worktree');
+    assert.equal(await readFile(join(liveTree, 'live.txt'), 'utf8'), 'in flight');
+    assert.equal(await exists(sharedPath), true, 'a shared checkout is never swept');
+    assert.deepEqual((await built.history.load()).map((row) => row.taskId).sort(), ['task-live-1', 'task-shared-keep']);
+    assert.deepEqual([...host.archived].sort(), ['sess-orphan', 'sess-orphan-shared']);
+    assert.equal(response.body.retained.sourceFiles, true);
+
+    // 5. A second sweep finds nothing left, and says so instead of claiming work.
+    const again = await runOrphanCleanup(linked, { confirm: true });
+    assert.equal(again.orphanSessionsForgotten, 0);
+    assert.deepEqual(again.cleaned.archivedSessionIds, []);
+    assert.deepEqual(again.cleaned.removedWorktreePaths, []);
+    assert.deepEqual(again.cleaned.removedWorkspaceIds, []);
+    await sessions.dispose();
+  } finally {
     await teardown(built);
     await rm(dir, { recursive: true, force: true });
   }

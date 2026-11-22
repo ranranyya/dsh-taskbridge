@@ -30,14 +30,25 @@ test('new workspaces get task titles, existing workspaces retain their name, dup
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test('placement carries the title into the native workspace', async () => {
+test('placement carries the title into the native workspace for worktree runs, and keeps project name for shared runs', async () => {
   const root = await mkdtemp(join(tmpdir(), 'taskbridge-placement-'));
   const workspaces = fakeWorkspaceController();
   const sessionController = fakeSessionController({ workspaces });
   try {
-    const placed = await placeSession({ workspaces, sessionController }, { path: root, title: '修复授权界面', taskId: 'task-123456' });
-    assert.equal(placed.workspaceTitle, '修复授权界面');
-    assert.equal(workspaces.renames[0].workspaceId, placed.workspaceId);
+    const worktreePlaced = await placeSession(
+      { workspaces, sessionController },
+      { path: join(root, 'wt-1'), title: '修复授权界面', taskId: 'task-123456', isolation: 'worktree' },
+    );
+    assert.equal(worktreePlaced.workspaceTitle, '修复授权界面');
+    assert.equal(workspaces.renames.length, 1);
+    assert.equal(workspaces.renames[0].workspaceId, worktreePlaced.workspaceId);
+
+    const sharedPlaced = await placeSession(
+      { workspaces, sessionController },
+      { path: join(root, 'repo-shared'), title: '单次共享任务标题', taskId: 'task-789012', isolation: 'shared' },
+    );
+    assert.equal(sharedPlaced.workspaceTitle, 'repo-shared');
+    assert.equal(workspaces.renames.length, 1, 'shared-mode runs must not overwrite a newly created project workspace name');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

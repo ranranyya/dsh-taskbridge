@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.8.1 — 任务联动清理、指挥端低耗优化、共享工作区保护与全新架构图（2026-11-23）
+
+- **任务记录联动清理、快捷预设与历史孤儿扫除**：
+  - 设置页「任务记录」支持快捷批量勾选预设（全部可清理 / 仅已通过验收 / 仅失败·取消·中断），以及三项按需勾选的联动清理：归档关联 DSH 派工会话、移除隔离工作树与临时工作区、递归清理空规划父节点；严格按隔离模式区分保护，绝不删除主项目源码与共享工作区。
+  - 打通 `interrupted`（DSH 重启中断且不可恢复）终态历史记录的手动清理与底层 `HistoryStore.deleteMany` 删除，并新增 `POST /api/dsh-delegate/tasks/cleanup-orphans` 一键扫除历史残留工作树与孤儿会话映射。
+- **三重指挥端省 Token 优化**：
+  - Antigravity 规则默认走轻量 `dsh-taskbridge`（`Model: "flash"`）后台子智能体隔离等待与常规审批并只回传结构化精简摘要；修正 `agents/dsh-taskbridge.md` 的 YAML `tools:` 声明（不手写由 `mcp_config.json` 自动注入的 `call_mcp_tool`）。
+  - 底层 `worker-prompt.js` 要求优先使用原生文件/搜索工具代替 Shell 读写日志并禁止未要求的外部网络请求，实测大幅减少沙箱审批回合。
+  - MCP 全量响应改为单行紧凑 JSON，且 `permission` / `question` 交互暂停回合裁剪 `task.activity`、`selfCheck`、`route`、`reviewPersistence` 冗余监控大块。
+- **共享模式工作区命名保护**：仅 `worktree` 隔离模式首次新建工作区时以任务 `title` 命名，`shared` 共享模式保留项目原生工作区名称。
+- **规则、MCP 契约与全新介绍图同步**：修正 MCP `initialize` `instructions`、`delegate_wait` Schema 与兜底提示中的旧版 10 分钟静默口径；写透两种模式均需已提交 Git 仓库根目录及非代码问答边界；补齐双端防重发与三态中断对称规则并登记 `1.8.0` 升级哈希；替换中英文架构图并修复 `README.md` 全部断链与过时参考区。详见 [1.8.1 更新说明](docs/releases/1.8.1.zh.md)。
+
 ## 1.8.0 — Antigravity 一键集成、三层黑盒优化与文档润色（2026-11-22）
 
 - **新增 Antigravity 一键集成**：设置页新增独立「Antigravity 集成」标签页与托管安装器（`src/antigravity/`），可将自包含插件包安装至 `~/.gemini/config/plugins/dsh-taskbridge/`（内含 `plugin.json`、按需加载的 `SKILL.md`、仅含只读与 MCP 权限的后台派工子智能体 `agents/dsh-taskbridge.md` 与插件内独立 `mcp_config.json`），不修改 Antigravity 全局配置。

@@ -1422,7 +1422,7 @@ test('EOF drains outstanding replies instead of truncating them', async () => {
   const lines = harness.chunks.join('').split('\n').filter((line) => line.trim() !== '');
   assert.equal(lines.length, 2, 'the outstanding reply is written, not lost at EOF');
   assert.equal(JSON.parse(lines[1]).id, 2);
-  assert.equal(JSON.parse(lines[1]).result.content[0].text.includes('"reason": "ready"'), true);
+  assert.equal(JSON.parse(JSON.parse(lines[1]).result.content[0].text).reason, 'ready');
 });
 
 // ---------------------------------------------------------------------------
@@ -1512,5 +1512,44 @@ test('a settled state reached while the observer was interrupted still reaches r
   assert.equal(body.reason, 'ready');
   assert.equal(body.terminal, true);
   assert.equal(body.state, 'awaiting-host-review');
+});
+
+test('interactive pauses omit bulky monitoring fields from wait.task while progress checks and terminal returns keep them', async () => {
+  const richTask = summary({
+    state: 'running',
+    phase: 'awaiting-permission',
+    route: { providerId: 'p1', model: 'm1', isolation: 'shared' },
+    reviewPersistence: { state: 'none', accepted: false },
+  });
+  const permServer = waitFixture([
+    observation('permission', {
+      task: richTask,
+      permission: { requestId: 'req-1', state: 'pending', argumentsComplete: true, completeness: 'complete', fingerprint: 'fp-1' },
+    }),
+  ]).server;
+  const perm = await callWait(permServer, { taskId: 'task-wait-1', waitSeconds: 60 });
+  assert.equal(perm.body.reason, 'permission');
+  assert.equal('activity' in perm.body.task, false, 'permission pause omits bulky activity');
+  assert.equal('selfCheck' in perm.body.task, false, 'permission pause omits selfCheck');
+  assert.equal('route' in perm.body.task, false, 'permission pause omits static route');
+  assert.equal('reviewPersistence' in perm.body.task, false, 'permission pause omits reviewPersistence');
+
+  const attentionServer = waitFixture([observation('attention', { task: richTask })]).server;
+  const attn = await callWait(attentionServer, { taskId: 'task-wait-1', waitSeconds: 60 });
+  assert.equal(attn.body.reason, 'attention');
+  assert.deepEqual(attn.body.task.activity, { toolCalls: 7, turns: 2 });
+  assert.deepEqual(attn.body.task.selfCheck, { ok: true });
+  assert.equal(attn.body.task.route.providerId, 'p1');
+  assert.doesNotMatch(attn.body.instruction, /ten minutes by default|may be stuck/iu);
+
+  const waitTool = TOOLS.find((entry) => entry.name === 'delegate_wait');
+  assert.doesNotMatch(waitTool.description, /ten minutes by default|so it may be stuck/iu);
+
+  const initResp = await permServer.handle({ jsonrpc: '2.0', id: 99, method: 'initialize', params: {} });
+  const initText = initResp.result.instructions;
+  assert.doesNotMatch(initText, /genuine inactivity|ten minutes by default/iu);
+  assert.match(initText, /question/u);
+  assert.match(initText, /NO default total execution timeout/u);
+  assert.match(initText, /completionSummary/u);
 });
 

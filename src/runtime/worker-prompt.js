@@ -25,10 +25,11 @@ export function buildWorkerPrompt(input) {
   }
   lines.push('- Do not commit, push, tag, or rewrite git history.');
   lines.push('- Do not read or print credentials, tokens, or .env contents.');
-  lines.push('- Do not install packages from the network unless the task explicitly requires it.');
+  lines.push('- Do not install packages or make external network requests (`Invoke-WebRequest`, `curl`, `wget`, etc.) unless the task explicitly requires it.');
   lines.push('- Report what you changed and what you could not do. Do not claim checks you did not run.');
   lines.push('');
   lines.push('## Checks and extra permissions');
+  lines.push('- Always prefer native file/search/edit tools (read, grep, glob, edit, write) over shell commands (`pwsh`, `powershell`, `cmd`, `bash`, `Get-Content`, `Select-String`, `cat`, `ls`, `dir`) to inspect files, search code, or read logs. Reserve shell commands strictly for running tests, builds, typechecks, and git inspection.');
   lines.push('- Read ordinary files and logs with the normal file tools and the ordinary workspace permission. '
     + 'Do not ask for elevated access merely to read a log, and do not use a sandbox escape as a substitute for '
     + 'a file tool.');

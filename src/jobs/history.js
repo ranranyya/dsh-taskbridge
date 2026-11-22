@@ -467,7 +467,7 @@ export class HistoryStore {
       for (const taskId of ids) {
         const row = byId.get(taskId);
         if (row === undefined) missing.push(taskId);
-        else if (!isTerminal(row.state) || row.state === 'interrupted') live.push(taskId);
+        else if (!isTerminal(row.state)) live.push(taskId);
       }
       if (missing.length > 0 || live.length > 0) {
         // The ids are echoed back because the caller sent them; nothing else is.

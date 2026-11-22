@@ -1,8 +1,11 @@
 import { buildTaskTree } from './task-tree.js';
 import { HISTORY_CODES, HISTORY_DELETE_MAX_TASKS } from './history.js';
+import { sessionPathKey } from '../runtime/session-placement.js';
 
 export const MAX_CLEANUP_CHAINS = 100;
-const FINISHED = new Set(['awaiting-host-review', 'failed', 'cancelled']);
+const FINISHED = new Set(['awaiting-host-review', 'failed', 'cancelled', 'interrupted']);
+const ALLOWED_CLEANUP_KEYS = new Set(['chains', 'confirm', 'archiveSessions', 'removeWorktrees', 'cleanPlans']);
+const ALLOWED_ORPHAN_KEYS = new Set(['confirm', 'archiveSessions', 'removeWorktrees']);
 
 export const CLEANUP_CODES = Object.freeze({
   invalid: 'CLEANUP_INVALID',
@@ -40,10 +43,15 @@ function isId(value) {
 }
 
 export function validateCleanupRequest(body) {
-  if (!isObject(body) || Object.keys(body).some((key) => key !== 'chains' && key !== 'confirm')) {
+  if (!isObject(body) || Object.keys(body).some((key) => !ALLOWED_CLEANUP_KEYS.has(key))) {
     invalid('expected only chains and explicit confirmation');
   }
   if (body.confirm !== true) invalid('cleanup requires explicit confirmation', { field: 'confirm' });
+  for (const flag of ['archiveSessions', 'removeWorktrees', 'cleanPlans']) {
+    if (body[flag] !== undefined && typeof body[flag] !== 'boolean') {
+      invalid(`${flag} must be a boolean`, { field: flag });
+    }
+  }
   if (!Array.isArray(body.chains) || body.chains.length === 0 || body.chains.length > MAX_CLEANUP_CHAINS) {
     invalid('select a bounded list of execution chains', { field: 'chains', limit: MAX_CLEANUP_CHAINS });
   }
@@ -63,7 +71,14 @@ export function validateCleanupRequest(body) {
     }
     return { chainId: chain.chainId, taskIds: [...chain.taskIds] };
   });
-  return { chains };
+  return {
+    chains,
+    options: {
+      archiveSessions: body.archiveSessions === true,
+      removeWorktrees: body.removeWorktrees === true,
+      cleanPlans: body.cleanPlans === true,
+    },
+  };
 }
 
 function planStore(deps) {
@@ -152,7 +167,7 @@ function checkBatch(chains, context) {
 }
 
 export async function runCleanup(deps, body) {
-  const { chains } = validateCleanupRequest(body);
+  const { chains, options } = validateCleanupRequest(body);
   const store = deps.history;
   const plans = planStore(deps);
   const engine = deps.engine;
@@ -160,6 +175,9 @@ export async function runCleanup(deps, body) {
     throw new CleanupError(CLEANUP_CODES.unavailable, 'task record cleanup is unavailable');
   }
   const ids = chains.flatMap((chain) => chain.taskIds);
+  const idsSet = new Set(ids);
+  let deletedRowsSnapshot = [];
+  let remainingRowsSnapshot = [];
   const deleteRecords = async (planNodes) => {
     let release;
     try {
@@ -167,7 +185,11 @@ export async function runCleanup(deps, body) {
         beforeWrite(archived) {
           // Read the latest engine state inside the history queue. No asynchronous
           // work may run between checking relationships and reserving these ids.
-          checkBatch(chains, cleanupContext(engine, archived, planNodes));
+          const context = cleanupContext(engine, archived, planNodes);
+          checkBatch(chains, context);
+          const allTasks = new Map([...context.archivedById, ...context.liveById]);
+          deletedRowsSnapshot = ids.map((id) => allTasks.get(id)).filter(Boolean);
+          remainingRowsSnapshot = [...allTasks.values()].filter((row) => !idsSet.has(row.taskId));
           release = engine?.reserveCleanupIds(ids);
         },
         afterWrite(deletedIds) {
@@ -187,10 +209,433 @@ export async function runCleanup(deps, body) {
       : error?.code === HISTORY_CODES.writeFailed ? CLEANUP_CODES.failed : CLEANUP_CODES.unavailable;
     throw new CleanupError(code, 'the task records could not be removed', { deleted: 0 });
   }
+
+  const hasLinkedCleanup = options.archiveSessions || options.removeWorktrees || options.cleanPlans;
+  if (!hasLinkedCleanup) {
+    return {
+      chains: chains.length,
+      tasks: result.deletedTaskIds.length,
+      ...result,
+      retained: { sessions: true, workspaces: true, worktrees: true, sourceFiles: true, plans: true },
+    };
+  }
+
+  const linked = await performLinkedCleanup(deps, {
+    options,
+    deletedTaskIds: result.deletedTaskIds,
+    deletedRows: deletedRowsSnapshot,
+    remainingRows: remainingRowsSnapshot,
+    plans,
+  });
+
   return {
     chains: chains.length,
     tasks: result.deletedTaskIds.length,
     ...result,
-    retained: { sessions: true, workspaces: true, worktrees: true, sourceFiles: true, plans: true },
+    retained: {
+      sessions: !options.archiveSessions,
+      workspaces: !options.removeWorktrees,
+      worktrees: !options.removeWorktrees,
+      sourceFiles: true,
+      plans: !options.cleanPlans,
+    },
+    cleaned: linked,
+  };
+}
+
+function firstNonEmpty(...values) {
+  for (const val of values) {
+    if (typeof val === 'string' && val.trim() !== '') return val.trim();
+  }
+  return null;
+}
+
+function extractTaskFacts(row, sessionRow = null) {
+  const isolation = firstNonEmpty(
+    row?.isolation,
+    row?.effective?.worker?.isolation,
+    sessionRow?.isolation,
+  );
+  const sourcePath = firstNonEmpty(
+    sessionRow?.sourcePath,
+    row?.sourcePath,
+    row?.execution?.sourcePath,
+    row?.conversation?.sourcePath,
+  );
+  const executionPath = firstNonEmpty(
+    sessionRow?.executionPath,
+    row?.executionWorkspacePath,
+    row?.worktree?.workspacePath,
+    row?.execution?.workspacePath,
+    row?.workspacePath,
+  );
+  const workspaceId = firstNonEmpty(
+    sessionRow?.workspaceId,
+    row?.workspaceId,
+    row?.execution?.workspaceId,
+    row?.execution?.conversation?.workspaceId,
+    row?.conversation?.workspaceId,
+  );
+  const sessionId = firstNonEmpty(
+    sessionRow?.sessionId,
+    row?.sessionId,
+    row?.execution?.sessionId,
+    row?.execution?.conversation?.sessionId,
+    row?.conversation?.sessionId,
+  );
+  return {
+    taskId: firstNonEmpty(row?.taskId, sessionRow?.taskId),
+    isolation,
+    sourcePath,
+    executionPath,
+    workspaceId,
+    sessionId,
+    planNodeId: firstNonEmpty(row?.planNodeId),
+    parentNodeId: firstNonEmpty(row?.parentNodeId),
+  };
+}
+
+function resolveController(serviceOrAccessor) {
+  if (serviceOrAccessor === null || serviceOrAccessor === undefined) return null;
+  if (typeof serviceOrAccessor === 'object' && 'current' in serviceOrAccessor) {
+    return serviceOrAccessor.current ?? null;
+  }
+  return serviceOrAccessor;
+}
+
+async function tryArchiveHostSession(deps, sessionId) {
+  const ws = resolveController(deps?.workspaces);
+  if (typeof ws?.archiveSession === 'function') {
+    try {
+      await ws.archiveSession(sessionId);
+      return true;
+    } catch {
+      try {
+        await ws.archiveSession({ sessionId });
+        return true;
+      } catch {
+        // Ignore host controller error; browser client also reconciles via client workspaces service.
+      }
+    }
+  }
+  const sc = resolveController(deps?.sessionController);
+  if (typeof sc?.archiveSession === 'function') {
+    try {
+      await sc.archiveSession(sessionId);
+      return true;
+    } catch {
+      // Ignore
+    }
+  }
+  return false;
+}
+
+async function tryDeleteHostWorkspace(deps, workspaceId) {
+  const ws = resolveController(deps?.workspaces);
+  if (typeof ws?.delete === 'function') {
+    try {
+      await ws.delete(workspaceId);
+      return true;
+    } catch {
+      try {
+        await ws.delete({ workspaceId });
+        return true;
+      } catch {
+        // Ignore
+      }
+    }
+  }
+  return false;
+}
+
+async function performLinkedCleanup(deps, { options, deletedTaskIds, deletedRows, remainingRows, plans }) {
+  const deletedSet = new Set(deletedTaskIds);
+  let sessionRows = [];
+  if (typeof deps?.sessionStore?.list === 'function') {
+    try {
+      sessionRows = await deps.sessionStore.list();
+    } catch {
+      sessionRows = [];
+    }
+  }
+  const sessionByTask = new Map(sessionRows.map((row) => [row.taskId, row]));
+
+  const activeSessionIds = new Set();
+  const activeWorkspaceIds = new Set();
+  const activeExecKeys = new Set();
+  for (const row of remainingRows) {
+    const facts = extractTaskFacts(row, sessionByTask.get(row.taskId));
+    if (facts.sessionId !== null) activeSessionIds.add(facts.sessionId);
+    if (facts.workspaceId !== null) activeWorkspaceIds.add(facts.workspaceId);
+    const execKey = sessionPathKey(facts.executionPath);
+    if (execKey !== null) activeExecKeys.add(execKey);
+  }
+
+  const deletedFacts = deletedTaskIds.map((taskId) => {
+    const row = deletedRows.find((item) => item?.taskId === taskId) ?? { taskId };
+    return extractTaskFacts(row, sessionByTask.get(taskId));
+  });
+
+  const archivedSessionIds = [];
+  const archivedSet = new Set();
+  if (options.archiveSessions) {
+    for (const facts of deletedFacts) {
+      if (facts.sessionId !== null && !activeSessionIds.has(facts.sessionId) && !archivedSet.has(facts.sessionId)) {
+        archivedSet.add(facts.sessionId);
+        archivedSessionIds.push(facts.sessionId);
+        await tryArchiveHostSession(deps, facts.sessionId);
+      }
+    }
+    if (typeof deps?.sessionStore?.forgetMany === 'function') {
+      await deps.sessionStore.forgetMany(deletedSet).catch(() => []);
+    } else if (typeof deps?.sessionStore?.forget === 'function') {
+      for (const id of deletedSet) {
+        await deps.sessionStore.forget(id).catch(() => false);
+      }
+    }
+  }
+
+  const removedWorktreePaths = [];
+  const removedWorktreeSet = new Set();
+  const removedWorkspaceIds = [];
+  const removedWorkspaceSet = new Set();
+
+  if (options.removeWorktrees) {
+    for (const facts of deletedFacts) {
+      // Strictly operate ONLY on worktree-isolated tasks; never touch shared directories or shared workspaces.
+      if (facts.isolation !== 'worktree') continue;
+      const execKey = sessionPathKey(facts.executionPath);
+      const sourceKey = sessionPathKey(facts.sourcePath);
+      if (execKey === null || execKey === sourceKey || activeExecKeys.has(execKey)) continue;
+
+      let worktreeEligibleForWorkspaceRemoval = false;
+      if (typeof deps?.worktrees?.removeManagedTree === 'function') {
+        if (!removedWorktreeSet.has(execKey)) {
+          const outcome = await deps.worktrees.removeManagedTree({
+            taskId: facts.taskId,
+            sourcePath: facts.sourcePath,
+            workspacePath: facts.executionPath,
+          });
+          if (outcome.removed && outcome.workspacePath) {
+            removedWorktreeSet.add(execKey);
+            removedWorktreePaths.push(outcome.workspacePath);
+            worktreeEligibleForWorkspaceRemoval = true;
+          } else if (outcome.reason === 'already-absent') {
+            removedWorktreeSet.add(execKey);
+            worktreeEligibleForWorkspaceRemoval = true;
+          }
+        } else {
+          worktreeEligibleForWorkspaceRemoval = true;
+        }
+      }
+
+      if (
+        worktreeEligibleForWorkspaceRemoval
+        && facts.workspaceId !== null
+        && !activeWorkspaceIds.has(facts.workspaceId)
+        && !removedWorkspaceSet.has(facts.workspaceId)
+      ) {
+        removedWorkspaceSet.add(facts.workspaceId);
+        removedWorkspaceIds.push(facts.workspaceId);
+        await tryDeleteHostWorkspace(deps, facts.workspaceId);
+      }
+    }
+  }
+
+  let removedPlanNodeIds = [];
+  if (options.cleanPlans && typeof plans?.deleteEmptyAncestors === 'function') {
+    const seedPlanIds = new Set();
+    for (const facts of deletedFacts) {
+      if (facts.planNodeId !== null) seedPlanIds.add(facts.planNodeId);
+      if (facts.parentNodeId !== null && facts.parentNodeId.startsWith('plan-')) {
+        seedPlanIds.add(facts.parentNodeId);
+      }
+    }
+    if (seedPlanIds.size > 0) {
+      try {
+        removedPlanNodeIds = await plans.deleteEmptyAncestors(seedPlanIds, remainingRows);
+      } catch {
+        removedPlanNodeIds = [];
+      }
+    }
+  }
+
+  return {
+    archivedSessionIds,
+    removedWorktreePaths,
+    removedWorkspaceIds,
+    removedPlanNodeIds,
+  };
+}
+
+export function validateOrphanCleanupRequest(body) {
+  if (!isObject(body) || Object.keys(body).some((key) => !ALLOWED_ORPHAN_KEYS.has(key))) {
+    invalid('expected explicit confirmation for orphan cleanup');
+  }
+  if (body.confirm !== true) invalid('orphan cleanup requires explicit confirmation', { field: 'confirm' });
+  for (const flag of ['archiveSessions', 'removeWorktrees']) {
+    if (body[flag] !== undefined && typeof body[flag] !== 'boolean') {
+      invalid(`${flag} must be a boolean`, { field: flag });
+    }
+  }
+  return {
+    archiveSessions: body.archiveSessions !== false,
+    removeWorktrees: body.removeWorktrees !== false,
+  };
+}
+
+/**
+ * Sweep residual worktrees and dispatched session identities whose task records
+ * were already deleted or rotated out of `history.json`.
+ *
+ * Strictly preserves any session, workspace or directory still referenced by a live
+ * or retained historical task, and never touches a shared checkout or shared project
+ * Workspace.
+ * @param {object} deps - runtime dependencies.
+ * @param {object} body - `{ confirm: true, archiveSessions?: boolean, removeWorktrees?: boolean }`.
+ * @returns {Promise<object>} sweep outcome.
+ */
+export async function runOrphanCleanup(deps, body) {
+  const options = validateOrphanCleanupRequest(body);
+  const store = deps?.history;
+  if (typeof store?.load !== 'function') {
+    throw new CleanupError(CLEANUP_CODES.unavailable, 'task history is unavailable');
+  }
+  let archived = [];
+  try {
+    archived = await store.load();
+  } catch {
+    throw new CleanupError(CLEANUP_CODES.unavailable, 'task history could not be read');
+  }
+  const live = deps?.engine?.list?.() ?? [];
+  const allExisting = [...archived, ...live];
+  const existingTaskIds = new Set(allExisting.map((row) => row?.taskId).filter(Boolean));
+
+  let sessionRows = [];
+  if (typeof deps?.sessionStore?.list === 'function') {
+    try {
+      sessionRows = await deps.sessionStore.list();
+    } catch {
+      sessionRows = [];
+    }
+  }
+  const sessionByTask = new Map(sessionRows.map((row) => [row.taskId, row]));
+
+  const activeSessionIds = new Set();
+  const activeWorkspaceIds = new Set();
+  const activeExecKeys = new Set();
+  const activeExecPaths = [];
+  const knownSourcePaths = new Set();
+
+  for (const row of allExisting) {
+    const facts = extractTaskFacts(row, sessionByTask.get(row.taskId));
+    if (facts.sessionId !== null) activeSessionIds.add(facts.sessionId);
+    if (facts.workspaceId !== null) activeWorkspaceIds.add(facts.workspaceId);
+    if (facts.sourcePath !== null) knownSourcePaths.add(facts.sourcePath);
+    if (facts.executionPath !== null) {
+      activeExecPaths.push(facts.executionPath);
+      const key = sessionPathKey(facts.executionPath);
+      if (key !== null) activeExecKeys.add(key);
+    }
+  }
+
+  const orphanRows = sessionRows.filter((row) => typeof row?.taskId === 'string' && !existingTaskIds.has(row.taskId));
+  const orphanTaskIds = orphanRows.map((row) => row.taskId);
+
+  const archivedSessionIds = [];
+  const archivedSet = new Set();
+  const removedWorktreePaths = [];
+  const removedWorktreeSet = new Set();
+  const removedWorkspaceIds = [];
+  const removedWorkspaceSet = new Set();
+
+  for (const row of orphanRows) {
+    const facts = extractTaskFacts(null, row);
+    if (facts.sourcePath !== null) knownSourcePaths.add(facts.sourcePath);
+
+    if (options.archiveSessions && facts.sessionId !== null) {
+      if (!activeSessionIds.has(facts.sessionId) && !archivedSet.has(facts.sessionId)) {
+        archivedSet.add(facts.sessionId);
+        archivedSessionIds.push(facts.sessionId);
+        await tryArchiveHostSession(deps, facts.sessionId);
+      }
+    }
+
+    if (options.removeWorktrees && facts.isolation === 'worktree') {
+      const execKey = sessionPathKey(facts.executionPath);
+      const sourceKey = sessionPathKey(facts.sourcePath);
+      if (execKey !== null && execKey !== sourceKey && !activeExecKeys.has(execKey)) {
+        let canRemoveWs = false;
+        if (typeof deps?.worktrees?.removeManagedTree === 'function') {
+          if (!removedWorktreeSet.has(execKey)) {
+            const wt = await deps.worktrees.removeManagedTree({
+              taskId: facts.taskId,
+              sourcePath: facts.sourcePath,
+              workspacePath: facts.executionPath,
+            });
+            if (wt.removed && wt.workspacePath) {
+              removedWorktreeSet.add(execKey);
+              removedWorktreePaths.push(wt.workspacePath);
+              canRemoveWs = true;
+            } else if (wt.reason === 'already-absent') {
+              removedWorktreeSet.add(execKey);
+              canRemoveWs = true;
+            }
+          } else {
+            canRemoveWs = true;
+          }
+        }
+        if (
+          canRemoveWs
+          && facts.workspaceId !== null
+          && !activeWorkspaceIds.has(facts.workspaceId)
+          && !removedWorkspaceSet.has(facts.workspaceId)
+        ) {
+          removedWorkspaceSet.add(facts.workspaceId);
+          removedWorkspaceIds.push(facts.workspaceId);
+          await tryDeleteHostWorkspace(deps, facts.workspaceId);
+        }
+      }
+    }
+  }
+
+  if (options.archiveSessions && orphanTaskIds.length > 0) {
+    if (typeof deps?.sessionStore?.forgetMany === 'function') {
+      await deps.sessionStore.forgetMany(orphanTaskIds).catch(() => []);
+    } else if (typeof deps?.sessionStore?.forget === 'function') {
+      for (const id of orphanTaskIds) {
+        await deps.sessionStore.forget(id).catch(() => false);
+      }
+    }
+  }
+
+  if (options.removeWorktrees && typeof deps?.worktrees?.sweepOrphanTrees === 'function') {
+    try {
+      const swept = await deps.worktrees.sweepOrphanTrees({
+        activePaths: activeExecPaths,
+        sourcePaths: [...knownSourcePaths],
+      });
+      for (const wtPath of Array.isArray(swept?.removedWorktreePaths) ? swept.removedWorktreePaths : []) {
+        const key = sessionPathKey(wtPath);
+        if (key !== null && !removedWorktreeSet.has(key)) {
+          removedWorktreeSet.add(key);
+          removedWorktreePaths.push(wtPath);
+        }
+      }
+    } catch {
+      // Best-effort disk sweep.
+    }
+  }
+
+  return {
+    orphanSessionsForgotten: options.archiveSessions ? orphanTaskIds.length : 0,
+    cleaned: {
+      archivedSessionIds,
+      removedWorktreePaths,
+      removedWorkspaceIds,
+    },
+    retained: {
+      sourceFiles: true,
+    },
   };
 }
