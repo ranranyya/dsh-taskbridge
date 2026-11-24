@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,8 +16,8 @@ import {
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const previous = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.3.toml'), 'utf8');
 const previous154 = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.4.toml'), 'utf8');
-const current = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
-const version = '1.6.0';
+const current = readFileSync(join(ROOT, 'codex/skills/dsh-taskbridge/SKILL.md'), 'utf8');
+const version = '1.9.0';
 
 useDirectoryClassifier(async (paths) => new Map(paths.map((path) => {
   let kind = 'missing';
@@ -45,31 +45,40 @@ test('the placement rules keep the exact published 1.5.3 and 1.5.4 identities up
   }
 });
 
-test('a real temporary Codex home upgrades only known rules and preserves custom edits and config', async () => {
+test('a real temporary Codex home upgrades only known rules into native skill, retires old toml, and preserves custom edits and config', async () => {
   for (const oldText of [previous, previous.replace(/\r\n/gu, '\n'), previous154, previous154.replace(/\r\n/gu, '\n')]) {
     const home = mkdtempSync(join(tmpdir(), 'taskbridge-placement-rules-'));
     try {
-      const agent = join(home, 'agents/dsh-taskbridge.toml');
+      const legacyAgent = join(home, 'agents/dsh-taskbridge.toml');
+      const skill = join(home, 'skills/dsh-taskbridge/SKILL.md');
       const config = join(home, 'config.toml');
       const configText = '# operator settings\r\nmodel = "operator-model"\r\n';
       mkdirSync(join(home, 'agents'));
-      writeFileSync(agent, oldText);
+      writeFileSync(legacyAgent, oldText);
       writeFileSync(config, configText);
       const options = { codexHome: home, env: { DSH_HOME: join(home, '.dsh-test-home') }, version };
-      assert.equal((await readCodexStatus(options)).agent.state, 'outdated');
+      const initial = await readCodexStatus(options);
+      assert.equal(initial.legacyAgents.state, 'managed-legacy');
       const upgraded = await refreshKnownAgentTemplate(options);
-      assert.deepEqual(upgraded.changed, ['agent']);
+      assert.deepEqual(upgraded.changed, ['agent', 'legacyAgent']);
       assert.deepEqual(upgraded.refused, []);
-      assert.equal(readFileSync(agent, 'utf8'), renderAgentFile(current, version));
+      assert.equal(readFileSync(skill, 'utf8'), renderAgentFile(current, version));
+      assert.equal(existsSync(legacyAgent), false, 'untouched legacy subagent must be retired');
       assert.equal(readFileSync(config, 'utf8'), configText);
       assert.equal((await readCodexStatus(options)).agent.state, 'installed');
       assert.deepEqual((await refreshKnownAgentTemplate(options)).changed, []);
 
-      const edited = `${oldText}\n# operator change\n`;
-      writeFileSync(agent, edited);
+      const editedSkill = `${readFileSync(skill, 'utf8')}\n<!-- operator change -->\n`;
+      writeFileSync(skill, editedSkill);
       assert.equal((await readCodexStatus(options)).agent.state, 'modified');
       assert.deepEqual((await refreshKnownAgentTemplate(options)).changed, []);
-      assert.equal(readFileSync(agent, 'utf8'), edited);
+      assert.equal(readFileSync(skill, 'utf8'), editedSkill);
+
+      const editedLegacy = `${oldText}\n# operator change\n`;
+      writeFileSync(legacyAgent, editedLegacy);
+      assert.equal((await readCodexStatus(options)).legacyAgents.state, 'modified-legacy');
+      assert.deepEqual((await refreshKnownAgentTemplate(options)).changed, []);
+      assert.equal(readFileSync(legacyAgent, 'utf8'), editedLegacy);
       assert.equal(readFileSync(config, 'utf8'), configText);
     } finally {
       rmSync(home, { recursive: true, force: true });

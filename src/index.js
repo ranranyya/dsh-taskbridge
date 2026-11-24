@@ -1,11 +1,11 @@
 // dsh-delegate — native DSH plugin entry point.
 //
 // Load order matters and is visible here: services are injected, configuration is
-// read, a byte-exact shipped Codex agent is refreshed, both HTTP planes are
-// registered on their respective carriers, and the native
-// provider/adapter/worktree/history machinery is constructed. The persisted
-// local-call switch is restored at startup and defaults to OFF; no task is
-// dispatched until an operator enables it in the DSH plugin settings.
+// read, the native provider/adapter/worktree/history machinery is constructed,
+// both HTTP planes are registered on their respective carriers immediately, and
+// byte-exact shipped Codex / Antigravity integrations are refreshed in parallel.
+// The persisted local-call switch is restored at startup and defaults to OFF;
+// no task is dispatched until an operator enables it in the DSH plugin settings.
 //
 // Service access is deliberately split in three:
 //
@@ -296,66 +296,9 @@ export async function apply(ctx, config = {}) {
       hasQuestionService: () => hasQuestionService(ctx),
       logger,
     }),
+    codexStartupRefresh: null,
+    antigravityStartupRefresh: null,
   };
-
-  try {
-    // Both halves of the installed-integration check: a byte-exact shipped agent is
-    // refreshed, and an ALREADY INSTALLED managed `mcp_servers.dsh-delegate` entry that
-    // is merely stale (for example one written before `tool_timeout_sec` existed) is
-    // upgraded in place. Nothing is created here — a home without an entry stays
-    // without one — and an entry this plugin cannot prove it wrote is refused and left
-    // byte-identical.
-    //
-    // The TARGET is the seam's own decision (`startupTarget`), not a second read of
-    // `process.env`: an explicit `CODEX_HOME`, else the home this plugin recorded from a
-    // successful install, else the default only when it is a real directory. A default
-    // that is a link is reported instead of walked, so the automatic upgrade never
-    // writes into a tree nobody named.
-    const target = await deps.codex?.startupTarget?.();
-    let migration = null;
-    if (target?.home) {
-      migration = await deps.codex?.refreshManagedIntegration({
-        startupTarget: target,
-        // The pre-write copy lives in the plugin's own data directory: supportable, not
-        // packaged, and never inside the Codex home.
-        backupDir: join(dataDir, 'codex-config-backup'),
-      });
-    } else if (target !== undefined && target !== null) {
-      logger?.info?.(`dsh-delegate: Codex integration check skipped (${target.reason})`);
-    }
-    if (migration?.changed.includes('agent')) {
-      logger?.info?.(`dsh-delegate: refreshed a managed Codex agent template to ${pluginVersion}`);
-    }
-    if (migration?.changed.includes('mcp')) {
-      logger?.info?.('dsh-delegate: upgraded a stale managed Codex MCP entry in place');
-    }
-    for (const refusal of migration?.refused ?? []) {
-      logger?.warn?.(`dsh-delegate: Codex integration refresh was refused (${refusal.code})`);
-    }
-  } catch (error) {
-    logger?.warn?.(`dsh-delegate: Codex integration refresh check failed (${diagnostic(error?.message ?? error, 200)})`);
-  }
-
-  try {
-    const agyTarget = await deps.antigravity?.startupTarget?.();
-    let agyMigration = null;
-    if (agyTarget?.home) {
-      agyMigration = await deps.antigravity?.refreshManagedIntegration({ startupTarget: agyTarget });
-    } else if (agyTarget !== undefined && agyTarget !== null) {
-      logger?.info?.(`dsh-delegate: Antigravity integration check skipped (${agyTarget.reason})`);
-    }
-    if (agyMigration?.changed.includes('plugin')) {
-      logger?.info?.(`dsh-delegate: refreshed a managed Antigravity plugin bundle to ${pluginVersion}`);
-    }
-    if (agyMigration?.changed.includes('mcp')) {
-      logger?.info?.('dsh-delegate: upgraded a stale managed Antigravity MCP entry in place');
-    }
-    for (const refusal of agyMigration?.refused ?? []) {
-      logger?.warn?.(`dsh-delegate: Antigravity integration refresh was refused (${refusal.code})`);
-    }
-  } catch (error) {
-    logger?.warn?.(`dsh-delegate: Antigravity integration refresh check failed (${diagnostic(error?.message ?? error, 200)})`);
-  }
 
   /**
    * Bring the native routes and the adapter's served snapshot to the state this
@@ -570,6 +513,85 @@ export async function apply(ctx, config = {}) {
     credentials,
     deps,
   });
+
+  // Run Codex and Antigravity startup refreshes AFTER both HTTP planes are registered
+  // (and in parallel), so clicking "Enable immediately" in DSH Desktop never leaves
+  // `/api/dsh-delegate/*` returning 404 while Windows PowerShell checks symlink paths.
+  // The `/codex` and `/antigravity` user-plane routes await their respective refresh
+  // promise before reading or mutating files so there is no startup read/write race.
+  const codexStartupRefresh = (async () => {
+    try {
+      // Both halves of the installed-integration check: a byte-exact shipped agent is
+      // refreshed, and an ALREADY INSTALLED managed `mcp_servers.dsh-delegate` entry that
+      // is merely stale (for example one written before `tool_timeout_sec` existed) is
+      // upgraded in place. Nothing is created here — a home without an entry stays
+      // without one — and an entry this plugin cannot prove it wrote is refused and left
+      // byte-identical.
+      //
+      // The TARGET is the seam's own decision (`startupTarget`), not a second read of
+      // `process.env`: an explicit `CODEX_HOME`, else the home this plugin recorded from a
+      // successful install, else the default only when it is a real directory. A default
+      // that is a link is reported instead of walked, so the automatic upgrade never
+      // writes into a tree nobody named.
+      const target = await deps.codex?.startupTarget?.();
+      let migration = null;
+      if (target?.home) {
+        migration = await deps.codex?.refreshManagedIntegration({
+          startupTarget: target,
+          // The pre-write copy lives in the plugin's own data directory: supportable, not
+          // packaged, and never inside the Codex home.
+          backupDir: join(dataDir, 'codex-config-backup'),
+        });
+      } else if (target !== undefined && target !== null) {
+        logger?.info?.(`dsh-delegate: Codex integration check skipped (${target.reason})`);
+      }
+      if (migration?.changed.includes('agent')) {
+        logger?.info?.(`dsh-delegate: refreshed a managed Codex skill template to ${pluginVersion}`);
+      }
+      if (migration?.changed.includes('legacyAgent')) {
+        logger?.info?.('dsh-delegate: removed managed legacy Codex subagent files');
+      }
+      if (migration?.changed.includes('mcp')) {
+        logger?.info?.('dsh-delegate: upgraded a stale managed Codex MCP entry in place');
+      }
+      for (const refusal of migration?.refused ?? []) {
+        logger?.warn?.(`dsh-delegate: Codex integration refresh was refused (${refusal.code})`);
+      }
+    } catch (error) {
+      logger?.warn?.(`dsh-delegate: Codex integration refresh check failed (${diagnostic(error?.message ?? error, 200)})`);
+    }
+  })().finally(() => {
+    if (deps.codexStartupRefresh === codexStartupRefresh) deps.codexStartupRefresh = null;
+  });
+  deps.codexStartupRefresh = codexStartupRefresh;
+
+  const antigravityStartupRefresh = (async () => {
+    try {
+      const agyTarget = await deps.antigravity?.startupTarget?.();
+      let agyMigration = null;
+      if (agyTarget?.home) {
+        agyMigration = await deps.antigravity?.refreshManagedIntegration({ startupTarget: agyTarget });
+      } else if (agyTarget !== undefined && agyTarget !== null) {
+        logger?.info?.(`dsh-delegate: Antigravity integration check skipped (${agyTarget.reason})`);
+      }
+      if (agyMigration?.changed.includes('plugin')) {
+        logger?.info?.(`dsh-delegate: refreshed a managed Antigravity plugin bundle to ${pluginVersion}`);
+      }
+      if (agyMigration?.changed.includes('mcp')) {
+        logger?.info?.('dsh-delegate: upgraded a stale managed Antigravity MCP entry in place');
+      }
+      for (const refusal of agyMigration?.refused ?? []) {
+        logger?.warn?.(`dsh-delegate: Antigravity integration refresh was refused (${refusal.code})`);
+      }
+    } catch (error) {
+      logger?.warn?.(`dsh-delegate: Antigravity integration refresh check failed (${diagnostic(error?.message ?? error, 200)})`);
+    }
+  })().finally(() => {
+    if (deps.antigravityStartupRefresh === antigravityStartupRefresh) deps.antigravityStartupRefresh = null;
+  });
+  deps.antigravityStartupRefresh = antigravityStartupRefresh;
+
+  await Promise.all([codexStartupRefresh, antigravityStartupRefresh]);
 }
 
 /**

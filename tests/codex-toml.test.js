@@ -9,7 +9,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { codexRuleText as templateText } from './helpers/codex-rule-files.js';
 
 import {
   TomlDocument,
@@ -290,11 +290,6 @@ test('a CR inside a line is still a control character, so a broken document is r
 // stated a choice for this dispatch, preflight is per CHAIN (a verified continuation
 // reuses its facts), and a review only counts once the write is durable.
 
-/** The instruction body of the template shipped in this repository. */
-function templateText() {
-  return readFileSync(new URL('../codex/dsh-taskbridge.toml', import.meta.url), 'utf8');
-}
-
 test('the template puts the agentTeams default under USER control, with a per-task override', () => {
   const text = templateText().replace(/\s+/gu, ' ');
   assert.match(text, /pass `true` or `false` ONLY when the user explicitly stated a choice/u);
@@ -339,5 +334,5 @@ test('the template keeps approval anchored on the concrete operation and forbids
   assert.match(text, /inspect the complete concrete operation, paths and bounds/u);
   assert.match(text, /Quote the exact `fingerprint`/u);
   assert.match(text, /Each allow covers one call only/u);
-  assert.match(text, /Do not edit files or implement anything locally/u);
+  assert.match(text, /Never commit, stash, branch, reset or edit locally while a delegated task is running/u);
 });

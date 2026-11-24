@@ -20,9 +20,10 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative as relativePath, resolve } from 'node:path';
+import { readCodexRuleFiles } from './helpers/codex-rule-files.js';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -37,10 +38,17 @@ import {
   runCodexAction,
   useDirectoryClassifier,
 } from '../src/codex/installer.js';
+import { describeCodexOutcome } from '../src/client/api.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const TEMPLATE_PATH = join(ROOT, 'codex', 'dsh-taskbridge.toml');
+const TEMPLATE_PATH = join(ROOT, 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md');
 const FIXTURES = join(ROOT, 'tests', 'fixtures');
+
+function writeCurrentSkill(path, entry) {
+  const { reference, referencePath } = readCodexRuleFiles();
+  writeFileSync(path, entry, 'utf8');
+  writeFileSync(join(dirname(path), basename(referencePath)), reference, 'utf8');
+}
 const FIXTURE_1_5_1 = join(FIXTURES, 'agent-1.5.1.toml');
 const FIXTURE_1_5_2 = join(FIXTURES, 'agent-1.5.2.toml');
 
@@ -159,18 +167,22 @@ function alternating(text) {
 function spellingVariants(text) {
   const lf = asLf(text);
   const crlf = asCrlf(text);
+  const isSkill = /^---\r?\n/u.test(crlf);
+  const versionPattern = isSkill ? /^<!-- dsh-taskbridge-version: .* -->/mu : /^version[ \t]*=[ \t]*"[^"]*"/mu;
+  const headerPattern = isSkill ? /^<!-- dsh-taskbridge-managed:.*/mu : /^# dsh-taskbridge Codex companion.*/mu;
   return [
     ['lf', lf],
     ['crlf', crlf],
-    ['version-mixed', withOneBareLf(crlf)],
-    ['mixed', withOneBareLf(crlf, /^# dsh-taskbridge Codex companion.*/mu)],
+    ['version-mixed', withOneBareLf(crlf, versionPattern)],
+    ['mixed', withOneBareLf(crlf, headerPattern)],
     ['alternating', alternating(lf)],
   ];
 }
 
-/** A temporary Codex home with its own `agents` directory. */
+/** A temporary Codex home with its own `skills/dsh-taskbridge` and `agents` directories. */
 function temporaryCodexHome() {
   const home = temporaryDirectory('codex-home');
+  mkdirSync(join(home, 'skills', 'dsh-taskbridge'), { recursive: true });
   mkdirSync(join(home, 'agents'), { recursive: true });
   return home;
 }
@@ -180,21 +192,25 @@ function isolatedEnv(codexHome) {
   return { CODEX_HOME: codexHome, DSH_HOME: join(codexHome, '.dsh-test-home'), DSH_DELEGATE_DISCOVERY_FILE: '' };
 }
 
-/** The agent file path inside a Codex home. */
+/** The managed skill file path inside a Codex home. */
+function skillPathOf(home) {
+  return join(home, 'skills', 'dsh-taskbridge', 'SKILL.md');
+}
+
+/** The legacy retired agent file path inside a Codex home. */
 function agentPathOf(home) {
   return join(home, 'agents', 'dsh-taskbridge.toml');
 }
 
 /**
- * A Codex home with an operator `config.toml` whose bytes must survive any agent action.
- * @returns {{ home: string, configPath: string, config: string, agentPath: string }} facts.
+ * A Codex home with an operator `config.toml` whose bytes must survive any skill/agent action.
  */
 function homeWithConfig() {
   const home = temporaryCodexHome();
   const configPath = join(home, 'config.toml');
   const config = '# operator config\r\nmodel = "keep-me"\r\n';
   writeFileSync(configPath, config);
-  return { home, configPath, config, agentPath: agentPathOf(home) };
+  return { home, configPath, config, skillPath: skillPathOf(home), agentPath: agentPathOf(home) };
 }
 
 /**
@@ -223,18 +239,25 @@ const ACTIONS = {
  *   `after` is null when the action deleted the file; `untouched` means the very same file (same
  *   bytes, same timestamp) is still in place.
  */
-async function runAgainstAgent(home, body, action) {
-  const agentPath = agentPathOf(home);
-  writeFileSync(agentPath, body, 'utf8');
-  const beforeMtime = lstatSync(agentPath).mtimeMs;
+async function runAgainstFile(home, filePath, body, action) {
+  writeFileSync(filePath, body, 'utf8');
+  const beforeMtime = lstatSync(filePath).mtimeMs;
   const outcome = await ACTIONS[action](home);
-  const stillThere = lstatSync(agentPath, { throwIfNoEntry: false });
-  const after = stillThere === undefined ? null : readFileSync(agentPath, 'utf8');
+  const stillThere = lstatSync(filePath, { throwIfNoEntry: false });
+  const after = stillThere === undefined ? null : readFileSync(filePath, 'utf8');
   const untouched = stillThere !== undefined && stillThere.mtimeMs === beforeMtime && after === body;
   return { before: body, after, outcome, untouched };
 }
 
-/** The edited bodies every negative case must preserve, as `[label, edit]` pairs. */
+async function runAgainstAgent(home, body, action) {
+  return await runAgainstFile(home, agentPathOf(home), body, action);
+}
+
+async function runAgainstSkill(home, body, action) {
+  return await runAgainstFile(home, skillPathOf(home), body, action);
+}
+
+/** The edited bodies every negative case must preserve, as `[label, edit]` pairs (legacy TOML). */
 const USER_EDITS = {
   'an added comment': (text) => text.replace('\nname = ', '\n# mine\nname = '),
   'an added blank line': (text) => text.replace('\nname = ', '\n\nname = '),
@@ -246,6 +269,20 @@ const USER_EDITS = {
   'a new version line': (text) => text.replace(/^version = ".*"$/mu, 'version = "9.9.9"'),
   'an older version line': (text) => text.replace(/^version = ".*"$/mu, 'version = "1.0.0"'),
   'a removed version line': (text) => text.replace(/^version = ".*"\r?\n/mu, ''),
+};
+
+/** The edited bodies every negative case must preserve for the native SKILL.md template. */
+const SKILL_USER_EDITS = {
+  'an added comment': (text) => `${text}\n<!-- mine -->\n`,
+  'an added blank line': (text) => text.replace('\nname: ', '\n\nname: '),
+  'a trailing space': (text) => text.replace('\nname: ', ' \nname: '),
+  'a tab': (text) => text.replace('\nname: ', '\t\nname: '),
+  'a removed blank line': (text) => text.replace(/^<!-- dsh-taskbridge-version: .* -->\r?\n\r?\n/mu, (match) => match.replace(/\r?\n\r?\n$/u, '\n')),
+  'a byte-order mark': (text) => `\uFEFF${text}`,
+  'a lone CR': (text) => text.replace(/\nname: /u, '\rname: '),
+  'a new version comment': (text) => text.replace(/^<!-- dsh-taskbridge-version: .* -->$/mu, '<!-- dsh-taskbridge-version: 9.9.9 -->'),
+  'an older version comment': (text) => text.replace(/^<!-- dsh-taskbridge-version: .* -->$/mu, '<!-- dsh-taskbridge-version: 1.0.0 -->'),
+  'a removed version comment': (text) => text.replace(/^<!-- dsh-taskbridge-version: .* -->\r?\n/mu, ''),
 };
 
 // ---------------------------------------------------------------------------
@@ -276,11 +313,11 @@ test('every 1.5.1, 1.5.2 and current-template spelling is recognized, and nothin
       assert.equal(isKnownPriorTemplate(form), true, `${label} ${variant} is a known published build`);
     }
   }
-  // The current template is `installed`, not `outdated`: it is the text this build writes, in
-  // any of its spellings.
+  // The current skill template is `installed`, not `outdated`: it is the text this build writes,
+  // in any of its spellings.
   for (const [variant, form] of spellingVariants(current)) {
     const home = temporaryCodexHome();
-    writeFileSync(agentPathOf(home), form, 'utf8');
+    writeCurrentSkill(skillPathOf(home), form);
     const status = await statusOf(home);
     assert.equal(status.agent.state, 'installed', `current template ${variant} is installed`);
     assert.equal(status.agent.expect, form, `current template ${variant}: expect is the exact bytes`);
@@ -293,23 +330,28 @@ test('every 1.5.1, 1.5.2 and current-template spelling is recognized, and nothin
 
 test('every operator edit is still modified, in every spelling of every known text', async () => {
   const current = renderAgentFile(await readAgentTemplate(), VERSION);
-  const bases = {
+  const legacyBases = {
     '1.5.1': readFileSync(FIXTURE_1_5_1, 'utf8'),
     '1.5.2': readFileSync(FIXTURE_1_5_2, 'utf8'),
-    current: current,
   };
-  for (const [name, base] of Object.entries(bases)) {
+  for (const [name, base] of Object.entries(legacyBases)) {
     for (const [variant, form] of spellingVariants(base)) {
       for (const [editLabel, edit] of Object.entries(USER_EDITS)) {
         const edited = edit(form);
         assert.notEqual(edited, form, `${name} ${variant} ${editLabel}: the edit changed the text`);
         assert.equal(isKnownPriorTemplate(edited), false, `${name} ${variant} ${editLabel} is not a known build`);
-        assert.equal(isKnownPriorTemplate(edited, { ignoreVersion: true }), false, `${name} ${variant} ${editLabel} is not a known body either`);
       }
     }
   }
+  for (const [variant, form] of spellingVariants(current)) {
+    for (const [editLabel, edit] of Object.entries(SKILL_USER_EDITS)) {
+      const edited = edit(form);
+      assert.notEqual(edited, form, `current ${variant} ${editLabel}: the edit changed the text`);
+      assert.equal(isKnownPriorTemplate(edited), false, `current ${variant} ${editLabel} is not a known build`);
+    }
+  }
   // Two terminators folded onto one line is an edit, not a spelling.
-  const lf = asLf(bases['1.5.1']);
+  const lf = asLf(legacyBases['1.5.1']);
   assert.equal(isKnownPriorTemplate(`${lf.slice(0, 10)}\r\r\n${lf.slice(10)}`), false, 'a lone CR before a CRLF is an edit');
   assert.equal(isKnownPriorTemplate(`${lf}\r`), false, 'a trailing CR is an edit');
 });
@@ -350,7 +392,6 @@ test('a file with an extra CR per line is never claimed as a known build', async
   for (const [release, shape, text] of extraCarriageReturnShapes()) {
     assert.ok(text.includes('\r'), `${release} ${shape}: the sample carries a CR`);
     assert.equal(isKnownPriorTemplate(text), false, `${release} ${shape} is not a known build`);
-    assert.equal(isKnownPriorTemplate(text, { ignoreVersion: true }), false, `${release} ${shape} is not a known body`);
   }
   // The samples are genuinely different files from the published CRLF form, and one fold leaves a
   // CR behind — which is exactly why a plain fold cannot be trusted as an identity.
@@ -363,22 +404,17 @@ test('a file with an extra CR per line is never claimed as a known build', async
   }
 });
 
-test('an extra-CR file is modified and install, refresh and remove all keep its bytes', async () => {
+test('an extra-CR legacy file is modified-legacy and install, refresh and remove all keep its bytes', async () => {
   for (const [release, shape, text] of extraCarriageReturnShapes()) {
     for (const action of ['install', 'refresh', 'remove']) {
       const { home, agentPath } = homeWithConfig();
       const facts = await runAgainstAgent(home, text, action);
       const status = facts.outcome.status;
-      assert.equal(status.agent.state, 'modified', `${release} ${shape} ${action}: reported modified`);
-      assert.equal(status.agent.managed, false, `${release} ${shape} ${action}: not managed`);
+      assert.equal(status.legacyAgents.state, 'modified-legacy', `${release} ${shape} ${action}: reported modified-legacy`);
       assert.equal(facts.after, text, `${release} ${shape} ${action}: the bytes are unchanged`);
       assert.equal(facts.untouched, true, `${release} ${shape} ${action}: the file was not rewritten or deleted`);
-      assert.equal(facts.outcome.changed.includes('agent'), false, `${release} ${shape} ${action}: no agent write`);
-      if (action === 'install') {
-        assert.ok(
-          facts.outcome.refused.some((entry) => entry.target === 'agent' && entry.code === 'AGENT_USER_MODIFIED'),
-          `${release} ${shape} ${action}: install refuses it as the operator's`,
-        );
+      if (action !== 'install') {
+        assert.equal(facts.outcome.changed.includes('agent'), false, `${release} ${shape} ${action}: no write`);
       }
       assert.equal(readFileSync(agentPath, 'utf8'), text, `${release} ${shape} ${action}: still the same file`);
     }
@@ -389,28 +425,24 @@ test('an extra-CR file is modified and install, refresh and remove all keep its 
 // 3. readAgentState through the real status read
 // ---------------------------------------------------------------------------
 
-test('a mixed-spelling 1.5.1 installation is outdated (upgradable), not modified', async () => {
+test('a mixed-spelling 1.5.1 legacy installation is managed-legacy (upgradable), not modified-legacy', async () => {
   const home = temporaryCodexHome();
   const mixed = withOneBareLf(asCrlf(readFileSync(FIXTURE_1_5_1, 'utf8')));
   writeFileSync(agentPathOf(home), mixed, 'utf8');
   const status = await statusOf(home);
-  assert.equal(status.agent.state, 'outdated', 'the untouched mixed 1.5.1 install is a known prior build');
-  assert.equal(status.agent.reason, null);
-  assert.equal(status.agent.managed, true);
-  assert.equal(status.agent.expect, mixed, 'expect stays the exact bytes that were read');
-  assert.ok(status.notes.some((note) => note.code === 'AGENT_OUTDATED'));
-  assert.equal(status.notes.some((note) => note.code === 'AGENT_USER_MODIFIED'), false);
+  assert.equal(status.legacyAgents.state, 'managed-legacy', 'the untouched mixed 1.5.1 install is a known prior build');
+  assert.equal(status.legacyAgents.entries[0].expect, mixed, 'expect stays the exact bytes that were read');
+  assert.ok(status.notes.some((note) => note.code === 'LEGACY_AGENT_MIGRATION_PENDING'));
+  assert.equal(status.notes.some((note) => note.code === 'LEGACY_AGENT_USER_MODIFIED'), false);
 });
 
-test('an installed current agent is never re-blamed for an older version line it does not carry', async () => {
-  // The same body at another marker is a different identity: it must not be reported as
-  // `installed`, and nothing may invent a version line for it.
+test('an installed current skill is never re-blamed for an older version marker it does not carry', async () => {
   const other = renderAgentFile(await readAgentTemplate(), '0.0.0-older');
   for (const [variant, form] of spellingVariants(other)) {
-    const { home, agentPath, config } = homeWithConfig();
+    const { home, config } = homeWithConfig();
     const status = await statusOf(home);
     assert.equal(status.agent.state, 'not-installed');
-    const facts = await runAgainstAgent(home, form, 'install');
+    const facts = await runAgainstSkill(home, form, 'install');
     assert.notEqual(facts.outcome.status.agent.state, 'installed', `${variant}: a foreign marker is never adopted`);
     if (facts.after === null) continue;
     assert.equal(facts.after, form, `${variant}: install did not rewrite it`);
@@ -425,20 +457,16 @@ test('an installed current agent is never re-blamed for an older version line it
 
 test('renderAgentFile writes LF for LF, CRLF and mixed input and keeps the body verbatim', async () => {
   const template = await readAgentTemplate();
-  assert.match(template, /^version[ \t]*=/mu);
+  assert.match(template, /^<!-- dsh-taskbridge-version: .* -->$/mu);
 
-  // A template whose version line must be INSERTED, with body bytes that must survive. The
-  // sample is minimal on purpose: the insertion lands on the first non-comment, non-blank line,
-  // so the input states that line explicitly.
+  // Legacy TOML input without a version line still gets `version = "<VERSION>"` inserted cleanly.
   const withoutVersion = [
     '# header comment',
     '',
     'name = "x"  ',
     '\ttabbed = 1',
     '',
-    // Every line except the marker and the first `name = …` line: the filter drops a version
-    // line in either spelling (`\r?`, because this text is not normalized before filtering).
-    ...asLf(template).split('\n').filter((line) => !/^version[ \t]*="?/u.test(line) && !/^name = /u.test(line)),
+    'body = "keep"',
   ].join('\n');
   assert.doesNotMatch(withoutVersion, /^version[ \t]*=/mu);
 
@@ -447,12 +475,11 @@ test('renderAgentFile writes LF for LF, CRLF and mixed input and keeps the body 
     assert.equal(measure(rendered).crlf, 0, `${label}: the managed file is LF only`);
     assert.equal(measure(rendered).bareLf, measure(asLf(input)).bareLf, `${label}: the line count is unchanged`);
     assert.equal(rendered, renderAgentFile(template, VERSION), `${label}: every spelling renders the same bytes`);
-    assert.ok(`\n${rendered}`.includes(`\nversion = "${VERSION}"\n`), `${label}: the version line is stamped`);
+    assert.ok(`\n${rendered}`.includes(`\n<!-- dsh-taskbridge-version: ${VERSION} -->\n`), `${label}: the version comment is stamped`);
     assert.equal(/\r/u.test(rendered), false, `${label}: no CR survives into the managed file`);
   }
 
-  // This input has no version line at all, so the sampled line is its header comment: the
-  // variants still cover LF, CRLF, a one-terminator mixture and alternation.
+  // Legacy TOML insertion path remains verbatim-preserving.
   const insertions = [];
   const sampleLine = /^# header comment/mu;
   const insertVariants = [
@@ -467,7 +494,6 @@ test('renderAgentFile writes LF for LF, CRLF and mixed input and keeps the body 
     const rendered = renderAgentFile(input, VERSION);
     assert.equal(measure(rendered).crlf, 0, `${label}: the inserted-line output is LF only`);
     const lines = rendered.split('\n');
-    // A header comment and a blank line come first, so the marker goes right after them.
     assert.equal(lines[2], `version = "${VERSION}"`, `${label}: the marker follows the provenance header`);
     assert.equal(lines[3], 'name = "x"  ', `${label}: the body continues unchanged after the marker`);
     insertions.push(rendered);
@@ -484,12 +510,73 @@ test('renderAgentFile writes LF for LF, CRLF and mixed input and keeps the body 
   assert.equal(readFileSync(TEMPLATE_PATH, 'utf8'), template);
 });
 
-test('a rendered file read back is installed, whatever spelling it was written from', async () => {
+// Extracted byte-for-byte from the archived test2 package, not from the current template.
+const test2Skill = readFileSync(join(FIXTURES, 'skill-1.9.0-test2.md'), 'utf8');
+
+for (const [ending, prior] of [['LF', test2Skill], ['CRLF', asCrlf(test2Skill)]]) {
+  test(`an untouched test2 skill (${ending}) upgrades without an ownership record`, async () => {
+    for (const action of ['install', 'refresh']) {
+      const { home, skillPath } = homeWithConfig();
+      writeFileSync(skillPath, prior);
+      const before = await statusOf(home);
+      assert.equal(before.agent.state, 'outdated');
+      assert.notEqual(before.agent.recorded, true);
+      const result = await ACTIONS[action](home);
+      assert.deepEqual(result.changed, action === 'install' ? ['agent', 'mcp'] : ['agent']);
+      assert.deepEqual(result.refused, []);
+      assert.equal(result.status.agent.state, 'installed');
+      assert.equal(readFileSync(skillPath, 'utf8'), renderAgentFile(await readAgentTemplate(), VERSION));
+    }
+  });
+
+  test(`an edited test2 skill (${ending}) survives install, startup refresh and removal`, async () => {
+    const edited = prior.replace('delegate_preflight', 'delegate_preflight_custom');
+    assert.notEqual(edited, prior);
+    for (const action of ['install', 'refresh', 'remove']) {
+      const result = await runAgainstSkill(temporaryCodexHome(), edited, action);
+      assert.equal(result.outcome.status.agent.state, 'modified');
+      assert.equal(result.outcome.status.agent.reason, 'unknown-content');
+      assert.equal(result.outcome.changed.includes('agent'), false);
+      assert.equal(result.untouched, true);
+    }
+  });
+}
+
+test('install and startup report legacy cleanup separately when the skill is already installed', async () => {
+  const prior = readFileSync(FIXTURE_1_5_2, 'utf8');
+  for (const action of ['install', 'refresh']) {
+    const { home, skillPath, agentPath } = homeWithConfig();
+    await ACTIONS.install(home);
+    const skill = readFileSync(skillPath, 'utf8');
+    const skillMtime = lstatSync(skillPath).mtimeMs;
+    writeFileSync(agentPath, prior);
+    const result = await ACTIONS[action](home);
+    assert.deepEqual(result.changed, ['legacyAgent']);
+    assert.deepEqual(result.refused, []);
+    assert.equal(describeCodexOutcome(result), '已清理：旧版子智能体文件。');
+    assert.equal(existsSync(agentPath), false);
+    assert.equal(readFileSync(skillPath, 'utf8'), skill);
+    assert.equal(lstatSync(skillPath).mtimeMs, skillMtime);
+  }
+});
+
+test('removing a legacy subagent by itself does not report removing a skill', async () => {
+  const { home, skillPath, agentPath } = homeWithConfig();
+  writeFileSync(agentPath, readFileSync(FIXTURE_1_5_2, 'utf8'));
+  const result = await ACTIONS.remove(home);
+  assert.deepEqual(result.changed, ['legacyAgent']);
+  assert.deepEqual(result.refused, []);
+  assert.equal(describeCodexOutcome(result), '已移除：旧版子智能体文件。');
+  assert.equal(existsSync(agentPath), false);
+  assert.equal(existsSync(skillPath), false);
+});
+
+test('a rendered skill read back is installed, whatever spelling it was written from', async () => {
   const template = await readAgentTemplate();
   for (const [label, input] of spellingVariants(template)) {
     const rendered = renderAgentFile(input, VERSION);
     const home = temporaryCodexHome();
-    writeFileSync(agentPathOf(home), rendered, 'utf8');
+    writeCurrentSkill(skillPathOf(home), rendered);
     const status = await statusOf(home);
     assert.equal(status.agent.state, 'installed', `${label}: the written file reads back as installed`);
     assert.equal(status.agent.expect, rendered);
@@ -500,31 +587,31 @@ test('a rendered file read back is installed, whatever spelling it was written f
 // 5. The upgrade path: install / refresh / remove across a real temporary home
 // ---------------------------------------------------------------------------
 
-test('every prior build is upgraded by install and by startup refresh, idempotently', async () => {
+test('every prior build is migrated to native skill by install and startup refresh, idempotently, retiring old toml', async () => {
   const template = renderAgentFile(await readAgentTemplate(), VERSION);
   for (const [fixtureLabel, fixture] of [['1.5.1', FIXTURE_1_5_1], ['1.5.2', FIXTURE_1_5_2]]) {
     for (const [label, form] of spellingVariants(readFileSync(fixture, 'utf8'))) {
       for (const action of ['install', 'refresh']) {
-        const { home, configPath, config, agentPath } = homeWithConfig();
+        const { home, configPath, config, skillPath, agentPath } = homeWithConfig();
         writeFileSync(agentPath, form, 'utf8');
         const first = await ACTIONS[action](home);
-        assert.equal(first.changed.includes('agent'), true, `${fixtureLabel} ${label} ${action}: the agent is upgraded`);
+        assert.equal(first.changed.includes('agent'), true, `${fixtureLabel} ${label} ${action}: the skill is migrated`);
+        assert.equal(first.changed.includes('legacyAgent'), true, `${fixtureLabel} ${label} ${action}: the legacy subagent is removed`);
         assert.equal(first.changed.includes('mcp'), action === 'install', `${fixtureLabel} ${label} ${action}: only install writes the MCP entry`);
-        assert.equal(readFileSync(agentPath, 'utf8'), template, `${fixtureLabel} ${label} ${action}: the template is written`);
-        assert.equal(measure(readFileSync(agentPath, 'utf8')).crlf, 0, `${fixtureLabel} ${label} ${action}: written as LF`);
+        assert.equal(readFileSync(skillPath, 'utf8'), template, `${fixtureLabel} ${label} ${action}: the skill template is written`);
+        assert.equal(measure(readFileSync(skillPath, 'utf8')).crlf, 0, `${fixtureLabel} ${label} ${action}: written as LF`);
+        assert.equal(existsSync(agentPath), false, `${fixtureLabel} ${label} ${action}: untouched legacy toml is retired`);
 
         // A fresh read of the same filesystem state, then the same action again: nothing left.
         const reread = await statusOf(home);
         assert.equal(reread.agent.state, 'installed', `${fixtureLabel} ${label} ${action}: reads back installed`);
+        assert.equal(reread.legacyAgents.state, 'absent');
         const second = await ACTIONS[action](home);
         assert.deepEqual(second.changed, [], `${fixtureLabel} ${label} ${action}: a repeat changes nothing`);
         const third = await ACTIONS[action](home);
         assert.deepEqual(third.changed, [], `${fixtureLabel} ${label} ${action}: still idempotent`);
-        assert.equal(readFileSync(agentPath, 'utf8'), template);
+        assert.equal(readFileSync(skillPath, 'utf8'), template);
 
-        // `refresh` is the unattended path and must never write config.toml at all; `install`
-        // writes its MCP entry by contract, so only the operator's own bytes are required to
-        // survive there.
         if (action === 'refresh') assert.equal(readFileSync(configPath, 'utf8'), config, `${fixtureLabel} ${label}: config.toml untouched`);
         else assert.ok(readFileSync(configPath, 'utf8').startsWith(config), `${fixtureLabel} ${label}: operator bytes survive`);
       }
@@ -532,14 +619,14 @@ test('every prior build is upgraded by install and by startup refresh, idempoten
   }
 });
 
-test('an operator edit survives install, refresh and remove without a byte of change', async () => {
+test('an operator edit to SKILL.md survives install, refresh and remove without a byte of change', async () => {
   const template = renderAgentFile(await readAgentTemplate(), VERSION);
   for (const [variant, base] of spellingVariants(template)) {
-    for (const [editLabel, edit] of Object.entries(USER_EDITS)) {
+    for (const [editLabel, edit] of Object.entries(SKILL_USER_EDITS)) {
       const edited = edit(base);
       for (const action of ['install', 'refresh', 'remove']) {
-        const { home, agentPath } = homeWithConfig();
-        const facts = await runAgainstAgent(home, edited, action);
+        const { home, skillPath } = homeWithConfig();
+        const facts = await runAgainstSkill(home, edited, action);
         assert.equal(facts.outcome.status?.agent?.state ?? 'modified', 'modified', `${editLabel} (${variant}) ${action}: modified`);
         assert.equal(facts.after, edited, `${editLabel} (${variant}) ${action}: the bytes are unchanged`);
         assert.equal(facts.untouched, true, `${editLabel} (${variant}) ${action}: the file was not rewritten`);
@@ -549,59 +636,60 @@ test('an operator edit survives install, refresh and remove without a byte of ch
             `${editLabel} (${variant}) ${action}: install refuses explicitly as the operator's file`,
           );
         }
-        assert.equal(readFileSync(agentPath, 'utf8'), edited, `${editLabel} (${variant}) ${action}: still the same file`);
+        assert.equal(readFileSync(skillPath, 'utf8'), edited, `${editLabel} (${variant}) ${action}: still the same file`);
       }
     }
   }
 });
 
-test('an edited prior build is never upgraded by install or refresh, nor deleted by remove', async () => {
+test('an edited prior build is never deleted by install, refresh or remove', async () => {
   for (const [fixtureLabel, fixture] of [['1.5.1', FIXTURE_1_5_1], ['1.5.2', FIXTURE_1_5_2]]) {
     for (const [variant, base] of spellingVariants(readFileSync(fixture, 'utf8'))) {
       for (const [editLabel, edit] of Object.entries(USER_EDITS)) {
         const edited = edit(base);
         for (const action of ['install', 'refresh', 'remove']) {
-          const { home, agentPath } = homeWithConfig();
+          const { home } = homeWithConfig();
           const facts = await runAgainstAgent(home, edited, action);
           assert.equal(facts.after, edited, `${fixtureLabel} ${editLabel} (${variant}) ${action}: bytes unchanged`);
           assert.equal(facts.untouched, true, `${fixtureLabel} ${editLabel} (${variant}) ${action}: not replaced or deleted`);
-          assert.equal(facts.outcome.changed.includes('agent'), false, `${fixtureLabel} ${editLabel} (${variant}) ${action}: nothing written`);
+          if (action !== 'install') {
+            assert.equal(facts.outcome.changed.includes('agent'), false, `${fixtureLabel} ${editLabel} (${variant}) ${action}: nothing written`);
+          }
         }
       }
     }
   }
 });
 
-test('the delete re-proof stays byte-exact, so a file changed after the read survives', async () => {
+test('the delete re-proof stays byte-exact, so a skill file changed after the read survives', async () => {
   const home = temporaryCodexHome();
-  const agentPath = agentPathOf(home);
+  const skillPath = skillPathOf(home);
   const template = renderAgentFile(await readAgentTemplate(), VERSION);
-  writeFileSync(agentPath, template, 'utf8');
+  writeCurrentSkill(skillPath, template);
   const status = await statusOf(home);
   assert.equal(status.agent.state, 'installed');
-  // A rewrite that only changes the terminator spelling is still a different byte identity than
-  // the `expect` the status captured, so the removal must refuse rather than delete.
   const respelled = asCrlf(template);
   assert.notEqual(respelled, template);
-  writeFileSync(agentPath, respelled, 'utf8');
+  writeFileSync(skillPath, respelled, 'utf8');
   const verdict = await removeManagedAgentFile(status.agent);
   assert.equal(verdict.code, 'AGENT_USER_MODIFIED');
   assert.equal(verdict.reason, 'modified-before-removal');
-  assert.equal(readFileSync(agentPath, 'utf8'), respelled, 'the file was kept');
+  assert.equal(readFileSync(skillPath, 'utf8'), respelled, 'the file was kept');
 });
 
 // ---------------------------------------------------------------------------
 // 6. repair keeps its MCP-only contract, and config.toml is never touched by an upgrade
 // ---------------------------------------------------------------------------
 
-test('repair never repairs the agent, whatever the agent spelling is', async () => {
+test('repair never touches the skill or legacy agent, whatever the spelling is', async () => {
   const mixed = withOneBareLf(asCrlf(readFileSync(FIXTURE_1_5_1, 'utf8')));
-  const { home, configPath, config, agentPath } = homeWithConfig();
+  const { home, configPath, config, skillPath, agentPath } = homeWithConfig();
   writeFileSync(agentPath, mixed, 'utf8');
   const repaired = await runCodexAction('repair', { codexHome: home, env: isolatedEnv(home), version: VERSION });
-  assert.equal(repaired.changed.includes('agent'), false, 'repair does not touch the agent file');
-  assert.equal(readFileSync(agentPath, 'utf8'), mixed, 'the outdated agent is left exactly as it was');
-  assert.equal(repaired.status.agent.state, 'outdated', 'and the status still reports why');
+  assert.equal(repaired.changed.includes('agent'), false, 'repair does not touch the skill or legacy agent file');
+  assert.equal(readFileSync(agentPath, 'utf8'), mixed, 'the legacy agent is left exactly as it was');
+  assert.equal(existsSync(skillPath), false, 'repair does not create the skill');
+  assert.equal(repaired.status.legacyAgents.state, 'managed-legacy', 'and the status still reports pending migration');
   assert.ok(readFileSync(configPath, 'utf8').startsWith(config), 'the operator config bytes survive');
   assert.equal(repaired.refused.some((entry) => entry.target === 'agent'), false, 'repair makes no agent claim either way');
 });
@@ -610,8 +698,8 @@ test('a recognized mixed build is removable and config.toml stays byte-identical
   const { home, configPath, config, agentPath } = homeWithConfig();
   writeFileSync(agentPath, withOneBareLf(asCrlf(readFileSync(FIXTURE_1_5_1, 'utf8'))), 'utf8');
   const removed = await runCodexAction('remove', { codexHome: home, env: isolatedEnv(home), version: VERSION });
-  assert.deepEqual(removed.changed.filter((entry) => entry === 'agent'), ['agent'], 'the known build is removable');
-  assert.equal(lstatSync(agentPath, { throwIfNoEntry: false }), undefined, 'the agent is gone');
+  assert.deepEqual(removed.changed, ['legacyAgent'], 'the known legacy build is removable');
+  assert.equal(lstatSync(agentPath, { throwIfNoEntry: false }), undefined, 'the legacy agent is gone');
   assert.equal(readFileSync(configPath, 'utf8'), config, 'config.toml is byte-identical');
 });
 
@@ -619,15 +707,6 @@ test('a recognized mixed build is removable and config.toml stays byte-identical
 // 7. The PRODUCT layout: no `tests/` directory at all
 // ---------------------------------------------------------------------------
 
-/**
- * Copy the module and its direct dependencies into a directory layout that ships in the package
- * (`src/`, `codex/`, `package.json`) and carries NO `tests/` tree.
- *
- * This is the regression the review required: the first attempt read byte identities out of
- * `tests/fixtures`, which `npm pack` never installs, so it passed in this checkout and failed in
- * an installation. Only file copies happen here — no source rewriting, no module stubbing.
- * @returns {string} absolute path of the copied package root.
- */
 function productLayout() {
   const root = temporaryDirectory('product-layout');
   for (const relative of [
@@ -635,7 +714,8 @@ function productLayout() {
     'src/codex/toml.js',
     'src/codex/agent-ownership.js',
     'src/config/store.js',
-    'codex/dsh-taskbridge.toml',
+    'codex/skills/dsh-taskbridge/SKILL.md',
+    relativePath(ROOT, readCodexRuleFiles().referencePath),
     'package.json',
   ]) {
     const target = join(root, relative);
@@ -647,11 +727,9 @@ function productLayout() {
 
 test('the mixed-line-ending fix holds in a package layout that ships no tests directory', async () => {
   const root = productLayout();
-  // The layout is a real package copy, not a checkout: it has no fixtures to fall back to.
   assert.equal(lstatSync(join(root, 'tests'), { throwIfNoEntry: false }), undefined, 'no tests directory is shipped');
   assert.equal(lstatSync(join(root, 'src', 'codex', 'installer.js'), { throwIfNoEntry: false })?.isFile(), true);
 
-  // Import the COPIED module, so its own relative paths (template, package.json) resolve here.
   const shipped = await import(`${new URL(`file:///${join(root, 'src', 'codex', 'installer.js').replace(/\\/gu, '/')}`).href}?layout=${Date.now()}`);
   shipped.useDirectoryClassifier(async (paths) => {
     const kinds = new Map();
@@ -671,27 +749,23 @@ test('the mixed-line-ending fix holds in a package layout that ships no tests di
   assert.equal(measure(mixed).bytes, 40258, 'the real observed mixed sample');
   assert.deepEqual(measure(mixed), { bytes: 40258, chars: 40140, crlf: 515, bareLf: 1 });
 
-  // The same identities the source checkout recognizes, recognized without tests/fixtures.
   assert.equal(shipped.isKnownPriorTemplate(fixture), true, '1.5.1 LF is known in the shipped layout');
   assert.equal(shipped.isKnownPriorTemplate(crlf), true, '1.5.1 CRLF is known in the shipped layout');
   assert.equal(shipped.isKnownPriorTemplate(mixed), true, 'the version-mixed form is known in the shipped layout');
   assert.equal(shipped.isKnownPriorTemplate(alternating(asLf(fixture))), true, 'the alternating form is known in the shipped layout');
-  // ...and an edit is still an edit there.
   assert.equal(shipped.isKnownPriorTemplate(crlf.replace('\nname = ', '\n# mine\nname = ')), false);
 
-  // A real status read through the COPIED module: the upgrade is not blocked any more.
   const home = temporaryDirectory('layout-codex-home');
   mkdirSync(join(home, 'agents'), { recursive: true });
   writeFileSync(join(home, 'agents', 'dsh-taskbridge.toml'), mixed, 'utf8');
   const status = await shipped.readCodexStatus({ codexHome: home, env: isolatedEnv(home) });
-  assert.equal(status.agent.state, 'outdated', 'the shipped layout reports the mixed install as upgradable');
+  assert.equal(status.legacyAgents.state, 'managed-legacy', 'the shipped layout reports the mixed legacy install as upgradable');
 
   const refreshed = await shipped.refreshKnownAgentTemplate({ codexHome: home, env: isolatedEnv(home), version: status.packageVersion });
-  assert.deepEqual(refreshed.changed, ['agent'], 'the shipped layout upgrades it');
-  const written = readFileSync(join(home, 'agents', 'dsh-taskbridge.toml'), 'utf8');
+  assert.deepEqual(refreshed.changed, ['agent', 'legacyAgent'], 'the shipped layout migrates it');
+  assert.equal(existsSync(join(home, 'agents', 'dsh-taskbridge.toml')), false, 'and retires the old toml');
+  const written = readFileSync(join(home, 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
   assert.equal(measure(written).crlf, 0, 'written LF');
-  // The written file is the release template itself here, so it reads back `installed`; what
-  // matters is that an EDITED file above was never claimed, which the assertions above prove.
   const after = await shipped.readCodexStatus({ codexHome: home, env: isolatedEnv(home), version: status.packageVersion });
   assert.equal(after.agent.state, 'installed', 'and reads back installed in the shipped layout');
 });
@@ -712,18 +786,16 @@ test('the shipped layout also refuses a file with an extra CR per line', async (
   });
 
   for (const [release, shape, text] of extraCarriageReturnShapes()) {
-    // No tests/fixtures exist in this layout, so this is the packaged module's own answer.
     assert.equal(await shipped.isKnownPriorTemplate(text), false, `${release} ${shape}: not known in the shipped layout`);
     const home = temporaryDirectory('layout-cr-home');
     mkdirSync(join(home, 'agents'), { recursive: true });
     writeFileSync(join(home, 'agents', 'dsh-taskbridge.toml'), text, 'utf8');
     const status = await shipped.readCodexStatus({ codexHome: home, env: isolatedEnv(home) });
-    assert.equal(status.agent.state, 'modified', `${release} ${shape}: modified in the shipped layout`);
+    assert.equal(status.legacyAgents.state, 'modified-legacy', `${release} ${shape}: modified-legacy in the shipped layout`);
     const refreshed = await shipped.refreshKnownAgentTemplate({ codexHome: home, env: isolatedEnv(home), version: status.packageVersion });
     assert.deepEqual(refreshed.changed, [], `${release} ${shape}: the shipped layout refuses to upgrade it`);
     assert.equal(readFileSync(join(home, 'agents', 'dsh-taskbridge.toml'), 'utf8'), text, `${release} ${shape}: bytes kept`);
 
-    // The legal spellings are still recognized there, so the guard did not just disable the fix.
     const legal = asCrlf(publishedTexts()[release]);
     assert.equal(await shipped.isKnownPriorTemplate(legal), true, `${release}: the published CRLF form is still known`);
     assert.equal(

@@ -101,6 +101,9 @@ export const PERMISSION_MAX_TIMEOUT_MS = 30 * 60 * 1000;
 /** The closed decision vocabulary this plugin's tool accepts. */
 export const PERMISSION_DECISIONS = Object.freeze(['allow-once', 'reject']);
 
+/** Scope inputs accepted from current and preview clients. Every grant covers one call. */
+export const PERMISSION_SCOPES = Object.freeze(['once', 'task-command']);
+
 /**
  * The closed native outcome vocabulary, mirrored from the approval seam so a
  * non-vocabulary answer can never be interpreted as a grant.
@@ -1172,6 +1175,19 @@ export class PermissionBridge {
       });
     }
     const allow = decision === 'allow-once';
+    const rawScope = request?.scope;
+    const scope = rawScope === undefined || rawScope === null ? 'once' : rawScope;
+    if (!PERMISSION_SCOPES.includes(scope)) {
+      throw new PermissionError(PERMISSION_CODES.invalid, 'scope must be once or task-command', {
+        field: 'scope',
+        accepted: [...PERMISSION_SCOPES],
+      });
+    }
+    if (!allow && scope === 'task-command') {
+      throw new PermissionError(PERMISSION_CODES.invalid, 'scope task-command is only valid with allow-once', {
+        field: 'scope',
+      });
+    }
     const pending = this.pending;
     if (pending === null || pending.requestId !== requestId) {
       // An unknown id, another run's id and an already-settled id are ONE answer:
@@ -1263,6 +1279,8 @@ export class PermissionBridge {
             argumentsComplete: pending.argumentsComplete === true,
             callReread: true,
             turnOpen: true,
+            // Preview callers can still settle this request. Record the effective scope.
+            ...(typeof rawScope === 'string' ? { scope: 'once' } : {}),
             boundsApplied: [...pending.boundsApplied],
           },
         }

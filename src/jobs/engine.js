@@ -612,6 +612,25 @@ export class JobEngine {
       });
     }
     const continueFromTaskId = typeof rawContinuation === 'string' ? rawContinuation.trim() : '';
+    const rawReuseWorktree = request?.reuseWorktreeFromTaskId;
+    if (rawReuseWorktree !== undefined && rawReuseWorktree !== null && typeof rawReuseWorktree !== 'string') {
+      throw new JobError(JOB_CODES.isolationRefused, 'reuseWorktreeFromTaskId must be a task id string', {
+        field: 'reuseWorktreeFromTaskId',
+        requestedType: typeof rawReuseWorktree,
+      });
+    }
+    const reuseWorktreeFromTaskId = typeof rawReuseWorktree === 'string' ? rawReuseWorktree.trim() : '';
+    if (continueFromTaskId !== '' && reuseWorktreeFromTaskId !== '') {
+      throw new JobError(
+        JOB_CODES.isolationRefused,
+        'continueFromTaskId and reuseWorktreeFromTaskId cannot be combined; continueFromTaskId already reuses the parent worktree',
+        {
+          continueFromTaskId,
+          reuseWorktreeFromTaskId,
+          cause: 'WORKTREE_REUSE_CONFLICT',
+        },
+      );
+    }
     const rawPlanNodeId = request?.planNodeId;
     if (rawPlanNodeId !== undefined && typeof rawPlanNodeId !== 'string') {
       throw new JobError(JOB_CODES.planRefInvalid, 'planNodeId must be a string', {
@@ -629,6 +648,7 @@ export class JobEngine {
     }
     const parentNodeId = typeof rawParentNodeId === 'string' ? rawParentNodeId.trim() : '';
     this.assertRecordNotBeingRemoved(continueFromTaskId);
+    this.assertRecordNotBeingRemoved(reuseWorktreeFromTaskId);
     this.assertRecordNotBeingRemoved(parentNodeId);
     const goal = canonicalTaskDescription(request?.goalDescription, TASK_DESCRIPTION_FIELDS.goal, redactText);
     if (goal.ok === false) {
@@ -648,6 +668,7 @@ export class JobEngine {
     // Frozen before the first await so the task record states, from the moment it
     // exists, whether it starts a conversation or continues one.
     task.continueFromTaskId = continueFromTaskId === '' ? null : continueFromTaskId;
+    task.reuseWorktreeFromTaskId = reuseWorktreeFromTaskId === '' ? null : reuseWorktreeFromTaskId;
     task.planNodeId = planNodeId === '' ? null : planNodeId;
     task.parentNodeId = parentNodeId === '' ? null : parentNodeId;
     task.goalDescription = goal.value;
@@ -696,6 +717,7 @@ export class JobEngine {
       // conversation. Frozen at creation: it is what the run does with its session,
       // and it must not be re-read after the first await.
       continueFromTaskId: null,
+      reuseWorktreeFromTaskId: null,
       planNodeId: null,
       parentNodeId: null,
       goalDescription: null,
@@ -738,6 +760,8 @@ export class JobEngine {
       // execution path and conversation, never the internal parent object.
       continuationParent: null,
       continuationRecord: null,
+      continuationParentUsage: null,
+      reuseWorktreeRecord: null,
       // The parent's Agent Teams facts (`teamFactsOf`), read once during continuation
       // admission from the same documents whose ownership was just proven. Admission's
       // effective step decides what may be inherited from them; nothing re-reads history
@@ -891,6 +915,11 @@ export class JobEngine {
       await this.assertPlanHierarchy(task, sourcePath);
       this.assertLive(task, 'plan-hierarchy');
     }
+    if (task.reuseWorktreeFromTaskId !== null) {
+      task.phase = 'worktree-reuse';
+      await this.assertWorktreeReuse(task, sourcePath);
+      this.assertLive(task, 'worktree-reuse');
+    }
 
     // ---- 3. one immutable settings snapshot ----------------------------------
     task.phase = 'settings';
@@ -947,6 +976,15 @@ export class JobEngine {
         overrides.agentTeams = inheritedTeam.value;
         teamChoiceOrigin = 'continuation';
       }
+    } else if (task.reuseWorktreeRecord !== null) {
+      if (overrides.isolation !== undefined && overrides.isolation !== 'worktree') {
+        throw new JobError(JOB_CODES.isolationRefused, 'reuseWorktreeFromTaskId requires worktree isolation', {
+          reuseWorktreeFromTaskId: task.reuseWorktreeFromTaskId,
+          requestedIsolation: overrides.isolation,
+          cause: 'WORKTREE_REUSE_ISOLATION_CONFLICT',
+        });
+      }
+      overrides.isolation = 'worktree';
     }
     // The operator's NEW-TASK default fills an absent choice for a NEW task only.
     //
@@ -1077,9 +1115,11 @@ export class JobEngine {
       const prepared = await this.guardPreflight(
         task,
         'worktree',
-        () => this.withPreparationTurn(task, () => (task.continuationRecord === null
-          ? this.prepareWorktree(task)
-          : this.reuseContinuationWorktree(task))),
+        () => this.withPreparationTurn(task, () => (task.continuationRecord !== null
+          ? this.reuseContinuationWorktree(task)
+          : (task.reuseWorktreeRecord !== null
+            ? this.reuseTaskWorktree(task)
+            : this.prepareWorktree(task)))),
         {
           // A tree that finished after this start was abandoned still exists on
           // disk. It is recorded and marked complete, never deleted or merged: it
@@ -1089,7 +1129,7 @@ export class JobEngine {
       );
       task.worktree = prepared;
       task.executionPath = prepared.workspacePath;
-      task.reusedWorktree = task.continuationRecord !== null;
+      task.reusedWorktree = task.continuationRecord !== null || task.reuseWorktreeRecord !== null;
       this.assertLive(task, 'worktree');
       if (!task.leases.some((lease) => lease.mode === LOCK_MODES.exclusive && samePath(lease.path, task.executionPath))) {
         // A follow-up drives the directory its parent ran in, so this keeps two
@@ -2073,8 +2113,10 @@ export class JobEngine {
     // supplies its stored `team`/`agentTeamsOrigin`, and the identity map (read once,
     // below) supplies the chain's decision when an older row predates those fields.
     let durableTeamRecord = {};
+    let parentUsage = null;
     if (parent !== null) {
       if (parent.connectionId !== caller) throw this.absentContinuation(parentId);
+      parentUsage = parent.execution?.usage ?? null;
       row = {
         state: parent.state,
         sourcePath: parent.sourcePath,
@@ -2091,6 +2133,7 @@ export class JobEngine {
     } else {
       const durable = await this.durableParent(task, parentId, caller);
       if (durable === null) throw this.absentContinuation(parentId);
+      parentUsage = durable.execution?.usage ?? null;
       row = {
         state: durable.state ?? null,
         sourcePath: durable.sourcePath ?? null,
@@ -2147,6 +2190,7 @@ export class JobEngine {
     // isolation and worktree steps read to resume the parent instead of starting over.
     task.continuationParent = parent;
     task.continuationRecord = task.continuationIdentity;
+    task.continuationParentUsage = parentUsage;
     // The parent's Agent Teams facts, taken from the same two documents that were just
     // proven. Admission reads them once here, so a later step never re-reads history or
     // the identity map for a decision it must not re-derive.
@@ -2594,6 +2638,153 @@ export class JobEngine {
       throw refuse('the original worktree path resolves to a different directory', 'worktree path mismatch');
     }
     return { ...tree, workspacePath, reused: true };
+  }
+
+  /**
+   * Prove that this caller owns the upstream isolated task named by
+   * `reuseWorktreeFromTaskId`, and that its managed worktree may be reused by a
+   * new independent subtask (with its own fresh DSH Session) under the same
+   * source repository.
+   * @param {object} task - pending record with `reuseWorktreeFromTaskId`.
+   * @param {string} sourcePath - resolved source repository path.
+   * @returns {Promise<void>} resolves when the worktree reuse is admitted.
+   */
+  async assertWorktreeReuse(task, sourcePath) {
+    const sourceTaskId = task.reuseWorktreeFromTaskId;
+    const caller = typeof task.connectionId === 'string' && task.connectionId !== '' ? task.connectionId : null;
+    if (caller === null) throw this.absentContinuation(sourceTaskId);
+    const refuse = (message, cause, extra = {}) => new JobError(JOB_CODES.isolationRefused, message, redactDeep({
+      reuseWorktreeFromTaskId: sourceTaskId,
+      requested: 'worktree',
+      cause,
+      ...extra,
+    }));
+
+    const parent = this.tasks.get(sourceTaskId) ?? null;
+    let row;
+    if (parent !== null) {
+      if (parent.connectionId !== caller) throw this.absentContinuation(sourceTaskId);
+      row = {
+        state: parent.state,
+        sourcePath: parent.sourcePath,
+        sourcePathDigest: pathDigest(parent.sourcePath),
+        executionWorkspacePath: parent.executionPath,
+        executionPathDigest: pathDigest(parent.executionPath),
+        isolation: parent.effective?.worker?.isolation ?? null,
+        worktreeId: parent.worktree?.taskId ?? parent.taskId,
+        worktreeState: parent.worktree?.state ?? null,
+      };
+    } else {
+      const durable = await this.durableParent(task, sourceTaskId, caller);
+      if (durable === null) throw this.absentContinuation(sourceTaskId);
+      let storedIdentity = null;
+      const store = this.deps?.sessionStore ?? null;
+      if (store !== null && typeof store.get === 'function') {
+        try {
+          storedIdentity = await this.guardPreflight(task, 'worktree-reuse-identity', () => store.get(sourceTaskId));
+        } catch (error) {
+          if (error instanceof JobError) throw error;
+          storedIdentity = null;
+        }
+      }
+      row = {
+        state: durable.state ?? null,
+        sourcePath: storedIdentity?.sourcePath ?? durable.sourcePath ?? null,
+        sourcePathDigest: storedIdentity?.sourcePathDigest ?? durable.sourcePathDigest ?? null,
+        executionWorkspacePath: storedIdentity?.executionPath ?? durable.executionWorkspacePath ?? null,
+        executionPathDigest: storedIdentity?.executionPathDigest ?? durable.executionPathDigest ?? null,
+        isolation: durable.isolation ?? storedIdentity?.isolation ?? null,
+        worktreeId: storedIdentity?.worktreeId ?? durable.worktree?.taskId ?? sourceTaskId,
+        worktreeState: storedIdentity?.worktreeState ?? durable.worktree?.state ?? null,
+      };
+    }
+
+    if (row.state !== TASK_STATES.awaitingHostReview) {
+      const message = row.state === TASK_STATES.pending || row.state === TASK_STATES.running
+        ? 'the named upstream task is still running, so its worktree cannot be reused yet'
+        : 'the named upstream task did not finish in awaiting-host-review, so its worktree cannot be reused';
+      throw refuse(message, 'WORKTREE_REUSE_STATE_INVALID', { upstreamState: row.state ?? null });
+    }
+    if (row.isolation !== 'worktree') {
+      throw refuse('the named upstream task did not use a managed worktree', 'WORKTREE_REUSE_NOT_ISOLATED', {
+        upstreamIsolation: row.isolation ?? null,
+      });
+    }
+    if (!recordedDirectoryIs({ path: row.sourcePath, digest: row.sourcePathDigest }, sourcePath)) {
+      throw refuse('the named upstream task belongs to another source repository', 'WORKTREE_REUSE_SOURCE_MISMATCH');
+    }
+    if (typeof row.executionWorkspacePath !== 'string' || row.executionWorkspacePath.trim() === ''
+      || recordedPathIsMasked(row.executionWorkspacePath)) {
+      throw refuse('the named upstream task has no usable worktree path to reuse', 'WORKTREE_REUSE_PATH_UNAVAILABLE');
+    }
+
+    task.reuseWorktreeRecord = {
+      taskId: sourceTaskId,
+      sourcePath,
+      executionPath: row.executionWorkspacePath,
+      worktreeId: row.worktreeId ?? sourceTaskId,
+      worktreeState: row.worktreeState ?? null,
+      isolation: 'worktree',
+    };
+  }
+
+  /**
+   * Resolve and validate the existing managed worktree named by
+   * `reuseWorktreeFromTaskId` for a new independent subtask.
+   * @param {object} task - pending task with `reuseWorktreeRecord`.
+   * @returns {Promise<object>} the existing tree metadata.
+   */
+  async reuseTaskWorktree(task) {
+    const identity = task.reuseWorktreeRecord;
+    const manager = this.deps?.worktrees ?? null;
+    const refuse = (message, cause) => new JobError(JOB_CODES.isolationRefused, message, {
+      reuseWorktreeFromTaskId: task.reuseWorktreeFromTaskId,
+      requested: 'worktree',
+      cause,
+    });
+    if (identity?.isolation !== 'worktree') {
+      throw refuse('the named upstream task did not use a managed worktree', 'WORKTREE_REUSE_NOT_ISOLATED');
+    }
+    if (manager === null || typeof manager.get !== 'function') {
+      throw refuse('the managed worktree service is unavailable, so the upstream tree cannot be reused', 'WORKTREE_SERVICE_UNAVAILABLE');
+    }
+    const expectedTreeId = identity.worktreeId ?? identity.taskId;
+    let tree;
+    try {
+      tree = manager.get(identity.executionPath);
+      if (tree === null && typeof manager.recover === 'function') {
+        tree = await manager.recover({
+          taskId: expectedTreeId,
+          sourcePath: identity.sourcePath,
+          workspacePath: identity.executionPath,
+          state: identity.worktreeState,
+          signal: task.controller.signal,
+        });
+      }
+    } catch (error) {
+      throw refuse('the managed worktree service refused to report the upstream tree', typeof error?.code === 'string' ? error.code : 'WORKTREE_REGISTRY_FAILED');
+    }
+    if (tree === null || typeof tree !== 'object') {
+      throw refuse('the upstream worktree is no longer registered; a new tree will not be substituted', 'WORKTREE_REUSE_ABSENT');
+    }
+    if (!samePath(tree.workspacePath, identity.executionPath)
+      || !samePath(tree.sourcePath, identity.sourcePath)
+      || (typeof expectedTreeId === 'string' && expectedTreeId !== '' && tree.taskId !== expectedTreeId)
+      || tree.state === 'disposed'
+      || tree.isolated !== true
+      || tree.detached !== true) {
+      throw refuse('the registered worktree does not match the upstream task', 'WORKTREE_REUSE_MISMATCH');
+    }
+    let workspacePath;
+    try {
+      workspacePath = await resolveWorkspacePath(identity.executionPath);
+    } catch {
+      throw refuse('the upstream worktree path is no longer available', 'WORKTREE_REUSE_PATH_UNAVAILABLE');
+    }
+    if (!samePath(workspacePath, identity.executionPath)) {
+      throw refuse('the upstream worktree path resolves to a different directory', 'WORKTREE_REUSE_PATH_MISMATCH');
+    }
+    return { ...tree, workspacePath, reused: true, reusedFromTaskId: task.reuseWorktreeFromTaskId };
   }
 
   /**
@@ -3059,6 +3250,7 @@ export class JobEngine {
         decision: request?.decision,
         reason: request?.reason,
         ...(request?.fingerprint === undefined ? {} : { fingerprint: request.fingerprint }),
+        ...(request?.scope === undefined ? {} : { scope: request.scope }),
       });
     } catch (error) {
       if (error instanceof PermissionError) {
@@ -3960,12 +4152,13 @@ export class JobEngine {
         task.native.settled = true;
       }
 
+      const usage = enrichUsageReceipt(run.usage, task.continuationParentUsage);
       task.execution = {
         workspacePath: task.executionPath,
         outcome: run.outcome,
         text: run.text,
         reasoningOnly: run.reasoningOnly,
-        usage: run.usage,
+        usage,
         turnEnd: run.turnEnd,
         agentId: run.agentId,
         sessionId: run.sessionId,
@@ -5354,6 +5547,42 @@ export class JobEngine {
     return this.tasks.get(taskId)?.cleanupSettled === true;
   }
 
+  /**
+   * Managed worktree paths already claimed by live pending/running tasks that
+   * have validated reuse/continuation admission but may not yet have switched
+   * `executionPath` away from `sourcePath`.
+   * @returns {string[]} claimed worktree paths.
+   */
+  reservedWorktreePathsForCleanup() {
+    const paths = [];
+    for (const task of this.tasks.values()) {
+      if (task.state !== TASK_STATES.pending && task.state !== TASK_STATES.running) continue;
+      const claimed = task.reuseWorktreeRecord?.executionPath ?? task.continuationRecord?.executionPath ?? null;
+      if (typeof claimed === 'string' && claimed.trim() !== '') paths.push(claimed);
+    }
+    return paths;
+  }
+
+  /**
+   * Session and workspace identities already claimed by live pending/running
+   * continuation tasks that have passed admission lookup but may not yet have
+   * recorded `execution`.
+   * @returns {{ sessionIds: string[], workspaceIds: string[] }} claimed identities.
+   */
+  reservedContinuationRefsForCleanup() {
+    const sessionIds = [];
+    const workspaceIds = [];
+    for (const task of this.tasks.values()) {
+      if (task.state !== TASK_STATES.pending && task.state !== TASK_STATES.running) continue;
+      const cont = task.continuationRecord;
+      if (cont !== null && typeof cont === 'object') {
+        if (typeof cont.sessionId === 'string' && cont.sessionId.trim() !== '') sessionIds.push(cont.sessionId.trim());
+        if (typeof cont.workspaceId === 'string' && cont.workspaceId.trim() !== '') workspaceIds.push(cont.workspaceId.trim());
+      }
+    }
+    return { sessionIds, workspaceIds };
+  }
+
   // Hold these ids between the final check and the removal from disk and memory.
   reserveCleanupIds(taskIds) {
     for (const id of taskIds) this.cleanupIds.add(id);
@@ -5477,6 +5706,9 @@ export class JobEngine {
       // Frozen on the task at creation, so the record states the intent even when
       // the run never got as far as driving a conversation.
       continueFromTaskId: task.continueFromTaskId ?? null,
+      ...(typeof task.reuseWorktreeFromTaskId === 'string' && task.reuseWorktreeFromTaskId !== ''
+        ? { reuseWorktreeFromTaskId: task.reuseWorktreeFromTaskId }
+        : {}),
       ...(typeof task.planNodeId === 'string' && task.planNodeId !== ''
         ? { planNodeId: task.planNodeId }
         : {}),
@@ -5923,5 +6155,46 @@ function summarizedTeam(team) {
     applied: team.applied === true,
     enabled: typeof team.enabled === 'boolean' ? team.enabled : null,
     reason: typeof team.reason === 'string' ? diagnostic(team.reason, 200) : null,
+  };
+}
+
+/**
+ * Attach bounded `delta` and `cumulative` token counter blocks to a worker usage receipt
+ * while keeping the original top-level counters intact for backward compatibility.
+ * @param {object | null | undefined} rawUsage - current run usage.
+ * @param {object | null | undefined} previousUsage - parent run usage on a continuation, or null.
+ * @returns {object | null} enriched usage receipt, or null when absent.
+ */
+function enrichUsageReceipt(rawUsage, previousUsage = null) {
+  if (rawUsage === null || rawUsage === undefined || typeof rawUsage !== 'object') return rawUsage ?? null;
+  const counter = (value) => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null);
+  const current = {
+    inputTokens: counter(rawUsage.inputTokens),
+    outputTokens: counter(rawUsage.outputTokens),
+    totalTokens: counter(rawUsage.totalTokens),
+    reasoningTokens: counter(rawUsage.reasoningTokens),
+  };
+  const prevSource = previousUsage && typeof previousUsage === 'object'
+    ? (previousUsage.cumulative && typeof previousUsage.cumulative === 'object' ? previousUsage.cumulative : previousUsage)
+    : null;
+  const deltaOf = (key) => {
+    const cur = current[key];
+    if (cur === null) return null;
+    if (prevSource === null) return cur;
+    const prev = counter(prevSource[key]);
+    if (prev === null) return cur;
+    return cur >= prev ? cur - prev : cur;
+  };
+  const delta = {
+    inputTokens: deltaOf('inputTokens'),
+    outputTokens: deltaOf('outputTokens'),
+    totalTokens: deltaOf('totalTokens'),
+    reasoningTokens: deltaOf('reasoningTokens'),
+  };
+  const cumulative = { ...current };
+  return {
+    ...current,
+    delta,
+    cumulative,
   };
 }

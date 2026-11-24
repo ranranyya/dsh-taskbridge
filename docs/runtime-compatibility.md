@@ -1,6 +1,6 @@
 # Runtime compatibility
 
-Build 1.8.1 retains the loading policy introduced in 1.4.2: **no DSH version whitelist**: it omits `engines.dsh`, declares
+Build 1.9.0 retains the loading policy introduced in 1.4.2: **no DSH version whitelist**: it omits `engines.dsh`, declares
 host-provided `@deepseek-ai/dsh-*` peers as `*`, and publishes no DSH engine range
 in the custom plugin index. The plugin uses runtime capability checks rather than
 rejecting a host solely by its version number. Node.js `>=24` is still required.
@@ -35,8 +35,8 @@ and does not represent whole-task or billing savings. See the 1.4.0 Release note
 the [measurement report](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.4.0-token-benchmark.zh.md) for their exact boundaries.
 An older production profile must
 be upgraded to this build, and the
-Codex companion refreshed from the settings page (or by the startup check, which now also
-upgrades the installed MCP entry) and Codex reloaded before the new wait rules and the
+Codex native skill refreshed from the settings page (or by the startup check, which also
+upgrades the installed MCP entry and retires untouched legacy `.toml` subagents) and Codex reloaded before the new wait rules and the
 managed `tool_timeout_sec` take effect. No unit-test count and no mock constitutes an
 acceptance run.
 
@@ -53,7 +53,7 @@ acceptance run.
 - Development dependencies remain pinned for reproducible tests; they do not
   restrict the host-provided peer versions used by an installed plugin.
 - Older plugin packages keep their own metadata and can still be refused by a
-  newer host. Upgrade to `dsh-taskbridge@1.5.2` to use this loading policy.
+  newer host. Upgrade to `dsh-taskbridge@1.9.0` (or `1.4.2+`) to use this loading policy.
 
 ## 2. What DSH 0.2.2 changes
 
@@ -183,16 +183,14 @@ What remains genuinely unverified:
 
 ## 5. Upgrading from an older plugin build
 
-1. Download `dsh-taskbridge-1.5.2.tgz` from the GitHub Release, or build the package locally (`npm pack`).
+1. Download `dsh-taskbridge-1.9.0.tgz` from the GitHub Release (or install `dsh-taskbridge` from npm), or build the package locally (`npm pack`).
 2. Install it the way your surface requires: the Desktop **Plugins manager** for a
    Desktop profile (npm/CLI operations on that profile are refused), or
-   `dsh plugin --profile <name> add ./dsh-taskbridge-1.5.2.tgz` for a CLI profile you
+   `dsh plugin --profile <name> add ./dsh-taskbridge-1.9.0.tgz` for a CLI profile you
    start yourself.
 3. The settings, the switch value and the task history are preserved
    (`$DSH_HOME/data/dsh-delegate`); nothing is migrated destructively.
-4. If the Codex companion was installed, no action is needed: a `0.1.11` — or `0.1.10` —
-   agent file whose bytes still match a published template is refreshed automatically on
-   startup, or explicitly from the Codex panel. A file you edited is left untouched.
+4. If the Codex or Antigravity integration was installed, untouched managed files (including `0.1.10` / `0.1.11` through `1.8.x` legacy `.toml` companions and earlier `1.9.0` skills) are refreshed/migrated automatically on startup, or explicitly from the **Codex integration** / **Antigravity integration** panels. Any file you edited is left untouched.
 5. To roll back, re-install the older `.tgz`. The data directory is not deleted.
    Older packages retain their own version restrictions and may be refused by the
    host; the unrestricted policy is specific to 1.4.2 and later builds that keep it.

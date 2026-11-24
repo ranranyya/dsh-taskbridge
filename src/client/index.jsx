@@ -2136,7 +2136,7 @@ function TaskDetail({ store, task }) {
         <dt>无进展诊断</dt>
         <dd>
           {activity === null || activity.selfCheck === null || activity.selfCheck.verdict === null
-            ? (activity === null ? '未采集到' : '尚未触发程序自检（安静时间还没到自检间隔）')
+            ? (activity === null ? '未采集到' : '尚未触发程序自检（开始运行时间还没到自检间隔，或已关闭自检）')
             : `${SELF_CHECK_LABELS[activity.selfCheck.verdict] ?? activity.selfCheck.verdict}`
               + (activity.selfCheck.checkedAt === null ? '' : `（${formatTime(activity.selfCheck.checkedAt)}）`)}
         </dd>
@@ -2229,8 +2229,8 @@ function TaskDetail({ store, task }) {
         </>
       )}
       <p className="dshdg-hint">
-        逐次授权桥只决定“这一次调用”。它不能创建或扩大任何长期有效的授权（“长期有效”指跨调用、跨会话持久的授权），不能修改设置、凭据、本机调用开关、提供方、模型或隔离方式，
-        也不能预先批准后续调用；工作进程的常规沙箱权限始终保持 workspace-write。此界面不提供手工批准按钮，决定由本机 MCP 指挥官通过
+        逐次授权只覆盖当前调用。后续调用如需扩大权限，须重新核对参数并审批。它不能创建或扩大任何跨任务或长期有效的授权（“长期有效”指跨会话持久的授权），不能修改设置、凭据、本机调用开关、提供方、模型或隔离方式；
+        工作进程的常规沙箱权限始终保持 workspace-write。此界面不提供手工批准按钮，决定由本机 MCP 指挥官通过
         delegate_permission_decide 作出。
       </p>
 
@@ -3316,7 +3316,7 @@ function TasksPanel({ store, snapshot }) {
   return (
     <div className="dshdg-panel">
       <div className="dshdg-row">
-        <p className="dshdg-muted">这里只记录执行事实。执行完成不等于被接受：“等待宿主审查”要由宿主（例如 Codex）单独给出结论。</p>
+        <p className="dshdg-muted">这里只记录执行事实。执行完成不等于被接受：“等待宿主审查”要由宿主（例如 Codex 或 Antigravity）单独给出结论。</p>
         <span className="dshdg-spacer" />
         <span className="dshdg-hint" data-dshdg-refresh-hint="">
           {changing !== true
@@ -3478,19 +3478,21 @@ function CodexPanel({ store, snapshot }) {
   return (
     <section className="dshdg-card" aria-labelledby="dshdg-codex-title">
       <div className="dshdg-row">
-        <h3 id="dshdg-codex-title">Codex 集成（子智能体 + MCP）</h3>
+        <h3 id="dshdg-codex-title">Codex 集成（技能 Skill + MCP）</h3>
         <span className="dshdg-spacer" />
         <Badge tone={ready ? 'on' : 'off'}>{ready ? '已就绪' : '未就绪'}</Badge>
       </div>
       <p className="dshdg-muted">
-        {'点下面的按钮，把 '}
-        <span className="dshdg-mono">agents/dsh-taskbridge.toml</span>
+        {'点下面的按钮，把原生技能 '}
+        <span className="dshdg-mono">skills/dsh-taskbridge/SKILL.md</span>
         {' 装进 Codex 目录，并在 Codex 的 '}
         <span className="dshdg-mono">config.toml</span>
-        {' 里登记本插件的 stdio MCP 服务（delegate_status / delegate_submit / delegate_result / delegate_wait / delegate_cancel）。'
-          + '首次安装只会由你点击触发：打开本页、安装或升级本插件都不会自动创建子智能体文件或 MCP 条目。'
-          + '已经安装过的情况下，插件下次启动会把本插件自己写入的过期托管条目就地更新（例如补上 tool_timeout_sec）；'
-          + '它不会改写非托管、被你改过的条目，也不会触碰 Codex 的其他设置。下面会显示当前条目缺了什么。'}
+        {' 里登记本插件的 stdio MCP 服务（全套 11 个 delegate_* 工具：delegate_status / delegate_preflight / delegate_plan / delegate_submit / delegate_wait / delegate_permission_decide / delegate_question_answer / delegate_result / delegate_review / delegate_cancel / delegate_metrics）。'
+          + '首次安装只会由你点击触发：打开本页、安装或升级本插件都不会自动创建技能文件或 MCP 条目。'
+          + '若目录里存在早期版本写入且未经你改动的旧子智能体文件（agents/dsh-taskbridge.toml / agents/dsh-delegate.toml），'
+          + '插件会在升级或安装时自动迁移为原生技能并安全移除旧文件；你手动改过的旧文件会原样保留不删。'
+          + '已经安装过的情况下，插件下次启动也会把本插件自己写入的过期托管 MCP 条目就地更新（例如补上 tool_timeout_sec），'
+          + '不触碰非托管条目或 Codex 的其他设置。'}
       </p>
       {error === null ? null : <p className="dshdg-fail">{error}</p>}
       {codex === null ? (
@@ -3511,7 +3513,7 @@ function CodexPanel({ store, snapshot }) {
             <p className="dshdg-hint" data-dshdg-codex-drift="">
               {'这个托管 MCP 条目已经过期：'}
               {codexMcpDriftText(codex.mcp)}
-              {'。插件下次启动会自动在原地更新；也可以点上面的「安装 / 更新 TaskBridge 智能体」。'}
+              {'。插件下次启动会自动在原地更新；也可以点上面的「安装 / 更新 TaskBridge 技能」。'}
             </p>
           ) : null}
           {notes.length === 0 ? null : (
@@ -3524,7 +3526,7 @@ function CodexPanel({ store, snapshot }) {
               {refreshing ? '读取中…' : '刷新状态'}
             </button>
             <button type="button" className="dshdg-primary" disabled={disabled} onClick={() => { void store.runCodexAction('install'); }}>
-              {busy ? '处理中…' : '安装 / 更新 TaskBridge 智能体'}
+              {busy ? '处理中…' : '安装 / 更新 TaskBridge 技能'}
             </button>
             <button type="button" disabled={disabled} onClick={() => { void store.runCodexAction('repair'); }}>
               仅修复 MCP 配置
@@ -3539,11 +3541,10 @@ function CodexPanel({ store, snapshot }) {
         </>
       )}
       <p className="dshdg-hint">
-        {'安装后需要让 Codex 重新载入：新开会话或重启 Codex，才会读到新的子智能体和 MCP 条目。'
-          + '本插件不宣称当前 Codex 桌面版/CLI 能在输入框用 @dsh-taskbridge 直接选中该子智能体——这取决于 Codex 版本自身是否提供提及选择；'
-          + '这里只保证子智能体文件与 MCP 工具存在，并由你在 Codex 提供的选择方式中指派它。'
-          + '子智能体只在明确指派时派发任务，并在提交前先检查上面的本机调用开关；本页不会替你打开该开关。'
-          + '同名的自定义 agent 会被保留并报告为冲突；没有本插件托管标记注释的同名 MCP 条目也视为你自己写的，不会被覆盖或删除。'}
+        {'安装后需要让 Codex 重新载入：新开会话或重启 Codex，才会读到新的原生技能和 MCP 条目。'
+          + 'Codex 会话在明确指派时（例如 $dsh-taskbridge 或明确要求交给 DSH / TaskBridge）会按技能规则由当前会话直接调用 delegate_submit 与单链 delegate_wait（利用 tool_timeout_sec = 3660 静默长等，不再派生子智能体并做 wait_agent 短轮询）。'
+          + '技能只在明确指派时派发任务，并在提交前先检查上面的本机调用开关；本页不会替你打开该开关。'
+          + '同名的自定义技能文件或你手动改过的旧 agents/*.toml 都会被保留而不被覆盖或删除；没有本插件托管标记注释的同名 MCP 条目也视为你自己写的，不会被覆盖或删除。'}
       </p>
     </section>
   );

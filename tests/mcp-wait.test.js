@@ -1444,7 +1444,7 @@ test('delegate_result keeps its own schema and behaviour beside the new tool', a
   // paged readers of the review note (R5) and completion summary (N154-01), so a plain
   // `{ taskId }` call is unchanged.
   assert.deepEqual(Object.keys(result.inputSchema.properties), [
-    'taskId', 'reviewNoteOffset', 'reviewNoteLimit', 'completionSummaryOffset', 'completionSummaryLimit',
+    'taskId', 'reviewNoteOffset', 'reviewNoteLimit', 'completionSummaryOffset', 'completionSummaryLimit', 'includeDiff',
   ]);
   assert.deepEqual(result.inputSchema.required, ['taskId']);
   assert.equal(result.inputSchema.additionalProperties, false);

@@ -25,10 +25,11 @@
 // No tarball is written: `--dry-run` only reports.
 
 import test from 'node:test';
+import { codexRuleText, readCodexRuleFiles } from './helpers/codex-rule-files.js';
 import assert from 'node:assert/strict';
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 
@@ -41,7 +42,7 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
  * so asserting itself would pass for any value. `1.5.0` adds question handling and combined waits.
  */
-const DELIVERABLE_VERSION = '1.8.1';
+const DELIVERABLE_VERSION = '1.9.0';
 
 /**
  * The published build this release upgrades *from*.
@@ -50,7 +51,7 @@ const DELIVERABLE_VERSION = '1.8.1';
  * current version must be strictly newer than this baseline,
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.8.0';
+const PREVIOUS_VERSION = '1.8.1';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -354,30 +355,33 @@ test('the stdio MCP executable is declared as a bin and points at a real script'
   assert.match(controlSource, /export const CONTROL_TIMEOUT_MS = 10_000;/u,
     'the documented whole-command budget is ten seconds');
   assert.match(controlSource, /retry: false/u, 'the control call must opt out of the observation retry');
-  assert.ok(PACKED.includes('codex/dsh-taskbridge.toml'), 'the custom-agent template must be published');
-  const codexAgent = readFileSync(join(ROOT, 'codex/dsh-taskbridge.toml'), 'utf8');
-  assert.match(codexAgent, /^name = "dsh-taskbridge"$/mu);
+  assert.ok(PACKED.includes('codex/skills/dsh-taskbridge/SKILL.md'), 'the native Codex skill template must be published');
+  const { referencePath } = readCodexRuleFiles();
+  const packedReferences = PACKED.filter((path) => path.startsWith('codex/skills/dsh-taskbridge/rules-reference-'));
+  assert.deepEqual(packedReferences, [`codex/skills/dsh-taskbridge/${basename(referencePath)}`]);
+  const codexSkill = codexRuleText().replace(/\s+/gu, ' ');
+  assert.match(codexSkill, /name:\s*dsh-taskbridge/u);
+  const codexSkillRaw = readFileSync(join(ROOT, 'codex/skills/dsh-taskbridge/SKILL.md'), 'utf8');
   // The managed copy is stamped with the package version, so an upgrade can tell an
   // older file of ours (safe to refresh) from an operator's edit (never touched).
-  assert.match(codexAgent, new RegExp(`^version = "${MANIFEST.version.replace(/\./gu, '\\.')}"$`, 'mu'));
+  assert.match(codexSkillRaw, new RegExp(`^<!-- dsh-taskbridge-version: ${MANIFEST.version.replace(/\./gu, '\\.')} -->$`, 'mu'));
   // Dispatch rules: explicit selection only, switch checked first, isolation-only
-  // override for shared runs, one task polled, evidence returned to Codex.
-  assert.match(codexAgent, /is NOT a dispatch request/u);
-  assert.match(codexAgent, /delegate_status/u);
-  assert.match(codexAgent, /For a `shared` decision, pass only\s+`overrides = \{ isolation = "shared" \}`/u);
-  assert.match(codexAgent, /Never\s+override the configured provider, model or reasoning effort/u);
-  assert.match(codexAgent, /configured isolation and matching project\s+override apply/u);
-  assert.match(codexAgent, /configured isolation and matching project\s+override apply/u);
-  assert.match(codexAgent, /actual provider\/model\/effort from the\s+result/u);
-  assert.match(codexAgent, /Codex remains responsible/u);
+  // override for shared runs, one direct wait chain, evidence returned to Codex.
+  assert.match(codexSkill, /is NOT a dispatch request/u);
+  assert.match(codexSkill, /delegate_status/u);
+  assert.match(codexSkill, /For a `shared` decision, pass only `overrides = \{ isolation = "shared" \}`/u);
+  assert.match(codexSkill, /Never override the configured provider, model or reasoning effort/u);
+  assert.match(codexSkill, /configured isolation and matching project override apply/u);
+  assert.match(codexSkill, /actual provider\/model\/effort from the result/u);
+  assert.match(codexSkill, /Codex remains responsible/u);
   // The pre-dispatch workspace check, and the rule that keeps it from becoming an
   // automatic downgrade. Both are part of the shipped file, so they are asserted
   // against the archive's own copy rather than the repository checkout.
-  assert.match(codexAgent, /delegate_preflight/u);
-  assert.match(codexAgent, /Do NOT downgrade to\s+shared isolation silently/u);
-  assert.match(codexAgent, /`allowShared: true`/u);
-  assert.doesNotMatch(codexAgent, /workbuddy|deepseek-v4\.1-flash/u, 'the companion must follow DSH plugin routing');
-  assert.doesNotMatch(codexAgent, /^\[mcp_servers\./mu, 'the companion inherits MCP tools from the parent session');
+  assert.match(codexSkill, /delegate_preflight/u);
+  assert.match(codexSkill, /Do NOT downgrade to shared isolation silently/u);
+  assert.match(codexSkill, /`allowShared: true`/u);
+  assert.doesNotMatch(codexSkill, /workbuddy|deepseek-v4\.1-flash/u, 'the skill must follow DSH plugin routing');
+  assert.doesNotMatch(codexSkillRaw, /^\[mcp_servers\./mu, 'the skill inherits MCP tools from the parent session');
 
   // The preflight module is imported by the execution plane, which the MCP
   // executable reaches, so it has to be in the archive for the tool to exist.
@@ -574,8 +578,8 @@ test(`the release is ${DELIVERABLE_VERSION}, newer than ${PREVIOUS_VERSION}`, ()
   assert.equal(lock.version, DELIVERABLE_VERSION, 'package-lock.json#version must match package.json');
   assert.equal(lock.packages[''].version, DELIVERABLE_VERSION, 'the lockfile root entry must match package.json');
 
-  const template = readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8');
-  assert.match(template, new RegExp(`^version = "${escape(DELIVERABLE_VERSION)}"$`, 'mu'));
+  const template = readFileSync(join(ROOT, 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
+  assert.match(template, new RegExp(`^<!-- dsh-taskbridge-version: ${escape(DELIVERABLE_VERSION)} -->$`, 'mu'));
 
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
   assert.match(readme, new RegExp(`dsh-taskbridge-${escape(DELIVERABLE_VERSION)}\\.tgz`, 'u'));
@@ -675,7 +679,7 @@ test('the archive carries every install-critical file', () => {
     // stdio MCP adapter
     'bin/dsh-delegate-mcp.js',
     'bin/dsh-delegate-codex-agent.js',
-    'codex/dsh-taskbridge.toml',
+    'codex/skills/dsh-taskbridge/SKILL.md',
     // bundle composition
     'cordis.patch.yml',
   ];
@@ -702,6 +706,8 @@ test('the archive publishes the operator-facing contracts, not internal notes', 
     'docs/runtime-compatibility.md',
     'docs/worker-permissions.md',
     'docs/workspace-contract.md',
+    'docs/assets/taskbridge-workflow.zh.png',
+    'docs/assets/taskbridge-workflow.en.svg',
   ]) {
     assert.ok(PACKED.includes(path), `missing doc: ${path}`);
   }
@@ -783,10 +789,32 @@ test('the packed size stays bounded and contains no single-file outlier', () => 
   const ANTIGRAVITY_INTEGRATION_GROWTH_BYTES = 48_000;
   // Isolation-aware linked cleanup (archiveSessions, removeWorktrees, cleanPlans), preset shortcuts and orphan sweep.
   const LINKED_CLEANUP_GROWTH_BYTES = 80_000;
+  // Immediate route registration ahead of startup refreshes, frontend cold-start 404 retry, and 1.9.0 release note.
+  const STARTUP_READINESS_GROWTH_BYTES = 16_000;
+  // Codex native skill (`skills/dsh-taskbridge/SKILL.md`), skill ownership tracking, and legacy subagent retirement.
+  const CODEX_SKILL_MIGRATION_GROWTH_BYTES = 16_000;
+  // Layered host-integration rules, R1/R2/R3 redlines, C1 batched Windows boundary checks, U1/U2 UI fixes, and 1.9.0 docs alignment.
+  const LAYERED_INTEGRATIONS_AND_REVIEW_FIXES_GROWTH_BYTES = 12_000;
+  // Original Chinese PNG and English SVG bundled with the README and introduction pages.
+  const WORKFLOW_DIAGRAMS_GROWTH_BYTES = 56_000;
+  // Multi-stage isolated worktree reuse (`reuseWorktreeFromTaskId`), per-task safe command permission
+  // scope (`scope: "task-command"`), MCP round-trip compression (`autoPreflight`/`wait`/`includeDiff`),
+  // usage receipt delta/cumulative counters, and Codex L1 slimming/lightweight review rules.
+  const WORKTREE_REUSE_AND_ROUNDTRIP_GROWTH_BYTES = 32_000;
+  // 1.9.0 dual-host benchmark tables & conclusions across README/INTRODUCTION/CHANGELOG/release notes
+  // plus 1.9.0-test6 upgrade digests and waitError rule guards — prose and hashes only, no dependency.
+  const BENCHMARK_DOCS_AND_TEST6_HASHES_GROWTH_BYTES = 24_000;
+  // Post-review hardening: exact fingerprint reuse for task-command, pending reuse cleanup guards,
+  // and autoPreflight cancellation checks.
+  const REVIEW_HARDENING_GROWTH_BYTES = 4_000;
   const growth = TASK_RECORDS_GROWTH_BYTES + MONITORING_GROWTH_BYTES
     + AGENT_TEAMS_DEFAULT_GROWTH_BYTES + AGENT_TEAMS_CHOICE_FIDELITY_BYTES
     + CONCURRENT_ISOLATION_GROWTH_BYTES + GROUPED_WORKSPACES_GROWTH_BYTES
-    + ANTIGRAVITY_INTEGRATION_GROWTH_BYTES + LINKED_CLEANUP_GROWTH_BYTES;
+    + ANTIGRAVITY_INTEGRATION_GROWTH_BYTES + LINKED_CLEANUP_GROWTH_BYTES
+    + STARTUP_READINESS_GROWTH_BYTES + CODEX_SKILL_MIGRATION_GROWTH_BYTES
+    + LAYERED_INTEGRATIONS_AND_REVIEW_FIXES_GROWTH_BYTES + WORKFLOW_DIAGRAMS_GROWTH_BYTES
+    + WORKTREE_REUSE_AND_ROUNDTRIP_GROWTH_BYTES + BENCHMARK_DOCS_AND_TEST6_HASHES_GROWTH_BYTES
+    + REVIEW_HARDENING_GROWTH_BYTES;
   assert.ok(total < 3_120_000 + growth, `unpacked size grew unexpectedly: ${total} bytes`);
   const RELEASE_BUDGET_BYTES = 3_080_000;
   const budget = RELEASE_BUDGET_BYTES + growth;

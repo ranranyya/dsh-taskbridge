@@ -10,6 +10,7 @@
 // wait answer. The engine half lives in `agent-teams.test.js`.
 
 import test from 'node:test';
+import { codexRuleText } from './helpers/codex-rule-files.js';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
@@ -179,7 +180,7 @@ test('the submit tool documents user control, per-task precedence and the contin
 });
 
 test('the template says a follow-up with no recorded choice writes nothing, and refuses both explicit values', () => {
-  const text = readFileSync(new URL('../codex/dsh-taskbridge.toml', import.meta.url), 'utf8');
+  const text = codexRuleText().replace(/\s+/gu, ' ');
   // Rule 4a: the continuation-with-no-record case applies nothing at all.
   assert.match(text, /if that task recorded no choice at all[\s\S]{0,120}writes nothing/u);
   assert.match(text, /the Session keeps\s+the mode it already has/u);

@@ -1,6 +1,6 @@
 # Antigravity integration contract
 
-Status: implemented in 1.8.0.
+Status: implemented in 1.8.0 (updated in 1.9.0 with layered commander core, isolated worktree reuse, per-task safe command approvals, and Flash subagent token boundaries).
 
 This document defines the contract between the TaskBridge settings page (**Antigravity integration** tab), the host-side installer (`src/antigravity/installer.js`, `src/antigravity/seam.js`), and the self-contained Antigravity plugin bundle it manages.
 
@@ -40,3 +40,8 @@ TaskBridge **never modifies** `~/.gemini/config/mcp_config.json` or `~/.gemini/c
 
 - Antigravity gates newly installed external MCP tools by default, so the first delegated task prompts for approval on each `delegate_*` call (`delegate_status`, `delegate_preflight`, `delegate_submit`, `delegate_wait`, `delegate_result`, `delegate_review`, etc.).
 - Operators can choose **Always Allow** (or add Permission Grants for `dsh-taskbridge_dsh-taskbridge` in Antigravity Settings) to avoid repeated prompts during routine dispatches. Turning off DSH's master **Allow local MCP calls to DSH delegation** switch still rejects all new submissions immediately, and DSH workers remain inside their configured worktree/sandbox boundaries.
+
+## 5. Layered rule maintenance (source repository)
+
+- Both `antigravity/skills/dsh-taskbridge/SKILL.md` and `antigravity/agents/dsh-taskbridge.md` (along with `codex/skills/dsh-taskbridge/SKILL.md`) are generated from the layered single-source definitions under `integrations/core/` (Layer 2 shared commander core: activation redlines, decompose-and-steer planning philosophy, dispatch state machine, pragmatic review) and `integrations/adapters/` (Layer 1 host-specific thin adapters).
+- After editing layered sources, run `npm run build:integrations`; `npm run check:integrations` and `tests/integrations-layering.test.js` verify byte-for-byte sync.

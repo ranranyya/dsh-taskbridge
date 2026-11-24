@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.9.0 — Codex 原生技能单链直等架构、分层指挥内核、跨包工作树复用与双端省流实测（2026-11-24）
+
+- **Codex 全面切换为原生技能（Skill + 按需附页）单链直等架构**：
+  - 托管目标从旧子智能体文件 `agents/dsh-taskbridge.toml` 升级为 Codex 原生技能 `$CODEX_HOME/skills/dsh-taskbridge/SKILL.md` 及同目录哈希固定附页 `rules-reference-<sha256>.md`（标准 YAML frontmatter + 托管版本注释 + 独立所有权记录 `codex-skill-ownership`），让当前 Codex 会话在明确指派时读入紧凑入口并直调 `delegate_submit` 与单链 `delegate_wait`（配合 `config.toml` 的 `tool_timeout_sec = 3660` 静默长等），彻底根除主会话通过 `spawn_agent` + 短超时 `wait_agent` 每 45–55 秒空转轮询的问题。
+  - Antigravity 端继续保留 `SKILL.md` + `Model: "flash"` 后台子智能体架构（适配其 3 分钟 MCP 调用硬上限与主旗舰模型被动零唤醒挂起）。
+- **旧版 Codex 子智能体安全自动退役**：
+  - 保留对 `0.1.6`–`1.8.x` 已发布模板精确哈希与历史 `codex-agent-ownership` 记录的识别能力。DSH 启动自动刷新、点击「安装 / 更新 TaskBridge 技能」或点击「移除插件托管项」时，会在先确认 `skills/dsh-taskbridge/SKILL.md` 与附页落盘且写入前再次逐字节复验后，自动移除未经用户修改的旧 `agents/dsh-taskbridge.toml` 与 `agents/dsh-delegate.toml`；任何被用户手动改过的旧文件或同名技能文件一律原样保留并在面板提示。
+  - 扩展边界保护至 `$CODEX_HOME`、`skills/`、`skills/dsh-taskbridge/` 与 `agents/`（Windows 下合并为单次批量路径属性探测以消除冷启动延迟），拒绝穿过符号链接或 Windows reparse point / junction 读写。
+- **跨宿主分层派工内核重构与双端指挥理念统一**：
+  - 将跨平台公共派工规则收拢至单一真源 `integrations/core/`（激活红线、规划哲学、派工状态机、务实审查），各宿主独有运行机制收拢至极薄适配壳 `integrations/adapters/`，通过 `npm run build:integrations` 自动组装出各端产物，并由 `npm run check:integrations` 与 `tests/integrations-layering.test.js` 锁死逐字节一致。
+  - 双端统一为「大任务先用 `delegate_plan` 拆小包 + 指明架构方向/接口契约/范围红线/验收标准（禁止指挥端代写逐行实现代码或伪代码）+ 务实审查防洁癖返工（仅真缺陷/违背规范/测试失败/遗留垃圾文件合并一轮返工，严禁自行构造超纲对抗性 Fuzz 探针打回合格交付）」。
+  - Antigravity 宿主适配层补齐省流边界：主控默认走 `flash` 后台子智能体时禁止预读子智能体专用 MCP schema 与 `agents/dsh-taskbridge.md`、禁止重复调用 `delegate_result`，Flash 子智能体禁止越界通读业务源码；两端安装器补登历史及 `test1`–`test6` 精确哈希保障无感升级。
+- **跨子包隔离工作树复用与 MCP 往返压缩**：
+  - `delegate_submit` 新增 `reuseWorktreeFromTaskId`：多阶段规划中下游子包可在上游已完成任务的隔离 `worktree` 上直接开启全新干净 DSH 会话继续构建，全程零污染用户源仓库，且联动清理自动保护仍被下游任务引用的共享工作树；同时新增 `autoPreflight: true` 与 `wait: true` 支持单次 MCP 调用完成预检、提交与首段等待（若后续等待中断仍完整返回 `submitReceipt` 与 `taskId` 防重复派工）。
+  - `delegate_permission_decide` 按本次调用的精确指纹逐次审批。为兼容预览版客户端，`allow-once` 带 `scope: "task-command"` 时按 `scope: "once"` 处理。
+  - `delegate_result` 新增 `includeDiff: false` 供本地直接审查 `executionWorkspacePath` 时省略重复大段补丁；任务执行回执新增 `execution.usage.delta` 与 `cumulative` 双口径 Token 统计；底层 `worker-prompt.js` 明确禁建工作区内 `.cache/` 临时垃圾日志。
+- **修复「立刻启用」瞬间 404 竞态与前端冷启动重试**：
+  - 在 `src/index.js` 中优先注册用户面 `/api/dsh-delegate/*` 与执行面 HTTP 路由，再并行执行 Codex / Antigravity 启动自动刷新（`/codex` 与 `/antigravity` 路由会在读写前等待启动刷新落定），彻底消除启动期路径校验阻塞路由注册导致的 404 窗口；前端 `store.init()` 增加冷启动短暂 404 自动短退避重试与同文案提示去重。
+- **双端 7 题黑盒基准实测验证（`1.9.0-test6` 候选构建）**：同宿主配对无插件强模型基线（DSH 执行后端为 `deepseek-v4.1-flash`），Antigravity 端 `7/7` 满分通过（`T1–T5` 同题 `5/5` 与基线持平，同题主控均步 `11.00 → 11.80`）、`T1–T5` 强模型有效 Token（非缓存输入 + 输出）净省 **32.06%**（重型题 `T5` 省 **37.95%**）；Codex 端 `6/7` 通过、`T1–T5`（`4/5`，均分 `96`）与无插件基线逐题得分 100% 一致，`T1–T5` 主控有效 Token 净省 **24.50%**（`T5` 省 **43.32%**，7 题有效 Token 较旧轮询态下降 **78.7%**）。详见 [1.9.0 更新说明](docs/releases/1.9.0.zh.md)。
+
 ## 1.8.1 — 任务联动清理、指挥端低耗优化、共享工作区保护与全新架构图（2026-11-23）
 
 - **任务记录联动清理、快捷预设与历史孤儿扫除**：

@@ -5,7 +5,14 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { taskTitle } from '../src/jobs/title.js';
 import { placeSession, ensureWorkspace } from '../src/runtime/session-placement.js';
-import { runCodexAction, refreshKnownAgentTemplate, AGENT_FILENAME, isExplicitlyMigratableScript, useDirectoryClassifier } from '../src/codex/installer.js';
+import {
+  runCodexAction,
+  refreshKnownAgentTemplate,
+  SKILL_DIR_NAME,
+  SKILL_FILENAME,
+  isExplicitlyMigratableScript,
+  useDirectoryClassifier,
+} from '../src/codex/installer.js';
 import { fakeWorkspaceController, fakeSessionController } from './helpers/fakes.js';
 
 test('titles use the task goal rather than an executor role and preserve Chinese content', () => {
@@ -52,10 +59,10 @@ test('placement carries the title into the native workspace for worktree runs, a
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-for (const action of ['install', 'startup']) test(`${action} migrates the actual published legacy agent without leaving duplicate mentions`, async () => {
+for (const action of ['install', 'startup']) test(`${action} migrates the actual published legacy agent into the native skill without leaving duplicate files`, async () => {
   const home = await mkdtemp(join(tmpdir(), 'taskbridge-agent-'));
   const legacy = join(home, 'agents', 'dsh-delegate.toml');
-  const current = join(home, 'agents', AGENT_FILENAME);
+  const current = join(home, 'skills', SKILL_DIR_NAME, SKILL_FILENAME);
   const published = await readFile(new URL('./fixtures/codex-agent-1.3.1.toml', import.meta.url));
   const env = { CODEX_HOME: home, DSH_HOME: home };
   // The boundary check asks Windows for `ReparsePoint` through one PowerShell child, and
@@ -66,10 +73,10 @@ for (const action of ['install', 'startup']) test(`${action} migrates the actual
   try {
     await mkdir(join(home, 'agents'));
     await writeFile(legacy, published);
-    const options = { codexHome: home, env, version: '1.3.2' };
+    const options = { codexHome: home, env, version: '1.9.0' };
     const result = action === 'startup' ? await refreshKnownAgentTemplate(options) : await runCodexAction('install', options);
     assert.equal(result.status.agent.state, 'installed');
-    assert.match(await readFile(current, 'utf8'), /^name = "dsh-taskbridge"$/mu);
+    assert.match(await readFile(current, 'utf8'), /^name:\s*dsh-taskbridge$/mu);
     await assert.rejects(access(legacy), { code: 'ENOENT' });
     if (action === 'startup') await assert.rejects(access(join(home, 'config.toml')), { code: 'ENOENT' });
     assert.deepEqual((await refreshKnownAgentTemplate(options)).changed, []);
@@ -79,23 +86,29 @@ for (const action of ['install', 'startup']) test(`${action} migrates the actual
   }
 });
 
-test('an edited old agent and an occupied new agent are preserved during migration', async () => {
+test('an edited old agent is preserved without creating a skill, and an occupied custom skill is preserved while untouched legacy is retired', async () => {
   const home = await mkdtemp(join(tmpdir(), 'taskbridge-custom-'));
   const legacy = join(home, 'agents', 'dsh-delegate.toml');
-  const current = join(home, 'agents', AGENT_FILENAME);
+  const current = join(home, 'skills', SKILL_DIR_NAME, SKILL_FILENAME);
+  const restoreClassifier = useDirectoryClassifier(async (paths) => new Map(paths.map((path) => [path, 'directory'])));
   try {
     await mkdir(join(home, 'agents'));
     const published = await readFile(new URL('./fixtures/codex-agent-1.3.1.toml', import.meta.url), 'utf8');
     await writeFile(legacy, published + '\n# my edit\n');
-    const options = { codexHome: home, env: { CODEX_HOME: home, DSH_HOME: home }, version: '1.3.2' };
+    const options = { codexHome: home, env: { CODEX_HOME: home, DSH_HOME: home }, version: '1.9.0' };
     assert.deepEqual((await refreshKnownAgentTemplate(options)).changed, []);
     await assert.rejects(access(current), { code: 'ENOENT' });
+    assert.equal(await readFile(legacy, 'utf8'), published + '\n# my edit\n');
+    await mkdir(join(home, 'skills', SKILL_DIR_NAME), { recursive: true });
     await writeFile(legacy, published);
-    await writeFile(current, 'name = "my-taskbridge"\n');
+    await writeFile(current, '---\nname: my-taskbridge\n---\ncustom skill\n');
     await refreshKnownAgentTemplate(options);
-    assert.equal(await readFile(current, 'utf8'), 'name = "my-taskbridge"\n');
-    assert.equal(await readFile(legacy, 'utf8'), published);
-  } finally { await rm(home, { recursive: true, force: true }); }
+    assert.equal(await readFile(current, 'utf8'), '---\nname: my-taskbridge\n---\ncustom skill\n');
+    await assert.rejects(access(legacy), { code: 'ENOENT' });
+  } finally {
+    restoreClassifier();
+    await rm(home, { recursive: true, force: true });
+  }
 });
 
 test('explicit MCP migration accepts an uninstalled legacy sibling and rejects other locations', async () => {

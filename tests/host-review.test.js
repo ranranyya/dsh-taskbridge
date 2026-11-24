@@ -626,13 +626,11 @@ test('the MCP catalog advertises delegate_review with a closed schema, and its r
   const listed = await server.handle({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const review = listed.result.tools.find((tool) => tool.name === 'delegate_review');
   assert.ok(review !== undefined, 'delegate_review must be advertised');
-  // The set is CLOSED and still exactly the review's own fields. `completionSummary` is the
-  // one addition (G01-B): what was actually done, stated by the same review call, saved
-  // inside the same write and never as a second top-level record.
   assert.deepEqual(
     Object.keys(review.inputSchema.properties).sort(),
-    ['completionSummary', 'decision', 'note', 'taskId'],
+    ['completionSummary', 'decision', 'note', 'receiptOnly', 'taskId'],
   );
+  assert.equal(review.inputSchema.properties.receiptOnly.type, 'boolean');
   assert.deepEqual(review.inputSchema.required, ['taskId', 'decision', 'note']);
   assert.equal(review.inputSchema.additionalProperties, false);
   assert.deepEqual([...review.inputSchema.properties.decision.enum], ['accepted', 'changes-requested']);
@@ -672,6 +670,7 @@ test('the MCP catalog advertises delegate_review with a closed schema, and its r
   // plane — and so is a summary over the bound or of the wrong type.
   for (const args of [
     { taskId: 't1', decision: 'accepted', note: 'ok', extra: 1 },
+    { taskId: 't1', decision: 'accepted', note: 'ok', receiptOnly: 'true' },
     { taskId: 't1', decision: 'accepted', note: 'q'.repeat(8_001) },
     { taskId: 't1', decision: 'approved', note: 'ok' },
     { taskId: 't1', decision: 'accepted', note: 'ok', completionSummary: 'z'.repeat(2_001) },
@@ -683,6 +682,44 @@ test('the MCP catalog advertises delegate_review with a closed schema, and its r
     assert.equal(bad.result.isError, true, `${JSON.stringify(args).slice(0, 50)} must be refused`);
     assert.deepEqual(seen, [], 'a refused argument sends nothing');
   }
+});
+
+test('receipt-only host review sends the same write and returns the current persistence state', async () => {
+  const args = { taskId: 't1', decision: 'accepted', note: 'verified', completionSummary: 'done' };
+  const hostAcceptance = { accepted: true, note: args.note, completionSummary: args.completionSummary };
+  let persistence = { state: 'saved', decision: 'accepted', accepted: true, durable: true };
+  const server = createMcpServer({
+    async callExecution(route, payload) {
+      assert.equal(route, 'review');
+      assert.deepEqual(payload, args);
+      return {
+        ok: true,
+        task: { taskId: 't1', diff: { patchText: 'reviewed diff' }, execution: { text: 'worker summary' } },
+        hostAcceptance: persistence.durable ? hostAcceptance : null,
+        reviewPersistence: persistence,
+      };
+    },
+  });
+  await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  async function review(extra) {
+    const response = await server.handle({
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'delegate_review', arguments: { ...args, ...extra } },
+    });
+    assert.equal(response.result.isError, undefined);
+    return JSON.parse(response.result.content[0].text);
+  }
+  const full = await review();
+  assert.equal(full.task.diff.patchText, 'reviewed diff');
+  assert.deepEqual(full.hostAcceptance, hostAcceptance);
+  assert.deepEqual(await review({ receiptOnly: true }), {
+    ok: true, taskId: 't1', reviewPersistence: persistence,
+  });
+
+  persistence = { state: 'timed-out', decision: 'accepted', accepted: false, durable: false, retryable: false };
+  assert.deepEqual(await review({ receiptOnly: true }), {
+    ok: true, taskId: 't1', reviewPersistence: persistence,
+  });
 });
 
 // ---------------------------------------------------------------------------

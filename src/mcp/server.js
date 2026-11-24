@@ -298,8 +298,8 @@ export const TOOLS = Object.freeze([
     name: 'delegate_submit',
     title: 'Submit delegated task',
     description: 'Submit one prompt to run as a delegated task while the DSH delegation switch is enabled. '
-      + 'Returns the task identity and state; '
-      + 'it does not wait for the work to finish and it is not host approval. '
+      + 'Returns the task identity and state (or follows the first wait in the same call when `wait: true` is set); '
+      + 'submission is not host approval. '
       + 'workspacePath is the operator-authorized SOURCE repository or checkout the task runs against; '
       + 'a source root may legitimately be a Git checkout or a Git worktree (subject to the usual preflight). '
       + 'A follow-up keeps that same source path as the task it continues. '
@@ -309,10 +309,13 @@ export const TOOLS = Object.freeze([
       + 'reuses that task\u2019s recorded execution checkout and DSH Session internally, taking no execution '
       + 'location from '
       + 'the caller. An unknown, unfinished, removed or differently-sourced parent is refused rather than '
-      + 'started as a new conversation. '
+      + 'started as a new conversation. For a new dependent subtask that starts a fresh DSH Session directly on '
+      + 'an earlier finished isolated worktree under the same source repository, pass reuseWorktreeFromTaskId '
+      + 'instead (never combined with continueFromTaskId). '
       + 'The commander must first plan and scope ONE cohesive, independently verifiable work packet. '
       + 'Inspect the project and prior delivery, choose the next ready packet, and tell the operator the approach and reuse decision. '
-      + 'Put the implementation plan in the prompt. Group dependent packets with delegate_plan. A simple task can use one brief. '
+      + 'Put clear architectural direction, exported contracts, owned scope redlines and acceptance checks in the prompt (without dictating line-by-line code). '
+      + 'Group dependent packets with delegate_plan. A simple task can use one brief. '
       + 'Rules, planning and final review stay with the commander. Verification-only packets are read-only.',
     // It creates work, so it is not a read; it is not destructive of anything the
     // operator already has, and repeating it creates ANOTHER task (never idempotent).
@@ -340,8 +343,8 @@ export const TOOLS = Object.freeze([
         },
         prompt: {
           type: 'string',
-          description: 'Give DSH the objective, verified starting facts, code entry points, ordered steps, existing-code or GitHub reuse, owned scope and acceptance evidence. '
-            + 'Make the first implementation step clear. Roadmap context does not authorize future packets. A verification-only packet permits checks and evidence only.',
+          description: 'Give DSH the objective, verified starting facts, code/spec entry points, architectural direction and exported contracts/invariants, owned scope redlines, and acceptance evidence (do not dictate line-by-line implementation code). '
+            + 'Roadmap context does not authorize future packets. A verification-only packet permits checks and evidence only.',
         },
         title: { type: 'string', maxLength: 120, description: 'Short work-content title in the operator\'s language, e.g. 修复登录错误. Used to name the new DSH Workspace; omit role instructions and task ids. A follow-up keeps its existing Workspace name.' },
         overrides: {
@@ -376,6 +379,44 @@ export const TOOLS = Object.freeze([
             + 'internally and pins the follow-up to the parent\u2019s recorded isolation; do not select a new '
             + 'isolation override either. An unknown, still-running, removed or differently-sourced parent is '
             + 'refused, never replaced by a new conversation.',
+        },
+        reuseWorktreeFromTaskId: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 256,
+          description: 'OPTIONAL. Task id of an earlier finished (`awaiting-host-review`) isolated worktree task '
+            + 'under the SAME source repository whose managed worktree this NEW independent subtask should reuse. '
+            + 'Starts a FRESH DSH Session (clean worker context) and may bind its own `planNodeId`, while editing '
+            + 'directly on top of the upstream task\u2019s worktree without touching or committing to the user\u2019s source '
+            + 'checkout. Mutually exclusive with `continueFromTaskId` (which reuses both session and worktree for '
+            + 'rectification of the same item).',
+        },
+        autoPreflight: {
+          type: 'boolean',
+          description: 'OPTIONAL, default false (MCP-only control flag). For a new task chain (neither '
+            + '`continueFromTaskId` nor `reuseWorktreeFromTaskId`), run `delegate_preflight` automatically before '
+            + 'submitting. If preflight returns `block`, stops without submitting and returns `{ ok: true, '
+            + 'submitted: false, preflight }`; if clean (`worktree`, or `shared` with `allowShared: true`), proceeds '
+            + 'straight to submit inside this same call.',
+        },
+        allowShared: {
+          type: 'boolean',
+          description: 'OPTIONAL, default false (only valid with `autoPreflight: true`). Forwarded to automatic '
+            + 'preflight when explicitly authorizing in-place `shared` execution on a dirty Git repository root.',
+        },
+        wait: {
+          type: 'boolean',
+          description: 'OPTIONAL, default false (MCP-only control flag). After the task is submitted, immediately '
+            + 'follow it via `delegate_wait` inside this same MCP call and return the compact wait answer plus '
+            + '`submitted: true` and `submitReceipt`. If the follow-up wait fails after submission succeeded, this '
+            + 'call still returns `submitted: true`, `taskId`, `submitReceipt` and `waitError` so you never lose the '
+            + 'task id or resubmit a duplicate.',
+        },
+        waitSeconds: {
+          type: 'integer',
+          minimum: MIN_WAIT_SECONDS,
+          maximum: MAX_WAIT_SECONDS,
+          description: 'OPTIONAL (only valid with `wait: true`). Wait budget in seconds; omit to use the default 3600s.',
         },
         goalDescription: {
           type: 'string',
@@ -462,6 +503,12 @@ export const TOOLS = Object.freeze([
           maximum: MAX_COMPLETION_SUMMARY_PAGE_CHARS,
           description: `Code points of completionSummary per page (1..${MAX_COMPLETION_SUMMARY_PAGE_CHARS}, `
             + 'default 2000). Only meaningful together with completionSummaryOffset.',
+        },
+        includeDiff: {
+          type: 'boolean',
+          description: 'OPTIONAL, default true (MCP-only control flag). Set to false to omit `task.diff.patchText` '
+            + 'while keeping changed file paths, counts, summary, execution receipt and review state — useful when '
+            + 'the commander inspects the diff directly inside `executionWorkspacePath` to avoid duplicate context.',
         },
       },
       required: ['taskId'],
@@ -599,9 +646,9 @@ export const TOOLS = Object.freeze([
       + 'in delegate_result as `permission.pending` (state stays `running`, phase `awaiting-permission`). '
       + 'Read `permission.pending.arguments`/`argumentKeys` for the exact operation and `permission.pending.reason` '
       + 'for the asker\u2019s claim — the claim is not the operation. Answer `allow-once` to let THAT ONE call '
-      + 'proceed, or `reject` to keep it denied; the worker then continues and a later escalation asks again. '
+      + 'proceed, or `reject` to keep it denied. Every later escalation requires a separate decision. '
       + 'This cannot grant an account, a workspace or a standing policy, cannot change settings, credentials, '
-      + 'the switch, the provider/model or the isolation, and cannot approve a future call. '
+      + 'the switch, the provider/model or the isolation, and cannot grant cross-task or standing permissions. '
       + '`allow-once` REQUIRES the pending request\u2019s `fingerprint` and is refused when `permission.pending.'
       + 'completeness` is not `complete` (the operation was shortened by a bound, so an allow cannot be granted '
       + 'on it). `reject` needs neither and is therefore always available. '
@@ -644,6 +691,12 @@ export const TOOLS = Object.freeze([
           description: 'The pending request\u2019s `fingerprint`. REQUIRED for `allow-once`: the decision must name '
             + 'the exact operation it grants, and an allow that omits it is refused. Optional for `reject` (a '
             + 'refusal is safe without it); when supplied, a request whose operation no longer matches is refused.',
+        },
+        scope: {
+          type: 'string',
+          enum: ['once', 'task-command'],
+          description: 'OPTIONAL, default `once`. Use `once` to permit only this exact paused call. The preview '
+            + 'value `task-command` is accepted with `allow-once` as a compatibility alias for `once`.',
         },
         waitAfterDecision: {
           type: 'boolean',
@@ -819,6 +872,10 @@ export const TOOLS = Object.freeze([
             + 'successful never produces one. It is part of the review\u2019s identity: repeating the same decision and '
             + 'note WITH the same summary is an idempotent no-op, and a different summary \u2014 or adding one to an '
             + 'already recorded review \u2014 is refused like any other different conclusion.',
+        },
+        receiptOnly: {
+          type: 'boolean',
+          description: 'Set true to return the task ID and reviewPersistence only. Read full details with delegate_result.',
         },
       },
       required: ['taskId', 'decision', 'note'],
@@ -1039,6 +1096,8 @@ function canonicalizeToolDescription(tool, key, field) {
  * {@link validateArgs} — and never reintroduced anywhere else.
  */
 export const MCP_ONLY_ARGUMENTS = Object.freeze({
+  delegate_submit: Object.freeze(['autoPreflight', 'allowShared', 'wait', 'waitSeconds']),
+  delegate_result: Object.freeze(['includeDiff']),
   delegate_permission_decide: Object.freeze(['waitAfterDecision']),
   delegate_question_answer: Object.freeze(['waitAfterAnswer']),
 });
@@ -1236,6 +1295,17 @@ function validateArgs(tool, args) {
     }
     if (Array.isArray(declared.enum) && !declared.enum.includes(out[key])) {
       throw new McpError('MCP_ARGUMENT_ENUM', `${tool.name}.${key} must be one of ${declared.enum.join(', ')}`);
+    }
+  }
+  if (tool.name === 'delegate_submit') {
+    if (out.continueFromTaskId !== undefined && out.reuseWorktreeFromTaskId !== undefined) {
+      throw new McpError('MCP_ARGUMENTS_INVALID', 'delegate_submit cannot combine continueFromTaskId and reuseWorktreeFromTaskId');
+    }
+    if (out.waitSeconds !== undefined && out.wait !== true) {
+      throw new McpError('MCP_ARGUMENT_REQUIRED', 'delegate_submit.waitSeconds requires wait: true');
+    }
+    if (out.allowShared !== undefined && out.autoPreflight !== true) {
+      throw new McpError('MCP_ARGUMENT_REQUIRED', 'delegate_submit.allowShared requires autoPreflight: true');
     }
   }
   if (tool.name === 'delegate_result') {
@@ -2839,6 +2909,25 @@ export function createMcpServer(options) {
       let result;
       if (name === 'delegate_wait') {
         result = await waitAnswer(payload, context);
+      } else if (name === 'delegate_submit') {
+        result = await submitAnswer(payload, context);
+      } else if (name === 'delegate_result') {
+        const { includeDiff, ...resultBody } = payload;
+        result = await callExecution(route, resultBody);
+        if (includeDiff === false && result?.ok === true && result.task?.diff && typeof result.task.diff === 'object') {
+          result = {
+            ...result,
+            task: {
+              ...result.task,
+              diff: {
+                ...result.task.diff,
+                patchText: '',
+                patchOmitted: true,
+                omittedByRequest: true,
+              },
+            },
+          };
+        }
       } else if (name === 'delegate_permission_decide') {
         result = await decidePermissionAnswer(payload, context);
       } else if (name === 'delegate_question_answer') {
@@ -2846,6 +2935,23 @@ export function createMcpServer(options) {
       } else if (name === 'delegate_metrics') {
         // A census of THIS process: no plane route, no task identity, nothing to change.
         result = { ok: true, metrics: metrics.snapshot() };
+      } else if (name === 'delegate_review') {
+        const { receiptOnly, ...review } = payload;
+        result = await callExecution(route, review);
+        if (receiptOnly && result?.ok === true) {
+          result = {
+            ok: true,
+            taskId: result.task?.taskId ?? review.taskId,
+            reviewPersistence: result.reviewPersistence ?? result.task?.reviewPersistence ?? null,
+          };
+        } else if (result?.ok === true && result.reviewPersistence !== undefined) {
+          result = {
+            ok: true,
+            reviewPersistence: result.reviewPersistence,
+            ...(result.hostAcceptance !== undefined ? { hostAcceptance: result.hostAcceptance } : {}),
+            ...result,
+          };
+        }
       } else {
         result = await callExecution(route, payload);
       }
@@ -2898,6 +3004,126 @@ export function createMcpServer(options) {
       // the text this process handed back, whatever that text said. `null` means no text
       // existed at all, which the census reports as an unmeasured return.
       metrics.recordReturn(producedText);
+    }
+  }
+
+  /**
+   * Reject with `MCP_REQUEST_CANCELLED` when this MCP request has already been cancelled.
+   * @param {{ signal?: AbortSignal }} [context] - per-request cancellation.
+   * @returns {void}
+   */
+  function throwIfRequestCancelled(context) {
+    if (context?.signal?.aborted !== true) return;
+    const reason = context.signal.reason;
+    const code = typeof reason?.code === 'string' && reason.code !== ''
+      ? reason.code
+      : 'MCP_REQUEST_CANCELLED';
+    const message = typeof reason?.message === 'string' && reason.message !== ''
+      ? reason.message
+      : 'the request was cancelled by the host';
+    throw new McpError(code, message);
+  }
+
+  /**
+   * One `delegate_submit` call, optionally performing automatic preflight and/or
+   * single-chain waiting inside the same MCP call to eliminate round-trip turns.
+   * @param {object} payload - validated submit arguments.
+   * @param {{ signal?: AbortSignal }} context - per-request cancellation.
+   * @returns {Promise<object>} submit answer, preflight block, or compact wait answer + receipt.
+   */
+  async function submitAnswer(payload, context) {
+    throwIfRequestCancelled(context);
+    const { autoPreflight, allowShared, wait, waitSeconds, ...rawSubmitBody } = payload;
+    let submitBody = rawSubmitBody;
+    let preflightResult = null;
+    if (autoPreflight === true
+      && submitBody.continueFromTaskId === undefined
+      && submitBody.reuseWorktreeFromTaskId === undefined) {
+      try {
+        preflightResult = await callExecution(
+          'preflight',
+          {
+            workspacePath: submitBody.workspacePath,
+            ...(allowShared === true ? { allowShared: true } : {}),
+          },
+          ...(context?.signal !== undefined ? [{ signal: context.signal }] : []),
+        );
+      } catch (error) {
+        throwIfRequestCancelled(context);
+        throw error;
+      }
+      throwIfRequestCancelled(context);
+      const resolvedIso = preflightResult?.isolation ?? preflightResult?.preflight?.isolation ?? null;
+      if (preflightResult?.ok !== true || resolvedIso === 'block' || resolvedIso === null) {
+        return { ok: true, submitted: false, preflight: preflightResult };
+      }
+      if (resolvedIso === 'shared' && submitBody.overrides?.isolation === undefined) {
+        submitBody = {
+          ...submitBody,
+          overrides: { ...(submitBody.overrides ?? {}), isolation: 'shared' },
+        };
+      }
+    }
+    throwIfRequestCancelled(context);
+    const submitted = await callExecution('submit', submitBody);
+    if (wait !== true) {
+      if (autoPreflight === true) {
+        return {
+          ...submitted,
+          submitted: true,
+          ...(preflightResult === null ? {} : { preflight: preflightResult }),
+        };
+      }
+      return submitted;
+    }
+    const t = submitted?.task ?? {};
+    const taskId = typeof t.taskId === 'string' && t.taskId !== '' ? t.taskId : null;
+    const submitReceipt = {
+      taskId,
+      sourcePath: t.sourcePath ?? null,
+      executionWorkspacePath: t.executionWorkspacePath ?? t.workspacePath ?? null,
+      isolation: t.isolation ?? null,
+      reusedWorktree: t.worktree?.reused === true,
+      ...(typeof t.reuseWorktreeFromTaskId === 'string' && t.reuseWorktreeFromTaskId !== ''
+        ? { reuseWorktreeFromTaskId: t.reuseWorktreeFromTaskId }
+        : {}),
+      ...(typeof t.continueFromTaskId === 'string' && t.continueFromTaskId !== ''
+        ? { continueFromTaskId: t.continueFromTaskId }
+        : {}),
+      agentTeams: t.agentTeams ?? null,
+      ...(t.agentTeamsOrigin !== undefined ? { agentTeamsOrigin: t.agentTeamsOrigin } : {}),
+    };
+    if (taskId === null) {
+      return {
+        ...submitted,
+        submitted: true,
+        submitReceipt,
+        ...(preflightResult === null ? {} : { preflight: preflightResult }),
+      };
+    }
+    try {
+      const waited = await waitAnswer(
+        { taskId, ...(waitSeconds === undefined ? {} : { waitSeconds }) },
+        context,
+      );
+      return {
+        ...waited,
+        submitted: true,
+        submitReceipt,
+        ...(preflightResult === null ? {} : { preflight: preflightResult }),
+      };
+    } catch (error) {
+      const code = typeof error?.code === 'string' ? error.code : 'MCP_WAIT_FAILED';
+      const message = diagnostic(error?.message ?? String(error), 400) ?? 'the follow-up wait failed after submission';
+      return {
+        ok: true,
+        submitted: true,
+        taskId,
+        submitReceipt,
+        ...(preflightResult === null ? {} : { preflight: preflightResult }),
+        reason: null,
+        waitError: { code, message },
+      };
     }
   }
 
@@ -3344,11 +3570,14 @@ export function createMcpServer(options) {
               + 'the parent\u2019s recorded execution checkout and DSH Session internally, so it passes the parent\u2019s original '
               + 'source path again and never substitutes an internal execution location for it. A parent that '
               + 'is unknown, still running, removed or belongs to another source repository is refused '
-              + 'instead of starting a new conversation. A worker that needs wider access for ONE tool call '
+              + 'instead of starting a new conversation. For a new downstream subtask that starts a fresh DSH '
+              + 'Session directly on an earlier finished isolated worktree under the same source repository, '
+              + 'pass reuseWorktreeFromTaskId instead (never combined with continueFromTaskId). A worker that needs wider access for ONE tool call '
               + 'pauses that call and reports it as `permission.pending` in delegate_result; while it waits the '
-              + 'task stays `running` with phase `awaiting-permission`. Answer exactly one such request with '
-              + 'delegate_permission_decide (`allow-once` or `reject`). That decision covers only that call, is '
-              + 'never a standing grant, and cannot approve anything else. When your channel supports it, pass '
+              + 'task stays `running` with phase `awaiting-permission`. Answer one such request with '
+              + 'delegate_permission_decide (`allow-once` or `reject`). That decision '
+              + 'covers only that call, is never a standing grant, and never widens the sandbox or crosses task '
+              + 'boundaries. Each later escalation requires a new decision. When your channel supports it, pass '
               + '`waitAfterDecision: true`: the decision and the following wait then happen in ONE call, and the '
               + 'answer is the same compact shape delegate_wait returns plus `decisionReceipt`. Deciding and then '
               + 'waiting is what resumes the task; a client without the flag decides first and then calls '

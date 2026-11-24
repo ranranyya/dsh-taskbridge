@@ -112,8 +112,13 @@ export interface DelegateSubmitRequest {
   title?: string;
   goalDescription?: string;
   continueFromTaskId?: string;
+  reuseWorktreeFromTaskId?: string;
   planNodeId?: string;
   parentNodeId?: string;
+  autoPreflight?: boolean;
+  allowShared?: boolean;
+  wait?: boolean;
+  waitSeconds?: number;
   overrides?: {
     model?: string;
     reasoningEffort?: string;
@@ -227,7 +232,7 @@ export interface DelegatePendingPermission {
   deadlineAt: number;
   decision: 'allow-once' | 'reject' | null;
   decidedAt: number | null;
-  decidedBy: 'commander' | 'deadline' | 'asker' | 'stop' | 'binding' | 'restart' | null;
+  decidedBy: 'commander' | 'commander-task-command' | 'deadline' | 'asker' | 'stop' | 'binding' | 'restart' | null;
   decisionReason: string | null;
   /** Closed native outcome: `allowed-once` is the only grant. */
   outcome: 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable' | null;
@@ -237,6 +242,9 @@ export interface DelegatePendingPermission {
     argumentsComplete: boolean;
     callReread: boolean;
     turnOpen: boolean;
+    /** Effective scope. `task-command` can appear in historical preview receipts. */
+    scope?: 'once' | 'task-command';
+    reusedFromRequestId?: string;
     boundsApplied: string[];
   } | null;
   /** Present only for an `allowed-once`; states that it covers one call. */

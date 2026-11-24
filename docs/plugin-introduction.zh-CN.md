@@ -1,4 +1,6 @@
-# DSH Delegate 插件介绍
+# DSH Delegate 插件介绍（1.0.0 历史归档）
+
+> **历史文档说明**：本文档为早期 `1.0.0`（原包名 `dsh-delegate`）的产品介绍留存，仅作版本历史参考，不再反映当前版本的包名、11 个 MCP 工具、静默长等及双端集成机制。当前最新介绍请阅读 [docs/INTRODUCTION.zh.md](./INTRODUCTION.zh.md) 与根目录 [README.md](../README.md)。
 
 **DSH Delegate** 是为 DeepSeek Harness（DSH）设计的本机任务委派插件。它让 Codex 等 MCP 宿主在你明确授权后，把实现任务交给 DSH 当前已经配置好的模型执行；执行结果再返回宿主，由宿主检查改动、验证证据并决定是否验收。
 

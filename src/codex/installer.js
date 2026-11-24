@@ -1,13 +1,16 @@
-// Codex integration: install the companion custom agent and register this
-// package's stdio MCP server in Codex.
+// Codex integration: install the native Codex skill and register this
+// package's stdio MCP server in Codex, while safely retiring untouched
+// legacy managed subagent files (`agents/dsh-taskbridge.toml` and
+// `agents/dsh-delegate.toml`) from 0.1.6–1.8.x releases.
 //
 // Scope, stated once and enforced below
 // -------------------------------------
-// This module owns exactly two things in a Codex home:
+// This module owns exactly two active targets in a Codex home:
 //
-//   1. `$CODEX_HOME/agents/dsh-taskbridge.toml` — a *managed copy* of the shipped
-//      template `codex/dsh-taskbridge.toml`. Ownership is proved by content, never by
-//      the file name or a version line alone:
+//   1. `$CODEX_HOME/skills/dsh-taskbridge/SKILL.md` — a *managed copy* of the shipped
+//      template `codex/skills/dsh-taskbridge/SKILL.md` and the reference it links to.
+//      Ownership is proved by content,
+//      never by the file name or a version marker alone:
 //        * a file that is the same text as the template this build would write is
 //          `installed` (and removable). "Same text" admits exactly one difference: CRLF
 //          versus LF line terminators (including a mixed spelling of the same lines).
@@ -81,7 +84,7 @@
 // say what the file can and cannot guarantee.
 
 import { lstatSync } from 'node:fs';
-import { link, lstat, mkdir, open, readFile, readlink, realpath, stat, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readFile, readlink, realpath, rmdir, stat, unlink } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -89,7 +92,15 @@ import { basename, delimiter, dirname, isAbsolute, join, parse, resolve, sep } f
 import { fileURLToPath } from 'node:url';
 
 import { writeFileAtomic } from '../config/store.js';
-import { recallTemplateDigest, rememberTemplateDigest, digestLf } from './agent-ownership.js';
+import {
+  chainPathsOf,
+  ownershipRecordPath,
+  recallSkillTemplateDigest,
+  recallTemplateDigest,
+  rememberSkillTemplateDigest,
+  skillOwnershipRecordPath,
+  digestLf,
+} from './agent-ownership.js';
 import {
   TomlDocument,
   TomlSyntaxError,
@@ -100,7 +111,12 @@ import {
   tomlValueType,
 } from './toml.js';
 
-/** Agent file name inside `$CODEX_HOME/agents`. */
+/** Native Codex skill directory and file name inside `$CODEX_HOME/skills`. */
+export const SKILL_DIR_NAME = 'dsh-taskbridge';
+export const SKILL_FILENAME = 'SKILL.md';
+export const SKILL_RELATIVE_PATH = join('skills', SKILL_DIR_NAME, SKILL_FILENAME);
+
+/** Legacy retired subagent file names inside `$CODEX_HOME/agents` (recognised for safe cleanup). */
 export const AGENT_FILENAME = 'dsh-taskbridge.toml';
 export const LEGACY_AGENT_FILENAME = 'dsh-delegate.toml';
 
@@ -525,10 +541,44 @@ export const KNOWN_AGENT_TEMPLATES = [
   // Published 1.8.0 companion before the 1.8.1 dual-client symmetry and Q&A boundary refinement, in LF and CRLF.
   { version: '1.8.0', sha256: 'ba3c964cad6b9ae395dbe0d74971a430795fd8927a4a5daeb6a45617823a9cab' },
   { version: '1.8.0', sha256: '6f732230068f3230f9ad1c6a92d30d677f717dd0b0ebd92abb73ed7578f956dd' },
+  // Published 1.8.1 companion before the 1.9.0 migration to native Codex Skill, in LF and CRLF.
+  { version: '1.8.1', sha256: 'dc09680bcf6927ca1019554f1e841a176ac7035236f329ce008f45be06b9fb82' },
+  { version: '1.8.1', sha256: 'addc76a5c9c47e64e2b7f30750e0bcbdfefe060dc6a2d5e3ebcf93252e072850' },
+  // Local 1.8.2-test2 companion before the 1.9.0 migration to native Codex Skill, in LF and CRLF.
+  { version: '1.8.2-test2', sha256: '596177b7c3fe8fa446d50f670a546a2ae884a717c476eaaae63e637124b10d64' },
+  { version: '1.8.2-test2', sha256: '6452e8672fd3628fe6a5650e21bb4bb9925e7ff0d090bae9330427325975d915' },
 ];
 
-/** The `version = "…"` line of an agent file, at column 0. */
-const VERSION_LINE = /^version[ \t]*=[ \t]*"([^"]*)"\r?$/mu;
+/** Exact shipped `skills/dsh-taskbridge/SKILL.md` files of earlier 1.9+ builds (SHA-256). */
+export const KNOWN_SKILL_TEMPLATES = [
+  // Local 1.9.0-test1 native Codex skill before layered integrations/ refactor, in LF and CRLF.
+  { version: '1.9.0-test1', sha256: '815ec71d75e8089dd1d726b5bb07cd7ad2e3a3dec444e7dca76b83cce064b565' },
+  { version: '1.9.0-test1', sha256: '9777da3423c1a5c8d6cf50f0f161ab0f6e5b064708670f32abf6e6c4a4fffda0' },
+  // Local test packages with layered integration rules, in LF and CRLF.
+  { version: '1.9.0-test2', sha256: '5ed46037522e854fb31c6bfb3ecefc751e85a4d1a445b2e0830cee40b0738d5b' },
+  { version: '1.9.0-test2', sha256: '71b84788ab13749776f0ffa97d2be77e0b0296d1deff59b556eccdb95f681271' },
+  { version: '1.9.0-test3', sha256: 'd381022187327e9aff453588239b1664f6b9b7fc2f895e11701d4148e1330b82' },
+  { version: '1.9.0-test3', sha256: '5a0b5100b67a35600ead1c3b75d2e03a92e1fee10709e46e8ddd93661b59ddfc' },
+  { version: '1.9.0-test4', sha256: 'f67b394705485d3dd3e7219bde9f05d7720410eeeaa234c5da6dc68f89e3c7ca' },
+  { version: '1.9.0-test4', sha256: '7740c10f5f84f6fa309bdba67c10721dda6754b66f6b56236ca400ba6b9644af' },
+  { version: '1.9.0-test5', sha256: '709e7c18aef5c54e371f6830ac9c837fbfcb5963b26e4019ef5f9e491864df24' },
+  { version: '1.9.0-test5', sha256: '6e30655cb97200c3a3bbf6545ad90da1cc3e464363646e506f3075825cedf55d' },
+  { version: '1.9.0-pre', sha256: 'd8878f88e60a4d46079f7fde93408d21c1e517c76d1bad86a7814d40603d729d' },
+  { version: '1.9.0-pre', sha256: 'e2b8ec097cdedcbbbdf811870d566cb1fb36f6882d579db67a0f33f08c78da98' },
+  { version: '1.9.0-pre', sha256: '64560e14664ab0b932c36a5e2560c35ef5acf7cdbf38acf522e87e8aefbd53b7' },
+  { version: '1.9.0-pre', sha256: 'db1526280a0618a379db8dbe1c71840204a5957907a92b20bd3f43fd00971c0f' },
+  { version: '1.9.0-test6', sha256: 'c2477b9233f4f9b4e36c59f8544f607249b2f96be0aeba0a013525e18c4eab38' },
+  { version: '1.9.0-test6', sha256: '238366a0ebaa543d6b09fd1a94d5507a22d5ba0d19fee32539c429d1ded2182c' },
+  { version: '1.9.0-preview', sha256: 'eefe1134216d3d73901ec8e279e8752b4281dd191343e180fb76c671055c4523' },
+  { version: '1.9.0-preview', sha256: '0f28427153bda6e696fc6203d3ac885067ac22902b716e6ecbce6a2a0e693148' },
+  { version: '1.9.0-preview2', sha256: 'bc1a1be12d5117efe52ed5c10e4d25cac4713b9746c41096cc6f5e75efada40d' },
+  { version: '1.9.0-preview2', sha256: '6a2684b21762157edf3b32ddccea81d6327b117454cdb74e0c7260803f46d4be' },
+  { version: '1.9.0-preview3', sha256: 'c3b3d6ad273f55ec822cde3f6635f875103c339d65821601d3baaddac85af4d7' },
+  { version: '1.9.0-preview3', sha256: '1237d095f32a0c4ac1d5dde8f05f11b6edf17d863ff1bb67ab63a17f6ac2fe3b' },
+];
+
+/** The version provenance comment line inside a shipped Markdown Codex skill file. */
+const SKILL_VERSION_LINE = /^<!-- dsh-taskbridge-version: ([^>\r\n]+) -->\r?$/mu;
 
 /**
  * Read agent text with CRLF terminators folded to LF.
@@ -578,29 +628,23 @@ function sameAgentText(contents, template) {
  * Everything else still fails too: an added or removed line, a comment, a trailing space, a tab,
  * a BOM, a changed version line or any other edit hashes to nothing in the table.
  * @param {string} contents - installed file text.
- * @param {object} [options] - `ignoreVersion`: compare with the version line masked, used only
- *   to explain *why* a file is `modified` in the status note. It never grants refresh or removal.
  * @returns {boolean} true when the file is a known published build of this template.
  */
-export function isKnownPriorTemplate(contents, { ignoreVersion = false } = {}) {
+export function isKnownPriorTemplate(contents) {
   if (typeof contents !== 'string') return false;
-  const known = (text) => KNOWN_AGENT_TEMPLATES.some((entry) => entry.sha256 === digest(text));
+  const known = (text) => {
+    const sha256 = digest(text);
+    return KNOWN_AGENT_TEMPLATES.some((entry) => entry.sha256 === sha256)
+      || KNOWN_SKILL_TEMPLATES.some((entry) => entry.sha256 === sha256);
+  };
   if (known(contents)) return true;
   const lf = normalizeLineEndings(contents);
   // A leftover `\r` means the file has a CR no spelling fold accounts for, so no equivalent
-  // digest may claim it. This guard wraps ONLY the equivalent branch; the diagnosis below is
-  // still reachable for such a file.
-  if (!lf.includes('\r')) {
-    if (known(lf)) return true;
-    const crlf = lf.replace(/\n/gu, '\r\n');
-    if (crlf !== contents && known(crlf)) return true;
-  }
-  if (!ignoreVersion) return false;
-  // Explanation-only path: the same body with the version line stripped still has to
-  // match a known build, which distinguishes "operator edited a managed file" from
-  // "this file was never ours".
-  const stripped = contents.replace(VERSION_LINE, 'version = "\u0000"');
-  return KNOWN_AGENT_TEMPLATES.some((entry) => entry.sha256 === digest(stripped));
+  // digest may claim it.
+  if (lf.includes('\r')) return false;
+  if (lf !== contents && known(lf)) return true;
+  const crlf = lf.replace(/\n/gu, '\r\n');
+  return crlf !== contents && known(crlf);
 }
 
 /** Stable states reported for the agent file. */
@@ -654,7 +698,8 @@ const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'
  * declare before its entry point can be adopted by an automatic migration.
  */
 const PACKAGE_NAME = 'dsh-taskbridge';
-const TEMPLATE_PATH = join(PACKAGE_ROOT, 'codex', AGENT_FILENAME);
+const TEMPLATE_PATH = join(PACKAGE_ROOT, 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME);
+const SKILL_REFERENCE_LINK = /\]\((rules-reference-([0-9a-f]{64})\.md)\)/u;
 const PACKAGE_MANIFEST_PATH = join(PACKAGE_ROOT, 'package.json');
 
 /** Bound on a Codex config document this module is willing to edit. */
@@ -1105,25 +1150,65 @@ async function inspectFile(path) {
  *   `unknown` means the platform could not say whether the directory is a link.
  */
 export async function inspectDirectory(path) {
-  let info;
-  try {
-    info = await lstat(path);
-  } catch (error) {
-    if (error?.code === 'ENOENT') return { kind: 'missing' };
-    if (error?.code === 'ENOTDIR') return { kind: 'other' };
-    throw error;
+  const results = await inspectDirectories([path]);
+  return results.get(path) ?? { kind: 'unknown' };
+}
+
+/**
+ * Inspect multiple directory paths in ONE batched platform attribute call on Windows.
+ * @param {string[]} paths - directory paths to inspect.
+ * @returns {Promise<Map<string, { kind: 'missing' | 'directory' | 'link' | 'other' | 'unknown', target?: string }>>}
+ */
+export async function inspectDirectories(paths) {
+  const unique = [];
+  const seen = new Set();
+  for (const path of paths) {
+    if (typeof path === 'string' && path !== '' && !seen.has(path)) {
+      seen.add(path);
+      unique.push(path);
+    }
   }
-  if (info.isSymbolicLink()) return { kind: 'link', target: await readLinkTarget(path) };
-  if (!info.isDirectory()) return { kind: 'other' };
-  const kinds = await windowsDirectoryKinds([path]);
-  const kind = kinds.get(path);
-  // A junction is reported by Node as a plain directory; only the attribute proves it.
-  // `unknown` (the platform could not answer) is reported as itself: callers must
-  // refuse, and must not describe it as a link they never saw.
-  if (kind === 'missing') return { kind: 'missing' };
-  if (kind === 'unknown') return { kind: 'unknown' };
-  if (kind !== 'directory') return { kind: 'link', target: await readLinkTarget(path) };
-  return { kind: 'directory' };
+  const results = new Map();
+  const toCheck = [];
+  for (const path of unique) {
+    let info;
+    try {
+      info = await lstat(path);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        results.set(path, { kind: 'missing' });
+        continue;
+      }
+      if (error?.code === 'ENOTDIR') {
+        results.set(path, { kind: 'other' });
+        continue;
+      }
+      throw error;
+    }
+    if (info.isSymbolicLink()) {
+      results.set(path, { kind: 'link', target: await readLinkTarget(path) });
+      continue;
+    }
+    if (!info.isDirectory()) {
+      results.set(path, { kind: 'other' });
+      continue;
+    }
+    toCheck.push(path);
+  }
+  if (toCheck.length > 0) {
+    const kinds = await windowsDirectoryKinds(toCheck);
+    for (const path of toCheck) {
+      const kind = kinds.get(path);
+      // A junction is reported by Node as a plain directory; only the attribute proves it.
+      // `unknown` (the platform could not answer) is reported as itself: callers must
+      // refuse, and must not describe it as a link they never saw.
+      if (kind === 'missing') results.set(path, { kind: 'missing' });
+      else if (kind === 'unknown') results.set(path, { kind: 'unknown' });
+      else if (kind !== 'directory') results.set(path, { kind: 'link', target: await readLinkTarget(path) });
+      else results.set(path, { kind: 'directory' });
+    }
+  }
+  return results;
 }
 
 /**
@@ -1340,17 +1425,58 @@ async function readAgentState(path, template, recordedDigest = null) {
   if (existing.kind === 'missing') return { state: AGENT_STATES.missing, present: false, reason: null, contents: null };
   if (existing.kind === 'other') return { state: AGENT_STATES.conflict, present: true, reason: 'not-a-regular-file', contents: null };
   const contents = existing.contents;
-  if (sameAgentText(contents, template)) return { state: AGENT_STATES.installed, present: true, reason: null, contents };
-  if (isKnownPriorTemplate(contents)) return { state: AGENT_STATES.outdated, present: true, reason: null, contents };
-  if (typeof recordedDigest === 'string' && recordedDigest !== '' && digestLf(contents) === recordedDigest) {
-    return { state: AGENT_STATES.outdated, present: true, reason: null, contents, recorded: true };
+  const current = sameAgentText(contents, template);
+  const known = !current && isKnownPriorTemplate(contents);
+  const recorded = !current && !known && recordedDigest !== null && digestLf(contents) === recordedDigest;
+  if (current || known || recorded) {
+    const reference = skillReference(path, contents);
+    if (reference !== null) {
+      const installed = await inspectFile(reference.path);
+      if (installed.kind === 'missing' && current) {
+        return { state: AGENT_STATES.outdated, present: true, reason: 'reference-missing', contents };
+      }
+      if (referenceConflicts(reference, installed)) {
+        return { state: AGENT_STATES.modified, present: true, reason: 'reference-operator-owned', contents };
+      }
+    }
+    const state = current ? AGENT_STATES.installed : AGENT_STATES.outdated;
+    return { state, present: true, reason: null, contents, recorded };
   }
+  const normalizedContents = normalizeLineEndings(contents);
+  const normalizedTemplate = normalizeLineEndings(template);
+  const sameBodyDifferentVersion = !normalizedContents.includes('\r')
+    && normalizedContents.replace(SKILL_VERSION_LINE, '<!-- dsh-taskbridge-version: \u0000 -->')
+      === normalizedTemplate.replace(SKILL_VERSION_LINE, '<!-- dsh-taskbridge-version: \u0000 -->');
   return {
     state: AGENT_STATES.modified,
     present: true,
-    reason: isKnownPriorTemplate(contents, { ignoreVersion: true }) ? 'edited' : 'unknown-content',
+    reason: sameBodyDifferentVersion ? 'edited' : 'unknown-content',
     contents,
   };
+}
+
+function createBatchedKindClassifier(cache = new Map()) {
+  const classifyMany = async (paths) => {
+    const missing = [];
+    for (const path of paths) {
+      if (typeof path === 'string' && path !== '' && !cache.has(path)) missing.push(path);
+    }
+    if (missing.length > 0) {
+      const inspected = await inspectDirectories(missing);
+      for (const [path, info] of inspected.entries()) {
+        cache.set(path, info.kind);
+      }
+    }
+    const out = new Map();
+    for (const path of paths) out.set(path, cache.get(path) ?? 'unknown');
+    return out;
+  };
+  const classify = async (path) => {
+    if (cache.has(path)) return cache.get(path);
+    const out = await classifyMany([path]);
+    return out.get(path) ?? 'unknown';
+  };
+  return { classify, classifyMany, cache };
 }
 
 /**
@@ -1361,22 +1487,78 @@ async function readAgentState(path, template, recordedDigest = null) {
  * file is classified. Nothing is created and nothing is written here.
  * @param {string} home - the REAL, pinned Codex home.
  * @param {Record<string, string | undefined>} env - environment (for `DSH_HOME`).
+ * @param {{ classify: Function, classifyMany: Function }} [batch] - optional shared classifier cache.
  * @returns {Promise<string | null>} LF digest, or null.
  */
-async function recallRecordedTemplate(home, env) {
+async function recallRecordedTemplate(home, env, batch = createBatchedKindClassifier()) {
   if (typeof home !== 'string' || home.trim() === '' || !isAbsolute(home)) return null;
   try {
-    return await recallTemplateDigest({ codexHome: home, env, classify: (path) => inspectDirectory(path).then((info) => info.kind) });
+    return await recallTemplateDigest({
+      codexHome: home,
+      env,
+      classify: batch.classify,
+      classifyMany: batch.classifyMany,
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function recallRecordedSkillTemplate(home, env, batch = createBatchedKindClassifier()) {
+  if (typeof home !== 'string' || home.trim() === '' || !isAbsolute(home)) return null;
+  try {
+    return await recallSkillTemplateDigest({
+      codexHome: home,
+      env,
+      classify: batch.classify,
+      classifyMany: batch.classifyMany,
+    });
   } catch {
     return null;
   }
 }
 
 /**
- * Record the template digest after a write this action just made, proved against the file.
+ * Inspect legacy Codex subagent files (`agents/dsh-taskbridge.toml` and `agents/dsh-delegate.toml`)
+ * so untouched prior installs can be migrated to the native skill and safely retired, while
+ * operator-edited files are preserved untouched and surfaced as notes.
+ */
+async function inspectLegacyAgents(home, recordedAgentDigest = null) {
+  const filenames = [AGENT_FILENAME, LEGACY_AGENT_FILENAME];
+  const entries = [];
+  for (const filename of filenames) {
+    const filePath = join(home, 'agents', filename);
+    const inspected = await inspectFile(filePath);
+    if (inspected.kind === 'missing') continue;
+    if (inspected.kind === 'other') {
+      entries.push({ filename, path: filePath, state: 'conflict', expect: null });
+      continue;
+    }
+    const contents = inspected.contents;
+    const isManaged = isKnownPriorTemplate(contents)
+      || (typeof recordedAgentDigest === 'string' && recordedAgentDigest !== '' && digestLf(contents) === recordedAgentDigest);
+    entries.push({
+      filename,
+      path: filePath,
+      state: isManaged ? 'managed-legacy' : 'modified-legacy',
+      expect: isManaged ? contents : null,
+    });
+  }
+  const state = entries.some((entry) => entry.state === 'managed-legacy')
+    ? 'managed-legacy'
+    : entries.some((entry) => entry.state === 'modified-legacy')
+      ? 'modified-legacy'
+      : entries.some((entry) => entry.state === 'conflict')
+        ? 'conflict'
+        : 'absent';
+  return { state, entries };
+}
+
+/**
+ * Record the skill template digest after a write this action just made, proved against the file.
  *
  * Called only from `install` and from the startup `refreshKnownAgentTemplate`, and only after the
- * write reported success: it re-reads the agent file, requires it to be exactly the rendered
+ * write reported success: it re-reads the skill file, requires it to be exactly the rendered
  * template, and records the digest of THOSE bytes. `repair`, `remove` and `status` never reach
  * this. A failed record is a lost proof for the next release, never a failed install.
  * @param {object} before - the status the write was planned from.
@@ -1386,99 +1568,177 @@ async function recordAgentTemplate(before) {
   const env = before[INTERNAL_ENV];
   if (env === undefined) return;
   try {
-    await rememberTemplateDigest({
+    const classify = (path) => inspectDirectory(path).then((info) => info.kind);
+    const classifyMany = async (paths) => {
+      const inspected = await inspectDirectories(paths);
+      const out = new Map();
+      for (const path of paths) out.set(path, inspected.get(path)?.kind ?? 'unknown');
+      return out;
+    };
+    await rememberSkillTemplateDigest({
       codexHome: before.codexHome,
       env,
       template: renderAgentFile(await readAgentTemplate(), before.packageVersion),
-      agentPath: before.agent.path,
+      skillPath: before.agent.path,
       readFile: async (path) => (await inspectFile(path)).contents,
       writeFileAtomic,
       mkdir,
-      classify: (path) => inspectDirectory(path).then((info) => info.kind),
+      classify,
+      classifyMany,
     });
   } catch {
     // A proof that cannot be recorded must never fail the install that produced it, and a
-    // refused record (a linked ancestor, a damaged file) is no record: the agent file stays
+    // refused record (a linked ancestor, a damaged file) is no record: the skill file stays
     // classified by its own content.
   }
 }
 
-/**
- * Inspect the two directories that bound what this module may write.
- *
- * `$CODEX_HOME` and `$CODEX_HOME/agents` are the only places the managed files may
- * live. A link at either (a POSIX symlink, or a Windows junction/reparse point that
- * `lstat` reports as a plain directory) means the final path string no longer names
- * a location inside the Codex home, so it is refused before anything is created or
- * removed — `mkdir(recursive)` would otherwise walk through the link.
- *
- * A directory whose identity cannot be established (`unknown`) is refused too: the
- * alternative is to assume it is safe, and an assumption is what this check exists to
- * remove. Both paths are inspected in one batch, so a normal Windows home costs one
- * child process, not two.
- * @param {string} home - resolved Codex home.
- * @returns {Promise<{
- *   blocked: boolean,
- *   link: 'codex-home' | 'agents' | null,
- *   unknown: boolean,
- *   home: { kind: string, target?: string },
- *   agents: { kind: string, target?: string },
- * }>} boundary state.
- */
-export async function inspectCodexBoundary(home) {
-  const agentsPath = join(home, 'agents');
-  const homeInfo = await inspectDirectory(home);
-  if (homeInfo.kind === 'link') {
-    // Reached only when the caller did NOT pin the root first (a direct caller of this
-    // public helper). The installer's own entries resolve a selected root link through
-    // {@link pinCodexHome} and then inspect the REAL directory, so this branch keeps the
-    // conservative answer for an unpinned call: below an unresolved link nothing is
-    // written and nothing below it is even inspected.
-    return { blocked: true, link: 'codex-home', unknown: false, home: homeInfo, agents: { kind: 'unchecked' } };
+async function isLstatPlainDirectory(path) {
+  try {
+    const info = await lstat(path);
+    return !info.isSymbolicLink() && info.isDirectory();
+  } catch {
+    return false;
   }
-  const agentsInfo = homeInfo.kind === 'directory'
-    ? await inspectDirectory(agentsPath)
-    : { kind: 'unchecked' };
-  if (agentsInfo.kind === 'link') {
-    return { blocked: true, link: 'agents', unknown: false, home: homeInfo, agents: agentsInfo };
-  }
-  // A home that exists but could not be classified, or an `agents` entry that could
-  // not be, is reported and refused for the same reason.
-  if (homeInfo.kind === 'unknown' || agentsInfo.kind === 'unknown') {
-    return { blocked: true, link: null, unknown: true, home: homeInfo, agents: agentsInfo };
-  }
-  return { blocked: false, link: null, unknown: false, home: homeInfo, agents: agentsInfo };
 }
 
-/**
- * Does a link stand between the Codex home and the managed files?
- *
- * The status document carries the answer (`boundary.blocked`) because it is read with
- * exactly the same inspect call; this turns that fact into a refusal in the shape
- * every action reports. Re-reading the status is what makes the check current: it is
- * re-done at the start of every writing action.
- * @param {object} status - a status document from {@link readCodexStatus}.
- * @returns {{ target: string, code: string, message: string, path: string, reason: string }} refusal.
- */
+export async function inspectCodexBoundary(home) {
+  const skillsPath = join(home, 'skills');
+  const skillDirPath = join(skillsPath, SKILL_DIR_NAME);
+  const agentsPath = join(home, 'agents');
+  const candidates = [home];
+  if (await isLstatPlainDirectory(home)) {
+    candidates.push(skillsPath, agentsPath);
+    if (await isLstatPlainDirectory(skillsPath)) {
+      candidates.push(skillDirPath);
+    }
+  }
+  const inspected = await inspectDirectories(candidates);
+  const homeInfo = inspected.get(home) ?? { kind: 'unknown' };
+  if (homeInfo.kind === 'link') {
+    return {
+      blocked: true,
+      link: 'codex-home',
+      unknown: false,
+      home: homeInfo,
+      skills: { kind: 'unchecked' },
+      skillDir: { kind: 'unchecked' },
+      agents: { kind: 'unchecked' },
+    };
+  }
+  const skillsInfo = homeInfo.kind === 'directory'
+    ? (inspected.get(skillsPath) ?? { kind: 'unknown' })
+    : { kind: 'unchecked' };
+  if (skillsInfo.kind === 'link') {
+    return {
+      blocked: true,
+      link: 'skills',
+      unknown: false,
+      home: homeInfo,
+      skills: skillsInfo,
+      skillDir: { kind: 'unchecked' },
+      agents: { kind: 'unchecked' },
+    };
+  }
+  const skillDirInfo = skillsInfo.kind === 'directory'
+    ? (inspected.get(skillDirPath) ?? { kind: 'unknown' })
+    : { kind: 'unchecked' };
+  if (skillDirInfo.kind === 'link') {
+    return {
+      blocked: true,
+      link: 'skill-dir',
+      unknown: false,
+      home: homeInfo,
+      skills: skillsInfo,
+      skillDir: skillDirInfo,
+      agents: { kind: 'unchecked' },
+    };
+  }
+  const agentsInfo = homeInfo.kind === 'directory'
+    ? (inspected.get(agentsPath) ?? { kind: 'unknown' })
+    : { kind: 'unchecked' };
+  if (agentsInfo.kind === 'link') {
+    return {
+      blocked: true,
+      link: 'agents',
+      unknown: false,
+      home: homeInfo,
+      skills: skillsInfo,
+      skillDir: skillDirInfo,
+      agents: agentsInfo,
+    };
+  }
+  if (
+    homeInfo.kind === 'unknown'
+    || skillsInfo.kind === 'unknown'
+    || skillDirInfo.kind === 'unknown'
+    || agentsInfo.kind === 'unknown'
+  ) {
+    return {
+      blocked: true,
+      link: null,
+      unknown: true,
+      home: homeInfo,
+      skills: skillsInfo,
+      skillDir: skillDirInfo,
+      agents: agentsInfo,
+    };
+  }
+  return {
+    blocked: false,
+    link: null,
+    unknown: false,
+    home: homeInfo,
+    skills: skillsInfo,
+    skillDir: skillDirInfo,
+    agents: agentsInfo,
+  };
+}
+
 function linkedBoundaryRefusal(status) {
   if (status.boundary?.unknown === true) {
     return {
       target: 'agent',
       code: 'AGENT_PATH_CONFLICT',
-      message: 'the Codex home or agents directory could not be verified as a real directory and was not written',
-      path: join(status.codexHome, 'agents'),
+      message: 'the Codex home, skills or agents directory could not be verified as a real directory and was not written',
+      path: join(status.codexHome, 'skills'),
       reason: 'boundary-unverified',
     };
   }
-  const isHome = status.boundary?.link === 'codex-home';
+  const linkKind = status.boundary?.link;
+  if (linkKind === 'codex-home') {
+    return {
+      target: 'agent',
+      code: 'AGENT_PATH_CONFLICT',
+      message: 'the Codex home is a link or reparse point, so nothing below it is written or removed',
+      path: status.codexHome,
+      reason: 'codex-home-is-link',
+    };
+  }
+  if (linkKind === 'skills') {
+    return {
+      target: 'agent',
+      code: 'AGENT_PATH_CONFLICT',
+      message: 'the skills directory is a link or reparse point, so nothing inside it is written or removed',
+      path: join(status.codexHome, 'skills'),
+      reason: 'skills-dir-is-link',
+    };
+  }
+  if (linkKind === 'skill-dir') {
+    return {
+      target: 'agent',
+      code: 'AGENT_PATH_CONFLICT',
+      message: 'the skills/dsh-taskbridge directory is a link or reparse point, so nothing inside it is written or removed',
+      path: join(status.codexHome, 'skills', SKILL_DIR_NAME),
+      reason: 'skill-dir-is-link',
+    };
+  }
   return {
     target: 'agent',
     code: 'AGENT_PATH_CONFLICT',
-    message: isHome
-      ? 'the Codex home is a link or reparse point, so nothing below it is written or removed'
-      : 'the agents directory is a link or reparse point, so nothing inside it is written or removed',
-    path: isHome ? status.codexHome : join(status.codexHome, 'agents'),
-    reason: isHome ? 'codex-home-is-link' : 'agents-dir-is-link',
+    message: 'the agents directory is a link or reparse point, so nothing inside it is written or removed',
+    path: join(status.codexHome, 'agents'),
+    reason: 'agents-dir-is-link',
   };
 }
 
@@ -2697,8 +2957,14 @@ export function removeMcpEntry(document) {
  * @returns {string} file contents, LF-terminated.
  */
 export function renderAgentFile(template, version) {
-  const marker = `version = ${renderString(version)}`;
   const text = normalizeLineEndings(template);
+  if (SKILL_VERSION_LINE.test(text)) {
+    return text.replace(SKILL_VERSION_LINE, `<!-- dsh-taskbridge-version: ${version} -->`);
+  }
+  if (/^---\n[\s\S]*?\n---\n/u.test(text)) {
+    return text.replace(/^(---\n[\s\S]*?\n---\n)/u, `$1<!-- dsh-taskbridge-version: ${version} -->\n`);
+  }
+  const marker = `version = ${renderString(version)}`;
   if (/^version = ".*"$/mu.test(text)) return text.replace(/^version = ".*"$/mu, marker);
   // Keep the provenance header first, then the version marker, then the rest.
   const lines = text.split('\n');
@@ -2707,6 +2973,8 @@ export function renderAgentFile(template, version) {
   lines.splice(resolved, 0, marker);
   return lines.join('\n');
 }
+
+export { renderAgentFile as renderSkillFile };
 
 /**
  * Read and parse the Codex config, or return an empty document.
@@ -2757,30 +3025,60 @@ export async function readCodexStatus({
   // against that real path.
   const pinned = await pinCodexHome(selected);
   const home = pinned.real;
-  const agentPath = join(home, 'agents', AGENT_FILENAME);
+  const skillPath = join(home, 'skills', SKILL_DIR_NAME, SKILL_FILENAME);
   const configPath = join(home, 'config.toml');
   const packageVersionValue = version ?? await readPackageVersion();
   const template = renderAgentFile(await readAgentTemplate(), packageVersionValue);
-  // The boundary first: a link at the Codex home or at `agents` means the agent path
-  // does not name a file this plugin may touch, whatever `lstat` would say about it.
   const boundary = pinned.error === null
     ? await inspectCodexBoundary(home)
-    // A root that could not be pinned is refused WITHOUT inspecting anything below it:
-    // the alias does not lead to a usable directory, so there is nothing to classify and
-    // nothing may be created through it.
-    : { blocked: true, link: null, unknown: false, home: { kind: 'link' }, agents: { kind: 'unchecked' } };
+    : {
+      blocked: true,
+      link: null,
+      unknown: false,
+      home: { kind: 'link' },
+      skills: { kind: 'unchecked' },
+      skillDir: { kind: 'unchecked' },
+      agents: { kind: 'unchecked' },
+    };
+  const boundaryReason = boundary.unknown === true
+    ? 'boundary-unverified'
+    : (pinned.error?.reason ?? (
+      boundary.link === 'codex-home' ? 'codex-home-is-link'
+        : boundary.link === 'skills' ? 'skills-dir-is-link'
+          : boundary.link === 'skill-dir' ? 'skill-dir-is-link'
+            : 'agents-dir-is-link'
+    ));
+  const skillPathBlocked = !boundary.blocked && (boundary.skills?.kind === 'other' || boundary.skillDir?.kind === 'other');
+  const ownershipBatch = createBatchedKindClassifier();
+  const needSkillRecord = !boundary.blocked && !skillPathBlocked;
+  const needAgentRecord = !boundary.blocked && boundary.agents?.kind === 'directory';
+  if (needSkillRecord || needAgentRecord) {
+    const primeDirs = [];
+    const skillRecPath = needSkillRecord ? skillOwnershipRecordPath(home, env) : null;
+    const agentRecPath = needAgentRecord ? ownershipRecordPath(home, env) : null;
+    for (const recPath of [skillRecPath, agentRecPath]) {
+      if (recPath !== null) primeDirs.push(...chainPathsOf(dirname(recPath)));
+    }
+    if (primeDirs.length > 0) await ownershipBatch.classifyMany(primeDirs);
+  }
   const agent = boundary.blocked
     ? {
       state: AGENT_STATES.conflict,
       present: false,
-      reason: boundary.unknown === true
-        ? 'boundary-unverified'
-        // A selected ROOT that could not be pinned reports WHY (missing target, not a
-        // directory) instead of the generic "is a link".
-        : (pinned.error?.reason ?? (boundary.link === 'codex-home' ? 'codex-home-is-link' : 'agents-dir-is-link')),
+      reason: boundaryReason,
       contents: null,
     }
-    : await readAgentState(agentPath, template, await recallRecordedTemplate(home, env));
+    : skillPathBlocked
+      ? {
+        state: AGENT_STATES.conflict,
+        present: true,
+        reason: 'not-a-regular-file',
+        contents: null,
+      }
+      : await readAgentState(skillPath, template, await recallRecordedSkillTemplate(home, env, ownershipBatch));
+  const legacyAgents = needAgentRecord
+    ? await inspectLegacyAgents(home, await recallRecordedTemplate(home, env, ownershipBatch))
+    : { state: 'absent', entries: [] };
   // A READ never writes: this function classifies the files and records nothing. The template
   // digest is recorded only by `install` and by the startup `refreshKnownAgentTemplate`, after
   // those actions themselves wrote and re-proved the file.
@@ -2823,16 +3121,10 @@ export async function readCodexStatus({
    */
   let configFingerprint = null;
   if (boundary.blocked) {
-    // A link (or an unverifiable directory) at `$CODEX_HOME` or `$CODEX_HOME/agents`
-    // bounds EVERY write this module makes, not only the agent file. The MCP entry is
-    // described by the same verdict instead of by a read-through of the link: reporting
-    // it as `outdated` from inside the linked tree, and then refusing to write, is how a
-    // link would have been followed for a READ. Nothing below the boundary is examined.
     mcp = {
       state: MCP_STATES.conflict,
       previous: null,
-      reason: boundary.unknown === true ? 'boundary-unverified'
-        : (boundary.link === 'codex-home' ? 'codex-home-is-link' : 'agents-dir-is-link'),
+      reason: boundaryReason,
       ownedValues: {},
       marked: false,
       drift: null,
@@ -2872,10 +3164,11 @@ export async function readCodexStatus({
     codexHomeSelected: pinned.selected,
     codexHomeLinked: pinned.linked,
     codexHomeLinkTarget: pinned.linkTarget,
-    agentPath,
+    agentPath: skillPath,
     configPath,
     packageVersionValue,
     agent,
+    legacyAgents,
     mcp,
     desired,
     script,
@@ -2920,6 +3213,7 @@ function buildStatus({
   configPath,
   packageVersionValue,
   agent,
+  legacyAgents = { state: 'absent', entries: [] },
   mcp,
   desired,
   script,
@@ -2933,43 +3227,36 @@ function buildStatus({
 }) {
   const agentOk = agent.state === AGENT_STATES.installed;
   const mcpOk = mcp.state === MCP_STATES.configured;
+  const skillTarget = {
+    kind: 'skill',
+    path: agentPath,
+    state: agent.state,
+    installed: agentOk,
+    managed: agent.state !== AGENT_STATES.conflict && agent.state !== AGENT_STATES.modified,
+    reason: agent.reason ?? null,
+    expect: agent.contents ?? null,
+    recorded: agent.recorded === true,
+  };
   return {
     codexHome,
-    // The selected spelling and whether it was a root link, kept beside the REAL path so
-    // an operator who configured a junction recognises the answer without guessing.
     codexHomeSelected: codexHomeSelected ?? codexHome,
     codexHomeLinked: codexHomeLinked === true,
     codexHomeLinkTarget,
     packageVersion: packageVersionValue,
-    // Whether the two directories that bound every write are real directories. A link
-    // at either one is a stable diagnosis, not an installation state: install, repair
-    // and remove all refuse while `blocked` is true.
     boundary: boundary === null
-      ? { blocked: false, link: null, unknown: false, home: 'unknown', agents: 'unknown' }
+      ? { blocked: false, link: null, unknown: false, home: 'unknown', skills: 'unknown', skillDir: 'unknown', agents: 'unknown' }
       : {
         blocked: boundary.blocked === true,
         link: boundary.blocked === true ? boundary.link : null,
         unknown: boundary.unknown === true,
         home: boundary.home.kind,
+        skills: boundary.skills?.kind ?? 'unknown',
+        skillDir: boundary.skillDir?.kind ?? 'unknown',
         agents: boundary.agents.kind,
       },
-    agent: {
-      path: agentPath,
-      state: agent.state,
-      // Stated once here so no caller has to infer it from a state name.
-      installed: agentOk,
-      managed: agent.state !== AGENT_STATES.conflict && agent.state !== AGENT_STATES.modified,
-      reason: agent.reason ?? null,
-      // The exact bytes a refresh is allowed to replace. Internal: `installManaged`
-      // re-reads the file and compares against this immediately before its rename, so
-      // a file edited between the status read and the write is never replaced.
-      expect: agent.contents ?? null,
-      // True when this file was recognised through the template digest recorded for THIS home
-      // rather than through the enumerated published history. It never reaches a response
-      // (`publicCodexStatus` strips it) and it never makes a state: an unproved file is still
-      // `modified`.
-      recorded: agent.recorded === true,
-    },
+    skill: skillTarget,
+    agent: skillTarget,
+    legacyAgents,
     mcp: {
       path: configPath,
       exists: configPathInfo.exists === true,
@@ -2978,28 +3265,15 @@ function buildStatus({
       configured: mcpOk,
       previous: mcp.previous,
       reason: mcp.reason,
-      // WHICH owned facts are stale, as a list of stable names (`tool_timeout_sec`,
-      // `args`, `command`, `env`) — or null when nothing is stale. A state name alone
-      // ("outdated") does not tell an operator, or the panel, what would change.
       drift: mcp.drift ?? null,
-      // The digest of the whole config this classification was derived from. It travels
-      // with the status only so the write path can prove the file has not changed since;
-      // `publicCodexStatus` strips it, and it is a hash, never the text.
       fingerprint: configFingerprint,
-      // True only when the entry carries the plugin marker, i.e. when a later
-      // `remove` may delete it. Values alone never establish ownership.
       marked: mcp.marked === true,
-      // `null` when no Node.js executable could be proved; `resolved: false` says so
-      // explicitly so a consumer never has to test for `null` alone.
       desired,
       node,
       nodeResolved: node !== null,
-      // Why the executable could not be resolved (`MCP_EXECUTABLE_UNRESOLVED`), or
-      // null. The app executable is never substituted for it.
       nodeError,
       script: script.script,
       scriptExists: script.exists,
-      // Only written to the file when DSH uses a non-default location.
       discoveryFile: discovery.path,
       discoveryPinned: discovery.pin,
     },
@@ -3007,45 +3281,60 @@ function buildStatus({
       ? { readable: true, error: null }
       : { readable: false, error: configError },
     ready: agentOk && mcpOk && configError === null && node !== null,
-    // What this action cannot do, stated where the operator sees the result.
-    notes: buildNotes({ agent, mcp, script, configError, nodeError }),
+    notes: buildNotes({ agent, legacyAgents, mcp, script, configError, nodeError }),
   };
 }
 
-/**
- * Operator-facing limitations of the current state.
- * @param {object} parts - collected facts.
- * @returns {object[]} `[{ code, text }]`.
- */
-function buildNotes({ agent, mcp, script, configError, nodeError = null }) {
+function buildNotes({ agent, legacyAgents = { state: 'absent', entries: [] }, mcp, script, configError, nodeError = null }) {
   const notes = [];
   if (agent.state === AGENT_STATES.modified) {
     notes.push({
       code: 'AGENT_USER_MODIFIED',
-      text: `已存在内容不同的 agents/${AGENT_FILENAME}，本插件不会覆盖或删除它。`
-        + (agent.reason === 'edited'
-          // The bytes are one of this plugin's own templates with something changed — a
-          // single character, an added note, or only the version line. Saying WHICH keeps
-          // the operator from guessing, and never suggests deleting a file they may want.
-          ? '它与本插件发布过的某个模板只在个别字节上不同（可能只改了 version 行，或加了一处你自己的说明）；改回该发布版本的原样内容后，本插件会自动更新它，否则由你继续管理。'
-          : '它不是本插件发布过的模板，因此插件不会把它当作自己的文件；由你继续管理即可。'),
+      text: agent.reason === 'reference-operator-owned'
+        ? 'Codex 技能的规则附页与发布内容不同。插件将保留入口和附页，由你继续管理。'
+        : `已存在内容不同的 skills/${SKILL_DIR_NAME}/${SKILL_FILENAME}，本插件不会覆盖或删除它。`
+          + (agent.reason === 'edited'
+            ? '它与本插件发布过的某个技能模板只在个别字节上不同（可能只改了版本注释或加了你自己的说明）；改回该发布版本的原样内容后，本插件会自动更新它，否则由你继续管理。'
+            : '它不是本插件发布过的技能模板，因此插件不会把它当作自己的文件；由你继续管理即可。'),
     });
   }
   if (agent.state === AGENT_STATES.conflict) {
-    // `AGENT_PATH_CONFLICT` covers two different physical situations, and the
-    // operator needs to know which one: a link on the way to the file (home or
-    // `agents/`), or a final path that is not a regular file (a link, a directory).
     const text = agent.reason === 'codex-home-is-link'
-      ? `Codex home 本身是链接（符号链接或 Windows reparse point/junction），本插件不会穿过它写入或删除 agents/${AGENT_FILENAME}。`
-      : agent.reason === 'agents-dir-is-link'
-        ? `agents 目录是链接（符号链接或 Windows reparse point/junction），本插件不会穿过它写入或删除 ${AGENT_FILENAME}。`
-        : agent.reason === 'boundary-unverified'
-          ? 'Codex home 或 agents 目录无法确认是真实目录（可能缺少 Windows PowerShell），本插件不会写入或删除任何文件。'
-          : `agents/${AGENT_FILENAME} 不是普通文件（可能是链接或目录），本插件不会改动它。`;
+      ? `Codex home 本身是链接（符号链接或 Windows reparse point/junction），本插件不会穿过它写入或删除 skills/${SKILL_DIR_NAME}/${SKILL_FILENAME}。`
+      : agent.reason === 'skills-dir-is-link'
+        ? `skills 目录是链接（符号链接或 Windows reparse point/junction），本插件不会穿过它写入或删除 ${SKILL_DIR_NAME}/${SKILL_FILENAME}。`
+        : agent.reason === 'skill-dir-is-link'
+          ? `skills/${SKILL_DIR_NAME} 目录是链接（符号链接或 Windows reparse point/junction），本插件不会穿过它写入或删除 ${SKILL_FILENAME}。`
+          : agent.reason === 'agents-dir-is-link'
+            ? `agents 目录是链接（符号链接或 Windows reparse point/junction），本插件不会穿过它写入或删除任何文件。`
+            : agent.reason === 'boundary-unverified'
+              ? 'Codex home、skills 或 agents 目录无法确认是真实目录（可能缺少 Windows PowerShell），本插件不会写入或删除任何文件。'
+              : `skills/${SKILL_DIR_NAME}/${SKILL_FILENAME} 不是普通文件（可能是链接或目录），本插件不会改动它。`;
     notes.push({ code: 'AGENT_PATH_CONFLICT', text });
   }
   if (agent.state === AGENT_STATES.outdated) {
-    notes.push({ code: 'AGENT_OUTDATED', text: '已安装的 agent 是旧版本（与某个已发布版本逐字节相同）。插件下次启动时会自动刷新为当前版本；也可以点「安装 / 更新 Codex 集成」立即更新。' });
+    notes.push({
+      code: 'AGENT_OUTDATED',
+      text: agent.reason === 'reference-missing'
+        ? 'Codex 技能缺少规则附页。插件启动时会补齐，也可以点「安装 / 更新 TaskBridge 技能」恢复。'
+        : '已安装的技能文件是旧版本（与某个已发布版本逐字节相同）。插件下次启动时会自动刷新为当前版本；也可以点「安装 / 更新 TaskBridge 技能」立即更新。',
+    });
+  }
+  const managedLegacy = legacyAgents.entries.filter((entry) => entry.state === 'managed-legacy');
+  if (managedLegacy.length > 0) {
+    const list = managedLegacy.map((entry) => `agents/${entry.filename}`).join('、');
+    notes.push({
+      code: 'LEGACY_AGENT_MIGRATION_PENDING',
+      text: `检测到旧版托管子智能体（${list}）。1.9.0 起 Codex 改用原生技能 skills/${SKILL_DIR_NAME}/${SKILL_FILENAME} 在当前会话单链直等（避免 spawn_agent + wait_agent 短轮询）；插件下次启动或点「安装 / 更新 TaskBridge 技能」时会自动迁移并移除未修改的旧子智能体文件。`,
+    });
+  }
+  const modifiedLegacy = legacyAgents.entries.filter((entry) => entry.state === 'modified-legacy');
+  if (modifiedLegacy.length > 0) {
+    const list = modifiedLegacy.map((entry) => `agents/${entry.filename}`).join('、');
+    notes.push({
+      code: 'LEGACY_AGENT_USER_MODIFIED',
+      text: `检测到已被手动修改的旧子智能体文件（${list}），本插件已原样保留不删。若你不希望 Codex 在主会话中派生旧子智能体触发 wait_agent 轮询，可手动将其移走或删除，改用原生技能 skills/${SKILL_DIR_NAME}/${SKILL_FILENAME}。`,
+    });
   }
   if (mcp.state === MCP_STATES.conflict) {
     notes.push({
@@ -3053,9 +3342,9 @@ function buildNotes({ agent, mcp, script, configError, nodeError = null }) {
       text: mcp.reason === 'unmanaged-entry'
         ? `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，但没有本插件的托管标记注释，视为你自己写的：本插件不会更新或删除它；请自行删除或改名后再点安装。`
         : (mcp.reason === UNMANAGED_EXACT_REASON
-          ? `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，内容与当前插件应写入的条目完全一致（命令、入口脚本、参数、超时与环境项都相同），只缺托管标记注释。点「仅修复 MCP 配置」只会补上这一行标记，不改动其他内容；「安装 / 更新 Codex 集成」不会替你接管它。`
+          ? `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，内容与当前插件应写入的条目完全一致（命令、入口脚本、参数、超时与环境项都相同），只缺托管标记注释。点「仅修复 MCP 配置」只会补上这一行标记，不改动其他内容；「安装 / 更新 TaskBridge 技能」不会替你接管它。`
           : (mcp.reason === 'args-shape-not-ours'
-            ? `config.toml 中已有的 mcp_servers.${MCP_SERVER_NAME} 条目带托管标记，但入口脚本与当前安装不同。若那是本插件的另一处真实安装，点「安装 / 更新 Codex 集成」或「仅修复 MCP 配置」会在证明后采纳；否则本插件不会替换它。`
+            ? `config.toml 中已有的 mcp_servers.${MCP_SERVER_NAME} 条目带托管标记，但入口脚本与当前安装不同。若那是本插件的另一处真实安装，点「安装 / 更新 TaskBridge 技能」或「仅修复 MCP 配置」会在证明后采纳；否则本插件不会替换它。`
             : `config.toml 中已有同名的 mcp_servers.${MCP_SERVER_NAME} 条目，但内容不是本插件写入的形态（${mcp.reason ?? 'unknown'}）。本插件不会替换它；请自行删除或改名后再点安装。`)),
     });
   }
@@ -3075,7 +3364,7 @@ function buildNotes({ agent, mcp, script, configError, nodeError = null }) {
     if (drift.includes('env')) reasons.push(`其 env.${DISCOVERY_ENV_VAR} 与当前发现文件不一致`);
     notes.push({
       code: 'MCP_ENTRY_OUTDATED',
-      text: `已安装的 mcp_servers.${MCP_SERVER_NAME} 是本插件写入的托管条目，但已经过期：${reasons.length === 0 ? '需要更新' : reasons.join('；')}。插件下次启动时会自动在原地更新它；也可以点「安装 / 更新 Codex 集成」立即更新。`,
+      text: `已安装的 mcp_servers.${MCP_SERVER_NAME} 是本插件写入的托管条目，但已经过期：${reasons.length === 0 ? '需要更新' : reasons.join('；')}。插件下次启动时会自动在原地更新它；也可以点「安装 / 更新 TaskBridge 技能」立即更新。`,
     });
   }
   if (configError !== null) {
@@ -3209,11 +3498,29 @@ async function installManaged(before, outcome) {
   await installMcpEntry(before, outcome);
 }
 
-/** Move a previously installed, unchanged companion to the public TaskBridge name. */
+/**
+ * Safely retire untouched legacy Codex subagent files (`agents/dsh-taskbridge.toml` and
+ * `agents/dsh-delegate.toml`) after migrating to the native skill `skills/dsh-taskbridge/SKILL.md`.
+ * User-modified files are NEVER deleted; every unlink re-proves byte-exact ownership immediately
+ * before deleting.
+ */
 async function migrateLegacyAgent(before, outcome, { removeOnly = false } = {}) {
-  const legacyPath = join(before.codexHome, 'agents', LEGACY_AGENT_FILENAME);
-  const legacy = await inspectFile(legacyPath);
-  if (legacy.kind !== 'file' || !isKnownPriorTemplate(legacy.contents)) return;
+  if (before.boundary?.blocked === true) return;
+  const managedEntries = (before.legacyAgents?.entries ?? []).filter((entry) => entry.state === 'managed-legacy');
+  if (managedEntries.length === 0) return;
+
+  // Re-prove at least one legacy managed file STILL matches its exact inspected bytes
+  // before creating or updating the native skill, so a concurrent user edit between
+  // `plan` and migration never triggers an unwanted skill creation or file deletion.
+  const liveEntries = [];
+  for (const entry of managedEntries) {
+    const currentLegacy = await inspectFile(entry.path);
+    if (currentLegacy.kind === 'file' && typeof entry.expect === 'string' && currentLegacy.contents === entry.expect) {
+      liveEntries.push(entry);
+    }
+  }
+  if (liveEntries.length === 0) return;
+
   if (!removeOnly) {
     if (before.agent.state === AGENT_STATES.missing) {
       const current = await inspectFile(before.agent.path);
@@ -3221,12 +3528,28 @@ async function migrateLegacyAgent(before, outcome, { removeOnly = false } = {}) 
     }
     const template = renderAgentFile(await readAgentTemplate(), before.packageVersion);
     const current = await inspectFile(before.agent.path);
-    if (current.kind !== 'file' || current.contents !== template) return;
+    const reference = skillReference(before.agent.path, template);
+    const installed = reference === null ? null : await inspectFile(reference.path);
+    const referenceReady = installed === null
+      || (installed.kind === 'file' && !referenceConflicts(reference, installed));
+    const skillReady = current.kind === 'file'
+      && ((sameAgentText(current.contents, template) && referenceReady)
+        || before.agent.state === AGENT_STATES.modified);
+    if (!skillReady) return;
   }
-  const currentLegacy = await inspectFile(legacyPath);
-  if (currentLegacy.kind !== 'file' || currentLegacy.contents !== legacy.contents) return;
-  await unlink(legacyPath);
-  if (!outcome.changed.includes('agent')) outcome.changed.push('agent');
+
+  for (const entry of liveEntries) {
+    const currentLegacy = await inspectFile(entry.path);
+    if (currentLegacy.kind !== 'file' || typeof entry.expect !== 'string' || currentLegacy.contents !== entry.expect) {
+      continue;
+    }
+    try {
+      await unlink(entry.path);
+      if (!outcome.changed.includes('legacyAgent')) outcome.changed.push('legacyAgent');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
 }
 
 /**
@@ -3290,6 +3613,51 @@ export async function refreshKnownAgentTemplate(options = {}) {
   return { changed, refused, status };
 }
 
+function skillReference(entryPath, entry) {
+  const match = entry?.match(SKILL_REFERENCE_LINK);
+  if (!match) return null;
+  const [, name, sha256] = match;
+  return { name, sha256, path: join(dirname(entryPath), name) };
+}
+
+function referenceConflicts(reference, inspected) {
+  return inspected.kind !== 'missing'
+    && (inspected.kind !== 'file' || digestLf(inspected.contents) !== reference.sha256);
+}
+
+function skillReferenceRefusal(path, reason) {
+  return {
+    target: 'agent',
+    code: reason === 'reference-operator-owned' ? 'AGENT_USER_MODIFIED' : 'AGENT_PATH_CONFLICT',
+    path,
+    reason,
+    message: 'the Codex skill reference could not be installed or removed safely',
+  };
+}
+
+// Publish a new reference alongside any older one. Replacing the entry switches versions;
+// Codex sessions which already loaded the old entry can still read their reference.
+async function installSkillReference(reference, outcome) {
+  if (reference === null) return 'unchanged';
+  const packaged = await inspectFile(join(dirname(TEMPLATE_PATH), reference.name));
+  if (packaged.kind !== 'file' || digestLf(packaged.contents) !== reference.sha256) {
+    outcome.refused.push(skillReferenceRefusal(reference.path,
+      packaged.kind === 'missing' ? 'reference-not-packaged' : 'reference-template-mismatch'));
+    return 'refused';
+  }
+  const current = await inspectFile(reference.path);
+  if (referenceConflicts(reference, current)) {
+    outcome.refused.push(skillReferenceRefusal(reference.path, 'reference-operator-owned'));
+    return 'refused';
+  }
+  if (current.kind === 'file') return 'unchanged';
+  if (await createFileExclusive(reference.path, packaged.contents) === 'created') return 'created';
+  const raced = await inspectFile(reference.path);
+  if (raced.kind === 'file' && !referenceConflicts(reference, raced)) return 'unchanged';
+  outcome.refused.push(skillReferenceRefusal(reference.path, 'reference-created-concurrently'));
+  return 'refused';
+}
+
 /**
  * Install or refresh the managed agent file without touching the MCP entry.
  *
@@ -3299,51 +3667,80 @@ export async function refreshKnownAgentTemplate(options = {}) {
  */
 async function installManagedAgent(before, outcome) {
   const { agent } = before;
-  if (agent.state === AGENT_STATES.missing || agent.state === AGENT_STATES.outdated) {
-    const template = renderAgentFile(await readAgentTemplate(), before.packageVersion);
-    await mkdir(dirname(agent.path), { recursive: true, mode: 0o700 });
-    if (agent.state === AGENT_STATES.missing) {
-      // First installation: exclusive. A file that appeared between the status read
-      // and this write belongs to whoever created it, and is reported, not replaced.
-      const created = await createFileExclusive(agent.path, template);
-      if (created === 'exists') {
-        outcome.refused.push({
-          target: 'agent',
-          code: 'AGENT_PATH_CONFLICT',
-          message: 'an agent file appeared while installing and was left untouched',
-          path: agent.path,
-          reason: 'created-concurrently',
-        });
-        return;
-      }
-      await recordAgentTemplate(before);
-      outcome.changed.push('agent');
-    } else {
-      // A refresh replaces a byte-exact known build of our own file. Re-check right
-      // before writing: if the file changed in the meantime it is no longer that
-      // known build, and the rename must not overwrite it.
-      const current = await inspectFile(agent.path);
-      if (current.kind !== 'file' || current.contents !== before.agent.expect) {
-        outcome.refused.push({
-          target: 'agent',
-          code: 'AGENT_USER_MODIFIED',
-          message: 'the agent file changed while updating and was left untouched',
-          path: agent.path,
-        });
-        return;
-      }
-      await writeFileAtomic(agent.path, template);
-      await recordAgentTemplate(before);
-      outcome.changed.push('agent');
+  if (agent.state === AGENT_STATES.installed) return;
+  if (agent.state === AGENT_STATES.modified || agent.state === AGENT_STATES.conflict) {
+    if (agent.reason === 'reference-operator-owned') {
+      outcome.refused.push(skillReferenceRefusal(skillReference(agent.path, agent.expect).path, agent.reason));
+      return;
     }
-  } else if (agent.state === AGENT_STATES.modified || agent.state === AGENT_STATES.conflict) {
     outcome.refused.push({
       target: 'agent',
       code: agent.state === AGENT_STATES.modified ? 'AGENT_USER_MODIFIED' : 'AGENT_PATH_CONFLICT',
       message: 'an agent file with different contents already exists and was left untouched',
       path: agent.path,
     });
+    return;
   }
+
+  const boundary = await inspectCodexBoundary(before.codexHome);
+  if (boundary.blocked) {
+    outcome.refused.push(linkedBoundaryRefusal({ ...before, boundary }));
+    return;
+  }
+  if (boundary.skills.kind === 'other' || boundary.skillDir.kind === 'other') {
+    outcome.refused.push(skillReferenceRefusal(agent.path, 'reference-boundary-changed'));
+    return;
+  }
+  if (boundary.skillDir.kind !== 'directory') {
+    await mkdir(dirname(agent.path), { recursive: true, mode: 0o700 });
+    const liveBoundary = await inspectCodexBoundary(before.codexHome);
+    if (liveBoundary.blocked || liveBoundary.skillDir.kind !== 'directory') {
+      outcome.refused.push(skillReferenceRefusal(agent.path, 'reference-boundary-changed'));
+      return;
+    }
+  }
+
+  const template = renderAgentFile(await readAgentTemplate(), before.packageVersion);
+  const previous = skillReference(agent.path, agent.expect);
+  const reference = await installSkillReference(skillReference(agent.path, template), outcome);
+  if (reference === 'refused') return;
+
+  if (agent.state === AGENT_STATES.missing) {
+    const created = await createFileExclusive(agent.path, template);
+    if (created === 'exists') {
+      outcome.refused.push({
+        target: 'agent',
+        code: 'AGENT_PATH_CONFLICT',
+        message: 'an agent file appeared while installing and was left untouched',
+        path: agent.path,
+        reason: 'created-concurrently',
+      });
+      return;
+    }
+  } else {
+    if (previous !== null && referenceConflicts(previous, await inspectFile(previous.path))) {
+      outcome.refused.push(skillReferenceRefusal(previous.path, 'reference-operator-owned'));
+      return;
+    }
+    const current = await inspectFile(agent.path);
+    if (current.kind !== 'file' || current.contents !== agent.expect) {
+      outcome.refused.push({
+        target: 'agent',
+        code: 'AGENT_USER_MODIFIED',
+        message: 'the agent file changed while updating and was left untouched',
+        path: agent.path,
+      });
+      return;
+    }
+    if (sameAgentText(current.contents, template)) {
+      // Restored a missing reference for the current entry. Its ownership record still applies.
+      if (reference === 'created') outcome.changed.push('agent');
+      return;
+    }
+    await writeFileAtomic(agent.path, template);
+  }
+  await recordAgentTemplate(before);
+  outcome.changed.push('agent');
 }
 
 /**
@@ -3582,7 +3979,7 @@ async function upgradeOutdatedMcpEntry(before, outcome, options = {}) {
   );
   if (gate.owned !== true) {
     refuse('MCP_ENTRY_CONFLICT',
-      'the stale mcp_servers.dsh-delegate entry is not one this plugin can prove is its own, so it was left untouched; use 安装 / 更新 Codex 集成 to replace it explicitly',
+      'the stale mcp_servers.dsh-delegate entry could not be verified as owned and was left untouched. 安装 / 更新 TaskBridge 技能 can update entries from a verifiable previous installation',
       { reason: gate.reason });
     return;
   }
@@ -3890,6 +4287,7 @@ export async function removeManagedAgentFile(agent) {
   }
   try {
     await unlink(agent.path);
+    await rmdir(dirname(agent.path)).catch(() => {});
   } catch (error) {
     if (error?.code === 'ENOENT') {
       // Raced away between the read and the unlink; still not a change of ours.
@@ -3924,16 +4322,33 @@ export async function removeManagedAgentFile(agent) {
 async function removeManaged(before, outcome) {
   const { agent, mcp } = before;
   if (agent.state === AGENT_STATES.installed || agent.state === AGENT_STATES.outdated) {
-    const verdict = await removeManagedAgentFile(agent);
-    if (verdict.code === null) outcome.changed.push('agent');
-    else outcome.refused.push(verdict);
+    const reference = skillReference(agent.path, agent.expect);
+    const verdict = reference !== null && referenceConflicts(reference, await inspectFile(reference.path))
+      ? skillReferenceRefusal(reference.path, 'reference-operator-owned')
+      : await removeManagedAgentFile(agent);
+    if (verdict.code === null) {
+      outcome.changed.push('agent');
+      if (reference !== null) {
+        const current = await inspectFile(reference.path);
+        if (referenceConflicts(reference, current)) {
+          outcome.refused.push(skillReferenceRefusal(reference.path, 'reference-operator-owned'));
+        } else if (current.kind === 'file') {
+          const removed = await removeManagedAgentFile({ path: reference.path, expect: current.contents });
+          if (removed.code !== null) outcome.refused.push(removed);
+        }
+      }
+    } else outcome.refused.push(verdict);
   } else if (agent.state === AGENT_STATES.modified) {
-    outcome.refused.push({
-      target: 'agent',
-      code: 'AGENT_USER_MODIFIED',
-      message: 'the agent file differs from the managed template and was left untouched',
-      path: agent.path,
-    });
+    if (agent.reason === 'reference-operator-owned') {
+      outcome.refused.push(skillReferenceRefusal(skillReference(agent.path, agent.expect).path, agent.reason));
+    } else {
+      outcome.refused.push({
+        target: 'agent',
+        code: 'AGENT_USER_MODIFIED',
+        message: 'the agent file differs from the managed template and was left untouched',
+        path: agent.path,
+      });
+    }
   } else if (agent.state === AGENT_STATES.conflict) {
     outcome.refused.push({
       target: 'agent',
@@ -3996,24 +4411,29 @@ async function removeManaged(before, outcome) {
 export function publicCodexStatus(status) {
   if (status === null || typeof status !== 'object') return status;
   const { expect: _ignored, recorded: _record, ...agent } = status.agent ?? {};
-  // `mcp.fingerprint` is the write path's receipt for the exact config bytes it plans to
-  // replace. It is a digest, not content, but it is an internal planning fact like
-  // `agent.expect`, so it does not belong in a response an operator or a page reads.
+  const { expect: _skillIgnored, recorded: _skillRecord, ...skill } = status.skill ?? agent;
+  const legacyAgents = status.legacyAgents && typeof status.legacyAgents === 'object'
+    ? {
+      state: status.legacyAgents.state ?? 'absent',
+      entries: Array.isArray(status.legacyAgents.entries)
+        ? status.legacyAgents.entries.map(({ expect: _legacyExpect, ...entry }) => entry)
+        : [],
+    }
+    : { state: 'absent', entries: [] };
   const { fingerprint: _receipt, ...mcp } = status.mcp ?? {};
-  return { ...status, agent, mcp };
+  return { ...status, skill, agent, legacyAgents, mcp };
 }
 
 /**
- * Load the shipped agent template without the version marker, for diagnostics.
- *
- * Exported so a test can assert the shipped dispatch rules independently of the
- * installed copy.
- * @returns {Promise<{ text: string, instructions: string }>} template text and its developer instructions.
+ * Load the shipped Codex skill template (or legacy TOML template) and its instruction body.
+ * @returns {Promise<{ text: string, instructions: string }>} template text and instructions.
  */
 export async function readAgentInstructions() {
   const text = await readAgentTemplate();
-  const match = /developer_instructions = """([\s\S]*?)"""/u.exec(text);
-  return { text, instructions: match === null ? '' : match[1] };
+  const tomlMatch = /developer_instructions = """([\s\S]*?)"""/u.exec(text);
+  if (tomlMatch !== null) return { text, instructions: tomlMatch[1] };
+  const stripped = normalizeLineEndings(text).replace(/^---\n[\s\S]*?\n---\n/u, '');
+  return { text, instructions: stripped };
 }
 
 /**

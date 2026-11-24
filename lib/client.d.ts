@@ -483,10 +483,10 @@ export declare const ROUTES: Readonly<Record<string, string>> & {
 };
 
 /**
- * One target's presentation state: agent file, MCP entry or DSH switch.
+ * One target's presentation state: Codex skill file (`SKILL.md`), MCP entry or DSH switch.
  *
  * The three are reported separately because they are independent: an installed
- * agent does not imply a configured MCP entry, and neither implies that the DSH
+ * skill does not imply a configured MCP entry, and neither implies that the DSH
  * local-call switch is on.
  */
 export interface DelegateCodexTargetView {

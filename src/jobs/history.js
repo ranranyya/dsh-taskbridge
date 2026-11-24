@@ -749,6 +749,7 @@ function projectView(view, maxEntryBytes, options = {}) {
   // Both are omitted when absent, so a load does not rewrite a document to add the new keys.
   const title = titleText(view.title, ctx);
   const continueFrom = continuationRef(view.continueFromTaskId, taskId);
+  const reuseWorktreeFrom = continuationRef(view.reuseWorktreeFromTaskId, taskId);
   const planNodeId = continuationRef(view.planNodeId, taskId);
   const parentNodeId = continuationRef(view.parentNodeId, taskId);
   const goalDescription = descriptionText(
@@ -759,6 +760,7 @@ function projectView(view, maxEntryBytes, options = {}) {
     state: view.state,
     ...(title === '' ? {} : { title }),
     ...(continueFrom === null ? {} : { continueFromTaskId: continueFrom }),
+    ...(reuseWorktreeFrom === null ? {} : { reuseWorktreeFromTaskId: reuseWorktreeFrom }),
     ...(planNodeId === null ? {} : { planNodeId }),
     ...(parentNodeId === null ? {} : { parentNodeId }),
     // Only present when the commander stated a goal: nothing is derived from the prompt.
@@ -969,6 +971,10 @@ function worktreeView(value) {
     completedAt: time(value.completedAt),
     sourcePreexistingChanges: count(value.sourcePreexistingChanges),
     disposable: value.disposable === true,
+    ...(value.reused === true ? { reused: true } : {}),
+    ...(typeof value.reusedFromTaskId === 'string' && value.reusedFromTaskId.trim() !== ''
+      ? { reusedFromTaskId: label(value.reusedFromTaskId) }
+      : {}),
   };
 }
 
@@ -1083,7 +1089,7 @@ function conversationView(value) {
  * @returns {object | null} usage counters. Only finite non-negative numbers are
  *   kept; `redactDeep` masks any counter-named field that is not one.
  */
-function usageView(value) {
+function usageCounters(value) {
   if (!isPlainObject(value)) return null;
   const out = {};
   for (const key of [
@@ -1095,6 +1101,16 @@ function usageView(value) {
     if (number !== null) setOwn(out, key, number);
   }
   return Object.keys(out).length === 0 ? null : out;
+}
+
+function usageView(value) {
+  const out = usageCounters(value);
+  if (out === null) return null;
+  const delta = usageCounters(value.delta);
+  if (delta !== null) setOwn(out, 'delta', delta);
+  const cumulative = usageCounters(value.cumulative);
+  if (cumulative !== null) setOwn(out, 'cumulative', cumulative);
+  return out;
 }
 
 /** @returns {object | null} bounded result from a legacy model review. */

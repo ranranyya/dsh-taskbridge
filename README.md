@@ -1,48 +1,77 @@
 # DSH TaskBridge
 
-> **1.8.1** 新增任务记录联动清理、快捷预设、`interrupted` 清理与孤儿扫除，落地三重指挥端省 Token 优化（轻量 `flash` 后台子智能体 + 原生文件工具优先 + 紧凑 JSON 载荷裁剪），保护共享工作区原名并上线全新中英文黑盒架构图。详见 [1.8.1 更新说明](docs/releases/1.8.1.zh.md)。
+**让 Codex 与 Antigravity 专注架构规划与验收把关，把繁重编码与测试调测交给 DeepSeek Harness（DSH）黑盒执行。**
 
-> **1.8.0** 新增 Antigravity 一键集成（自包含插件包 + Skill + 后台子智能体 + MCP），并将 Codex 派工规则瘦身为三层黑盒契约。详见 [1.8.0 更新说明](docs/releases/1.8.0.zh.md)。
+> **当前正式版 `1.9.0` · 已原生支持 Codex 与 Antigravity 一键集成；Claude Code / Claude Desktop 接入计划于 2.0 上线。**  
+> 本次 `1.9.0` 完成 Codex 原生技能单链直等架构升级、跨宿主分层指挥内核统一、跨子包隔离工作树复用（`reuseWorktreeFromTaskId`）以及插件启用 404 竞态修复。详见 [1.9.0 更新说明](docs/releases/1.9.0.zh.md)。
 
-> **1.7.1** 由指挥端在派工前确定实施路径、复用方案和验收方法，DSH 按收到的方案执行。
+[English](docs/INTRODUCTION.md) · [为什么选择 TaskBridge](#为什么选择-taskbridge) · [1.9.0 双端基准测试与结论](#190-双端基准测试与结论) · [核心能力](#核心能力) · [快速上手](#快速上手) · [设置与机制](#设置与机制) · [常见问题](#常见问题) · [更新日志](CHANGELOG.md)
 
-> **1.7.0** 增加任务记录的日期筛选和整链清理、同项目多会话并发、可选智能体协作，以及分级静默监控。详见 [1.7.0 更新说明](docs/releases/1.7.0.zh.md)。
+**DSH TaskBridge** 是面向 **DeepSeek Harness（DSH）** 的跨客户端黑盒派工桥接插件。
+你可以在最顺手的顶层指挥端（**Codex** 或 **Antigravity**）里阅读仓库、拆解架构、设定接口契约并独立验收交付；将耗费大量代码输出与反复调测轮次的具体实现工作，通过 11 个有界标准 `delegate_*` MCP 工具交给 DSH 内已配置的高性价比或专属模型落地。
 
-**把方案交给顺手的指挥端，把落地交给 DeepSeek Harness（DSH）。**
+对指挥端而言，底层执行是一座**受控黑盒车间**——API 密钥、模型路由、思考强度、Git `worktree` 隔离、跨子包工作树复用与 DSH 原生会话管理全部在插件内统一收口，指挥端只管**定方向、批越权、做验收**。
 
-> **已支持 Codex 与 Antigravity 一键集成；Claude Code / Claude Desktop 接入计划于 2.0 上线。**
+![DSH TaskBridge 四层架构。用户和开发者通过宿主适配层使用共享派工内核、MCP 协议和 DSH 执行引擎。](./docs/assets/taskbridge-workflow.zh.png)
 
-[English](docs/INTRODUCTION.md) · [快速上手](#快速上手) · [核心能力](#核心能力) · [设置与机制](#设置与机制) · [常见问题](#常见问题) · [更新日志](CHANGELOG.md)
+## 为什么选择 TaskBridge
 
-TaskBridge 是面向 **DeepSeek Harness（DSH）** 的多端任务派工插件。
-你可以在熟悉的 **Codex** 或 **Antigravity** 里看代码、定方案、拆任务、审 diff；具体改代码、跑测试的脏活累活，通过标准 MCP 接口交给 DSH 里配好的模型去干。
+当你信任高阶旗舰模型（如 GPT / Gemini 高推理档位）的架构设计与代码审查能力，但不想让它在样板代码编写和反复跑单测排错上快速消耗宝贵配额，同时又厌倦了在多个窗口间手工粘贴提示词与 diff 时，TaskBridge 通过四层架构直接打通协同闭环：
 
-整个执行过程对指挥端是**黑盒**的——API 连接、执行模型、思考强度、Git 工作树隔离和 DSH 原生会话管理都在插件内统一收口，指挥端只管派工、审批和验收。
+- **L1 宿主因地制宜，零空转等待**：
+  - **Codex 端（`1.9.0` 原生技能）**：安装紧凑入口 `skills/dsh-taskbridge/SKILL.md` 与按需读取附页，由当前主会话直调 `delegate_submit({ autoPreflight: true, wait: true })` + 单链 `delegate_wait`（配合 `tool_timeout_sec = 3660` 静默长等），彻底根除旧版 `spawn_agent` + 短超时 `wait_agent` 的高频轮询空转，并自动安全退役未修改的旧 `.toml` 子智能体。
+  - **Antigravity 端（自包含插件包）**：默认将预检、等待循环与常规权限审批卸载给轻量 `flash` 后台子智能体托管，主旗舰模型零唤醒挂起，仅在交付后接收精简结构化证据完成最终审查。
+- **L2 架构师式派工，杜绝代写与洁癖返工**：双端共享单一真源指挥内核——**大任务拆小包（`delegate_plan`）+ 指明架构骨架、接口契约与范围红线（严禁指挥端在提示词中代写逐行实现代码或伪代码）+ 务实独立审查（仅对违背规范、真 Bug、测试失败或越界残留合并一轮打回，拒绝超纲假设空耗）**。
+- **L3 紧凑有界 MCP 协议**：支持预检、提交与首段等待合并为一次调用。单行 JSON 载荷支持在本地审查时省略补丁正文或只返回回执（`includeDiff: false` / `receiptOnly: true`）。
+- **L4 Git 工作树并行隔离与无缝续接**：默认从干净基线拉出独立 `worktree` 并行执行；多阶段下游子包可通过 `reuseWorktreeFromTaskId` 在同一隔离工作树上开启全新干净 DSH 会话（全程不污染主仓库）；同一任务返工通过 `continueFromTaskId` 原会话续接；完成后支持按任务链一键联动清理。
 
-![DSH TaskBridge 多端指挥与黑盒执行架构：Codex 与 Antigravity 规划审批，TaskBridge 黑盒封装 MCP、路由、隔离与静默等待，DSH 沙箱落地并闭环续接](https://raw.githubusercontent.com/ranranyya/dsh-taskbridge/v1.8.1/docs/assets/taskbridge-workflow.zh.png)
+---
 
-## 它解决什么问题
+## 1.9.0 双端基准测试与结论
 
-当你更信任 Codex / Antigravity 的架构规划和代码审查能力，同时想用 DSH 里接入的高性价比或专属模型来跑具体实现时，手工来回粘贴需求和代码很快就会失控。TaskBridge 直接打通两边：
+我们使用覆盖 7 类真实工程场景的跨宿主黑盒基准套件（`T0A` 非指派静默边界、`T0B` 三类非法/未提交 Git 目录只读拦截、`T1` 配额账本核心实现、`T2` 超额计费与审计报告、`T3` 折扣集成与导出 CLI、`T4` 脏工作区未提交草稿完整性保护、`T5` 含 **235 项单测 + 6 份只读契约 SHA-256 校验**的企业级三域计费平台重构），在相同初始靶场与统一独立黑盒阅卷脚本下，基于 **`1.9.0-test6` 候选构建**对 **Antigravity** 与 **Codex** 双端进行了同宿主无插件直做基线对照实测。插件组 DSH 执行后端统一采用轻量模型 `deepseek-v4.1-flash`。
 
-- **黑盒分层，各司其职**：在 DSH 插件里选一次提供方、模型和思考强度，所有指挥端共用同一套标准 MCP 接口（11 个有界工具、紧凑 JSON 载荷），不需要在提示词里反复交代模型或环境细节。
-- **先定方案再派工**：指挥端先读代码、定步骤和验收标准，复杂目标可先建任务树再拆包派发；DSH 按方案落地，优先使用原生文件/搜索工具，遇到现场前提冲突先回报证据，不瞎改。
-- **静默等待，省指挥端上下文**：执行期间由本机程序盯进度，Antigravity 默认由轻量 `flash` 后台子智能体承载静默等待与常规审批，避免多轮中间载荷灌入主旗舰模型上下文。
-- **同会话续接，返工不丢上下文**：交付后由指挥端集中看 diff 和测试结果并落盘审查结论；需要修改时直接续接原来的 DSH 会话和工作树，不必从头讲一遍背景。
-- **独立隔离与联动清理**：默认从 Git 基线拉出独立工作树并行执行，互不干扰；任务完成后可在「任务记录」按执行链一键联动清理历史、派工会话、隔离工作树与空规划节点。
+### 1. 双端综合实测总览
+
+| 宿主端与主控配置 | 运行模式 | 全集通过（得分） | `T1–T5` 同题通过 | `T1–T5` 主控均步 | `T1–T5` 强模型有效 Token（非缓存输入 + 输出） | 强模型有效省流率 | `T1–T5` 强模型含缓存总 Token | 辅助 / DSH 执行端 Token |
+| --- | --- | :---: | :---: | ---: | ---: | ---: | ---: | ---: |
+| **Antigravity**<br>`gemini-4-neon-xhigh` | 无插件直做基线 | — | 5/5（均分 100） | 11.00 | 618,861 | 基线 | 3,276,639 | 0 |
+| **Antigravity**<br>`gemini-4-neon-xhigh` | **`1.9.0-test6` 插件组**<br>（`flash` 子智能体 + DSH） | **7/7（均分 100）** | **5/5（均分 100）** | **11.80**<br>*(7 题全集 9.57)* | **420,450**<br>*(7 题全集 484,480)* | **净省 32.06%** | 3,724,763<br>*(+13.68%)* | Flash 辅助 2,298,138<br>+ DSH 后端执行 |
+| **Codex CLI**<br>`gpt-6.2-sol (xhigh)` | 无插件直做基线 | — | 4/5（均分 96） | 11.20 | 608,065 | 基线 | 1,966,145 | 0 |
+| **Codex CLI**<br>`gpt-6.2-sol (xhigh)` | **`1.9.0-test6` 插件组**<br>（原生 Skill 单链 + DSH） | **6/7 通过** | **4/5（均分 96）**<br>*逐题得分 100% 一致* | **28.60**<br>*(7 题全集 21.29)* | **459,102**<br>*(7 题全集 503,180)* | **净省 24.50%** | 9,060,958<br>*(4.61×，94%+ 为缓存读)* | DSH 回执 745,409 |
+
+> **核验说明**：① `T0A`（普通非代码问答）中 Codex 仅 1 步直接回答、工具调用为 0，Antigravity 辅助步数为 0，两端均 100% 严守非指派不触发红线；`T0B` 三类不合规目录均被只读预检精准拦截且靶场完好。② Codex 端基线与 `1.9.0-test6` 插件组在 `T2` 上均因标准阅卷省略超额策略参数时要求返回 `overageUnits` 扣 20 分（同得 80 分），显式传入 `charge-overage-tier` 补测后两组三个样例均满分通过。③ 相比升级单链架构前的 `test5` 轮询态（Codex 7 题有效 Token `2,367,661`、总 Token `1,863 万`），`1.9.0-test6` 将 Codex 有效 Token 压降了 **78.7%**。
+
+### 2. `T1–T5` 分题强模型有效 Token（非缓存输入 + 输出）省流明细
+
+| 题目与工程特征 | Antigravity 基线 → `1.9.0-test6` | Antigravity 有效省流率 | Codex 基线 → `1.9.0-test6` | Codex 有效省流率 |
+| --- | ---: | ---: | ---: | ---: |
+| **`T4`** · 脏仓库小型增量修复（保留未提交草稿） | 44,731 → 56,269 | -25.79% *(小任务固定开销)* | 81,590 → 86,816 | -6.40% *(小任务固定开销)* |
+| **`T1`** · 配额账本核心模块实现（20 项单测） | 73,559 → 46,177 | **+37.22%** *(总 Token 亦省 9.8%)* | 52,768 → 52,446 | **+0.61%** *(基本打平)* |
+| **`T2`** · 分层超额计费与审计报告（39 项单测） | 92,737 → 53,542 | **+42.26%** *(总 Token 亦省 19.2%)* | 100,570 → 87,502 | **+13.00%** |
+| **`T3`** · 折扣引擎、账本集成与导出 CLI（51 项单测） | 85,481 → 64,440 | **+24.61%** *(总 Token 亦省 15.9%)* | 82,885 → 67,827 | **+18.17%** |
+| **`T5`** · 企业级三域计费平台重构（235 项单测 + 6 契约校验） | 322,353 → 200,022 | **+37.95%** | 290,252 → 164,511 | **+43.32%** *(主控输出降 47.9%)* |
+
+### 3. 四点实测结论与选型建议
+
+1. **轻量模型执行 + 强主控验收，同题得分与无插件旗舰基线完全持平**：尽管执行端使用的是轻量高性价比模型（`deepseek-v4.1-flash`），依靠主控在派工前定清接口契约与防坑边界、交付后在隔离工作树独立跑测验收并按需发起原会话修正（如 Codex 在 `T1–T5` 执行了 1～3 轮精准退回修复），双端在包含 235 项跨模块单测的重型架构题 `T5` 上均拿到 **100/100**，`T1–T5` 逐题得分与同宿主旗舰模型直做完全一致。
+2. **任务越复杂，强模型有效 Token 省得越显著（重型任务省流约 38%–43%）**：在 `T2`、`T3`、`T5` 等多文件功能开发、复杂业务规则与跨子系统重构中，原本由强模型承担的大段代码输出与反复跑测上下文被转移至 DSH，双端有效 Token 稳定节省 **13.0%–43.3%**；而对于像 `T4` 这样几分钟即可改完的极小单点修改，预检与审查往返的固定开销会抵消省流（微增 `6.4%`–`25.8%`），更适合直接在当前指挥端顺手改完。
+3. **双端宿主运行机制不同，前缀缓存表现各有特征**：Antigravity 依托 `flash` 后台子智能体隔离了等待与常规审批（`T5` 中卸载了 67.5% 的交互步数），`T1–T5` 同题主控平均步数（`11.80` vs 基线 `11.00`，7 题全集 `9.57`）基本持平，`T1`/`T2`/`T3` 连含缓存总 Token 都低于无插件基线；Codex 由主会话单链直调 MCP，遇到多轮权限审批或返工（如 `T2`/`T5` 退回 3 轮、33～54 步）时会重放主会话前缀缓存（含缓存总 Token 为基线的 `4.61` 倍，但其中 **94% 以上均为低单价 `cacheRead` 命中**），高单价的非缓存输入与代码输出仍净降 `24.5%`。
+4. **以适度后台墙钟耗时换取主力模型配额**：由于增加了派工通信、轻量模型编码调测及审查返工轮次，Antigravity 同题 `T1–T5` 平均端到端耗时约为基线的 `1.76` 倍（`656s` vs `372s`，7 题全集均耗时 `481s`），Codex 逐题累计耗时约为基线的 `3.11` 倍（扣除 7 题全并发首包约 9 分钟排队等待后约为基线的 `1.9` 倍）。推荐在后台或多工作树并行场景下派发中大型编码包，把主力旗舰配额留给核心架构决策与代码把关。
+
+---
 
 ## 核心能力
 
 | 能力 | 说明 |
 | --- | --- |
-| **Codex & Antigravity 一键集成** | 设置页分别提供 Codex（托管子智能体 + MCP）和 Antigravity（自包含插件包 + Skill + 轻量后台子智能体 + MCP）的安装、更新、仅修复 MCP 与卸载入口，按文件哈希完整保留用户自定义修改。 |
-| **复用 DSH 已有 API 与模型** | 直接选用 DSH 已启用的接口、执行模型与思考强度；密钥仍由 DSH 托管，不导出、不回显。 |
-| **多层任务树、任务记录与联动清理** | 支持规划总目标与子任务；「任务记录」支持日期筛选、快捷勾选预设（全部 / 仅已通过 / 仅失败·取消·中断）、查看完整审查意见与一键跳转原会话，并支持按需联动归档派工会话、移除隔离工作树/临时工作区、清理空规划父节点及扫除历史孤儿残留（主项目源码与共享工作区受保护绝不误删）。 |
-| **隔离并行与原生工作区整合** | 默认独立 Git 工作树隔离（支持同项目多会话并行，自动折叠在 DSH 侧栏 `TaskBridge` 节点下并按任务标题命名），也支持显式共享目录执行（沿用项目原生工作区并保留项目原名）；派工会话带轻量标识。 |
-| **分级静默监控** | 普通任务无默认总执行时长上限；默认 DSH 开始运行满 10 分钟本机自检一次、指挥端连续 40 分钟未收到新成果时提醒检查，重复失败自动提醒并支持事件确认（均可调或关闭）。 |
-| **逐次权限审批与原生提问** | 超出常规工作区权限的命令需经指挥端核验具体命令与路径后单次放行（审批暂停自动裁剪冗余监控字段以降低开销）；DSH 原生提问直传指挥端，答复或审批后同调用无缝续等。 |
-| **可选智能体团队协作** | 默认关闭，可在执行设置调整新任务默认开关，也可单次派工显式覆盖；续接沿用原会话选择。 |
-| **设置自动保存与项目覆盖** | 选项改动即时保存，文本输入自动防抖落盘；支持保存常用预设和按项目路径单独覆盖执行配置。 |
+| **Codex & Antigravity 一键集成** | 设置页分别提供 Codex（原生技能 `skills/dsh-taskbridge/SKILL.md` + 按需附页 + MCP，自动安全退役未修改的旧版 `.toml` 子智能体）和 Antigravity（自包含插件包 + Skill + 轻量后台子智能体 + MCP）的安装、更新、仅修复 MCP 与卸载入口，按内容哈希完整保护用户自定义修改。 |
+| **复用 DSH 已有 API、模型与思考强度** | 直接选用 DSH 已启用的接口、执行模型与思考强度；API 密钥全程留在 DSH 内，不导出、不回显。 |
+| **任务树拆解、跨包工作树复用与联动清理** | 支持 `delegate_plan` 规划多层任务树；下游依赖子包可通过 `reuseWorktreeFromTaskId` 直接复用上游已验收隔离 `worktree` 并开启干净新会话；「任务记录」支持日期筛选、快捷预设勾选、查看完整审查意见、一键跳转原生会话及整链联动清理（严保主项目源码与共享工作区）。 |
+| **隔离并行与原生工作区整合** | 默认独立 Git 工作树隔离（支持同项目多任务并行，自动归拢于 DSH 侧栏 `TaskBridge` 节点下并按任务标题命名），也支持预检确认后在脏仓库共享执行（保留项目原工作区名称）。 |
+| **分级静默监控** | 普通任务无默认总执行时长上限；默认开始运行满 10 分钟本机只读自检一次、连续 40 分钟未回传新成果时提醒指挥端检查，连续同类工具失败（默认 3 次）带事件 ID 去重提醒（均可调或关闭）。 |
+| **精确指纹单次审批与原生提问** | 超出常规工作区写权限的操作逐次审批，并核验本次调用的完整参数指纹。DSH 原生提问直传指挥端，答复后在同一次调用中续等。 |
+| **可选智能体团队协作与项目覆盖** | `agentTeams` 默认关闭，支持全局默认或按单次派工显式指定（续接自动继承）；设置改动即时/防抖自动保存，支持常用预设与按项目路径独立覆盖配置。 |
 
 ## 快速上手
 
@@ -54,7 +83,7 @@ TaskBridge 是面向 **DeepSeek Harness（DSH）** 的多端任务派工插件�
 dsh-taskbridge
 ```
 
-> 若区域镜像尚未同步最新版，可切换 npm 官方源，或从 GitHub Releases 下载 `.tgz` 本地安装。本机 MCP 连接需要 Node.js 24+，插件集成安装器会自动检测可用运行时（绝不会误写桌面端可执行文件）。
+> 若区域镜像尚未同步最新版，可切换 npm 官方源，或从 [GitHub Releases](https://github.com/ranranyya/dsh-taskbridge/releases) 下载 `.tgz` 本地安装。本机 MCP 连接需要 Node.js 24+，插件集成安装器会自动检测可用运行时（绝不会误写桌面端可执行文件）。
 
 ### 2. 配好执行模型
 
@@ -64,14 +93,14 @@ dsh-taskbridge
 
 ### 3. 一键接入指挥端
 
-- **接入 Codex**：切到 **Codex 集成**，点击 **安装 / 更新 TaskBridge 智能体**，完成后重启或新开 Codex 会话，即可在指令中点名 `dsh-taskbridge`（或明确说明“交给 DSH / TaskBridge”）派工。
+- **接入 Codex**：切到 **Codex 集成**，点击 **安装 / 更新 TaskBridge 技能**（写入原生技能 `skills/dsh-taskbridge/SKILL.md`、同目录规则附页与 `config.toml` MCP 条目，并自动清理未修改的旧 `agents/dsh-taskbridge.toml`），完成后重启或新开 Codex 会话，即可通过 `$dsh-taskbridge` 或明确说明“交给 DSH / TaskBridge”由当前会话直接单链派工与静默长等。
 - **接入 Antigravity**：切到 **Antigravity 集成**，点击 **安装 / 更新 Antigravity 插件**。插件会写入独立的 `~/.gemini/config/plugins/dsh-taskbridge/`（内含 `SKILL.md`、轻量后台子智能体和插件内 `mcp_config.json`，不碰全局配置），Antigravity 加载后即可通过 `@[plugin:dsh-taskbridge]` / `@dsh-taskbridge` 或明确指令派工。首次调用 `delegate_*` MCP 工具时若弹出外部工具确认框，建议勾选 **Always Allow**，避免打断静默等待与审批续等。
 
 ### 4. 打开总开关，派发第一个任务
 
 打开设置页顶部的 **允许本机 MCP 调用 DSH 委派**（新安装默认关闭，关闭即拒收新任务并中止运行中任务）。接着在 Codex 或 Antigravity 中给出需求，例如：
 
-> 用 TaskBridge 把当前仓库里设置页自动保存偶发丢草稿的问题交给 DSH 修复。你先看源码定实施方案，只改保存队列相关代码并补上回归测试；交付后审查 diff 和测试结果，有问题就续接原任务修完。
+> 用 TaskBridge 把当前仓库的分层超额计费模块和导出 CLI 交给 DSH 实现。你先核对现有目录与规范定好接口契约和边界，拆包或单包派给 DSH 完成编码与单测；交付后独立核验 diff 与测试结果并记录验收结论，若有缺陷就续接原任务修完。
 
 你可以在 DSH 左侧原生工作区实时围观执行过程，也可以在插件设置页 **任务记录** 中随时查看进展与完整验收记录。
 
@@ -83,7 +112,7 @@ dsh-taskbridge
 
 | 模式 | 修改位置与侧栏落点 | 适用场景 |
 | --- | --- | --- |
-| **独立工作树（默认）** | 从已提交的 Git 基线拉出隔离 worktree；在 DSH 侧栏自动折叠于 `TaskBridge` 节点下并按任务标题命名 | 希望改动与主目录隔离，或同一项目同时并行跑多个独立任务，验收后再决定如何合入；清理时可连同工作树与临时工作区一并移除。 |
+| **独立工作树（默认）** | 从已提交的 Git 基线拉出隔离 worktree；在 DSH 侧栏自动折叠于 `TaskBridge` 节点下并按任务标题命名；多阶段下游子包可通过 `reuseWorktreeFromTaskId` 在同一隔离树上开启新会话接力开发 | 希望改动与主目录隔离，或同一项目同时并行跑多个独立任务，验收后再决定如何合入；清理时可连同工作树与临时工作区一并移除。 |
 | **共享工作区** | 直接在授权的项目目录内修改；沿用项目自己的原生工作区并保留项目原名称（不落入 `TaskBridge` 节点下） | 当前目录已有未提交改动，且明确希望 DSH 基于现状继续修改（预检确认后才允许）；联动清理绝不删除项目源码目录与共享工作区。 |
 
 > **仓库硬性前提**：无论是独立工作树还是共享工作区，都要求授权目录是**已初始化且至少有 1 次 commit 的 Git 仓库根目录**（普通聊天问答或非仓库临时目录不走 TaskBridge）。审查通过只记录结论，不会自动合并工作树、创建提交或推送代码。
@@ -110,7 +139,7 @@ dsh-taskbridge
 ## 常见问题
 
 **安装后，Codex 或 Antigravity 会偷偷把所有活都派给 DSH 吗？**
-不会。必须同时满足两个条件：顶部本机调用开关已打开，且你在对话中明确指派将 Git 仓库中的代码实现或验证任务交给 DSH / TaskBridge 执行。普通问答（哪怕提到了 `@dsh-taskbridge`）、代码解读或未指派的本地改动都不会触发派工。
+不会。必须同时满足两个条件：顶部本机调用开关已打开，且你在对话中明确指派将 Git 仓库中的代码实现或验证任务交给 DSH / TaskBridge 执行。普通问答（哪怕提到了 `$dsh-taskbridge` 或 `@dsh-taskbridge`）、代码解读或未指派的本地改动都不会触发派工。
 
 **我手工改过 `dsh-taskbridge.toml` 或 `SKILL.md`，升级插件会被覆盖吗？**
 不会。TaskBridge 按文件内容哈希判定所有权：只有未改动过的托管文件才会在升级时自动刷新；你编辑过的文件会被标记为自定义并原样保留。如果只更新连接路径，点「仅修复 MCP 配置」即可。
@@ -118,20 +147,20 @@ dsh-taskbridge
 **Antigravity 集成会修改我的全局 `mcp_config.json` 或 `config.json` 吗？**
 不会。所有文件都收敛在 `~/.gemini/config/plugins/dsh-taskbridge/` 独立插件目录中，你可以在 Antigravity 插件页随时一键开关，卸载时也只清理插件自己写入的文件。
 
-**静默等待与 `1.8.1` 的低耗设计是怎么省指挥端 token 的？**
-规划方案、处理权限审批、回答提问和最终审查仍需要指挥端模型介入；TaskBridge 从三层压低额外消耗：① 执行期间静默等待，不反复查状态或拉中间代码；② Antigravity 默认使用轻量 `flash` 后台子智能体隔离等待和常规审批，只将精简摘要回传主旗舰模型；③ 底层提示 DSH 优先使用原生文件工具减少不必要的 Shell 审批弹窗，并采用单行紧凑 JSON 载荷及审批期裁剪。历史测量见 [等待阶段用量对照](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.0-token-benchmark.zh.md)。
+**什么时候最适合交给 TaskBridge，什么时候适合让指挥端直接改？**
+根据 `1.9.0` 双端基准实测：几分钟即可改完的极小单点修改直接由当前指挥端顺手完成最省事；而涉及**多文件功能实现、复杂业务规则、补齐成套单测或跨模块重构**时，交给 TaskBridge 执行并由指挥端把关架构契约与验收，可在保持旗舰级交付质量的同时节省约 **13%–43%** 的强模型有效 Token。早期等待阶段单样本对照另见 [等待阶段用量对照](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.5.0-token-benchmark.zh.md)。
 
 ## 客户端支持路线
 
 | 客户端 | 当前状态 | 接入形态 |
 | --- | --- | --- |
-| **Codex** | 已支持 | 一键安装托管子智能体（`agents/dsh-taskbridge.toml`）+ MCP 配置 |
-| **Antigravity** | 已支持 | 一键安装独立插件包（`plugins/dsh-taskbridge/`，含 Skill + 后台子智能体 + MCP） |
-| **Claude Code / Claude Desktop** | 计划中（预计 2.0） | 复用同一套标准 MCP 服务接口，规划见 [Claude 接入规划](docs/claude-code.md) |
+| **Codex** | 已支持（`1.9.0` 原生技能） | 一键安装原生技能（`skills/dsh-taskbridge/SKILL.md` + 规则附页）+ MCP 配置（自动安全退役旧版未修改子智能体） |
+| **Antigravity** | 已支持 | 一键安装独立插件包（`plugins/dsh-taskbridge/`，含 Skill + `flash` 后台子智能体 + MCP） |
+| **Claude Code / Claude Desktop** | 计划中（预计 `2.0`） | 复用同一套分层指挥内核与标准 MCP 服务接口，规划见 [Claude 接入规划](docs/claude-code.md) |
 
 ## 更多文档
 
-- [Codex 集成契约](docs/codex-integration.md) · [Antigravity 集成契约](docs/antigravity-integration.md) · [Claude 接入规划](docs/claude-code.md)
+- [1.9.0 更新说明](docs/releases/1.9.0.zh.md) · [Codex 集成契约](docs/codex-integration.md) · [Antigravity 集成契约](docs/antigravity-integration.md) · [Claude 接入规划](docs/claude-code.md)
 - [静默等待说明](docs/silent-wait.md) · [工作区与隔离](docs/workspace-contract.md) · [会话放置与续接](docs/conversation-placement.md)
 - [运行时兼容性](docs/runtime-compatibility.md) · [插件发现与更新](docs/plugin-market.md) · [旧名称迁移](docs/taskbridge-upgrade.md)
 
@@ -156,7 +185,7 @@ dsh-taskbridge
 | Node.js | `>= 24` | 与 DSH `0.2.0-rc.2` / `0.2.1-rc.2` 运行时一致；使用了原生 ESM、`AbortSignal.timeout`、`node --test`。 |
 | 操作系统 | Windows / Linux / macOS | 自动测试在 Windows + Node 24 上运行；需要 git 的工作树隔离在缺少 git 时会被显式拒绝，而不是静默降级。 |
 
-`@earendil-works/pi-ai`（`^0.87.1`）与 `@deepseek-ai/dsh-llm-pi-ai` 是运行时
+`@earendil-works/pi-ai`（`^0.87.1 || ^1.1.0`）与 `@deepseek-ai/dsh-llm-pi-ai` 是运行时
 `peerDependencies`：DSH 官方 bundle 已自带，**不需要**单独安装。
 
 ## 2. 安装
@@ -177,7 +206,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
    ```bash
    npm pack
-   #    → dsh-taskbridge-1.8.1.tgz
+   #    → dsh-taskbridge-1.9.0.tgz
    ```
 
 2. 使用本地包时，通过 **添加插件**入口选择下载或生成的 `.tgz`（或本仓库目录）完成安装。
@@ -191,7 +220,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-taskbridge-1.8.1.tgz && dsh plugin --profile web why dsh-taskbridge
+dsh plugin --profile web add ./dsh-taskbridge-1.9.0.tgz && dsh plugin --profile web why dsh-taskbridge
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -204,7 +233,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.8.1.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.9.0.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -237,7 +266,7 @@ dsh --profile web
 2. **接口管理**——从 DSH 已启用的接口中选择；模型和推理强度由 DSH 当前目录同步。
 3. **执行设置**——提供方 / 执行模型 / 思考强度 / 最大并发 / 工作区隔离 / 智能体协作 / 进度与静默监控 / 项目覆盖。
 4. **任务记录**——任务树与历史列表、日期筛选、完整审查意见、跳转原会话与按执行链联动清理。
-5. **Codex 集成**——一键安装 Codex 子智能体文件并登记 MCP 条目（见 6.1）；三种状态分开显示。
+5. **Codex 集成**——一键安装 Codex 原生技能文件（`skills/dsh-taskbridge/SKILL.md`）并登记 MCP 条目，同时安全退役未修改的旧版 `agents/dsh-taskbridge.toml`（见 6.1）；三种状态分开显示。
 6. **Antigravity 集成**——一键安装自包含插件包（`~/.gemini/config/plugins/dsh-taskbridge/`，含 `SKILL.md`、轻量后台子智能体与插件内 `mcp_config.json`，详见 [`docs/antigravity-integration.md`](./docs/antigravity-integration.md)）。
 
 界面只负责切换本机调用能力和配置；任务由 MCP 宿主提交。
@@ -273,9 +302,8 @@ dsh --profile web
 `delegate_status` / `delegate_preflight` / `delegate_submit` / `delegate_wait` / `delegate_result` / `delegate_cancel` /
 `delegate_permission_decide` / `delegate_question_answer` / `delegate_review` / `delegate_plan` / `delegate_metrics`。
 它**不提供**授权、配置写入或凭据读写工具。`delegate_permission_decide` 是唯一一条窄例外：
-它只能回答一个**已经挂起**的「单次调用授权请求」，给 `allow-once`（仅这一次调用可继续）或
-`reject`。它不能创建或扩大任何**长期有效**的授权，不能修改设置、凭据、本机开关、提供方/模型或隔离方式，
-也不能预先批准后续调用。
+它只能回答一个**已经挂起**的「单次调用授权请求」，给 `allow-once` 或 `reject`。
+`allow-once` 仅放行本次调用。预览版客户端传入 `scope: "task-command"` 时，正式版按 `scope: "once"` 处理。它不能创建或扩大任何跨任务或**长期有效**的授权，不能修改设置、凭据、本机开关、提供方/模型或隔离方式。
 
 `delegate_review` 只记录已交付任务的宿主审查结论。指挥端检查结果和验证证据后，传入
 `decision: "accepted"` 或 `"changes-requested"` 与简短 `note`；任务页显示“审查通过”或“需要修正”。
@@ -336,6 +364,8 @@ dsh --profile web
 - 工作区状态会被保留：共享模式的任务在原目录继续；隔离工作树的跟进任务仍使用父任务的原始
   `workspacePath` 做授权和预检，由插件内部恢复**同一棵**受管工作树继续上一次未提交的改动。
   不要把内部 `execution.workspacePath` 当成新的授权路径，也不要切换隔离模式；同一任务链由工作区锁串行化。
+- **跨子包隔离工作树复用（`reuseWorktreeFromTaskId`，1.9.0 新增）**：多阶段规划中，若下游依赖子包需要基于上游已完成（`awaiting-host-review`）的隔离工作树继续构建，传 `reuseWorktreeFromTaskId`（与 `continueFromTaskId` 互斥）即可在同一隔离工作树上开启**全新 DSH 会话**并绑定新子包自己的 `planNodeId`，全程不写入用户主工作区；只要仍有下游任务引用该工作树，单删上游任务记录时会自动保留共享工作树。
+- **MCP 单次往返压缩（1.9.0 新增）**：`delegate_submit` 支持可选控制参数 `autoPreflight: true` 与 `wait: true`（在单次调用内完成预检、提交与首段长等待；若提交成功但后续等待中断，仍完整返回 `submitted: true`、`taskId`、`submitReceipt` 与 `waitError` 防止重复提交）；`delegate_result` 支持 `includeDiff: false` 省略重复大段补丁正文。
 
 **派工前预检（`delegate_preflight`）**：只读检查一个绝对工作区路径——是否 Git 仓库、是否有
 提交、是否有未提交改动、变更文件总数和一个有上限的路径清单，并给出建议隔离
@@ -361,20 +391,18 @@ dsh --profile web
 
 Codex 支持一键安装集成。**「Codex 集成」**分页提供一个明确的按钮动作：点击一次即可完成
 
-1. 安装自定义子智能体文件 `CODEX_HOME/agents/dsh-taskbridge.toml`（未设置 `CODEX_HOME`
-   时为 `%USERPROFILE%\.codex\agents\dsh-taskbridge.toml`）；
+1. 安装原生技能文件 `CODEX_HOME/skills/dsh-taskbridge/SKILL.md`（未设置 `CODEX_HOME`
+   时为 `%USERPROFILE%\.codex\skills\dsh-taskbridge\SKILL.md`），并在核验新技能落盘后安全移除未经用户修改的旧托管 `agents/dsh-taskbridge.toml` / `agents/dsh-delegate.toml`；
 2. 在 `CODEX_HOME/config.toml` 里登记本包自带的 stdio MCP 服务
-   `mcp_servers.dsh-delegate`，让子智能体可以使用全套 11 个 `delegate_*` 工具
+   `mcp_servers.dsh-delegate`（含 `tool_timeout_sec = 3660`），让当前 Codex 会话直接使用全套 11 个 `delegate_*` 工具
    （`delegate_status` / `delegate_preflight` / `delegate_submit` / `delegate_wait` / `delegate_result` /
    `delegate_cancel` / `delegate_permission_decide` / `delegate_question_answer` / `delegate_review` /
    `delegate_plan` / `delegate_metrics`）。
 
 需要说明的边界（分页里也有同样的提示）：
 
-- **首次安装由按钮触发，启动刷新已有托管集成。** 点击「安装 / 更新 TaskBridge 智能体」安装智能体和 MCP；「仅修复 MCP 配置」不改智能体。启动时会刷新与已发布模板字节一致的文件，并更新同一安装位置的已托管 MCP 配置。1.3.2 还会把未修改的旧 `agents/dsh-delegate.toml` 迁移成 `agents/dsh-taskbridge.toml`，清除旧文件，避免两个名字同时出现。没有既有托管智能体时，启动不会首次安装；正文被改过或新文件被用户占用时保留用户文件。「刷新状态」和分页打开时的读取只做诊断。
-- **不覆盖、不删除你写的文件。** 同名但内容不同的 `agents/dsh-taskbridge.toml` 会被保留，
-  界面报告为「不属于已知版本」；只有与**某个已发布版本逐字节相同**的托管文件才会被更新或删除，
-  仅版本号变旧、正文被改过一字的文件都不会动。`config.toml` 里由插件写入的条目带托管标记注释；
+- **首次安装由按钮触发，启动刷新已有托管集成。** 点击「安装 / 更新 TaskBridge 技能」安装技能和 MCP；「仅修复 MCP 配置」不改技能或旧子智能体文件。启动时会刷新与已发布模板字节一致的技能文件、将未修改的旧版 `agents/dsh-taskbridge.toml` / `agents/dsh-delegate.toml` 迁移为原生技能并安全退役旧文件，同时原地更新同一安装位置的过期托管 MCP 配置。没有既有托管文件时，启动不会首次安装；正文被改过或目标路径被用户占用时一律保留用户文件。「刷新状态」和分页打开时的读取只做诊断。
+- **不覆盖、不删除你写的文件。** 同名但内容不同的 `skills/dsh-taskbridge/SKILL.md` 或你手动编辑过的旧 `agents/dsh-taskbridge.toml` / `agents/dsh-delegate.toml` 都会被原样保留；只有与**某个已发布版本逐字节相同**（或命中本插件记录的所有权摘要）的托管文件才会被更新或删除。`config.toml` 里由插件写入的条目带托管标记注释；
   **没有该标记**的同名条目（即使 `command`/`args` 与插件要写的完全一致）同样视为你自己写的，
   安装、修复、移除都不会改动它，界面报告为冲突并说明原因。
 - **旧桌面命令只做受限迁移。** 带托管标记、当前包 `args` 和完整 env 结构的条目，若 command
@@ -401,34 +429,33 @@ Codex 支持一键安装集成。**「Codex 集成」**分页提供一个明确�
 
   若 DSH 使用非默认 `DSH_HOME`，条目里会额外固定 `env.DSH_DELEGATE_DISCOVERY_FILE`，
   让 MCP 进程找到同一份运行时发现文件。
-- **三种状态分开显示，互不代表。**「Codex 子智能体文件」「Codex MCP 条目」
+- **三种状态分开显示，互不代表。**「Codex 原生技能（skills/dsh-taskbridge/SKILL.md）」「Codex MCP 条目」
   「DSH 本机调用开关」各占一行；安装文件**不会**打开本机调用开关，开关关闭时
   `delegate_submit` 仍会被拒绝。
-- **安装后需要 Codex 重新载入。** 新开会话或重启 Codex 才会读到新的子智能体和 MCP 条目。
-  Codex 官方文档说明了[自定义子智能体](https://learn.chatgpt.com/docs/agent-configuration/subagents)和
-  [MCP 连接](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)；这些文档支持 agent 配置与
-  MCP 继承，但**没有**说明当前 Codex 桌面版/CLI 的输入框支持用 `@dsh-taskbridge` 选中该子智能体。
-  本插件因此**不宣称**任何 Codex 界面支持这种 `@` 直接调用，只保证子智能体文件与 MCP 工具存在，
-  由你通过 Codex 自身提供的选择方式指派它。
-- **触发规则写死在 agent 文件里**（见 `codex/dsh-taskbridge.toml`）：只有在父请求明确指派
-  （例如写出 `@dsh-taskbridge`、从智能体列表中选择它，或明确要求把该实现任务交给 DSH）时才派发；
+- **安装后需要 Codex 重新载入。** 新开会话或重启 Codex 才会读到新的原生技能和 MCP 条目。
+  1.9.0 起 Codex 不再依赖 `agents/dsh-taskbridge.toml` 子智能体，而是在当前会话直接加载
+  `skills/dsh-taskbridge/SKILL.md` 并调用 `delegate_submit` + 单链 `delegate_wait`（利用
+  `tool_timeout_sec = 3660` 静默长等），避免主会话套一层 `spawn_agent` + 短超时 `wait_agent`
+  反复空转轮询。
+- **触发规则写死在技能文件里**（见 `codex/skills/dsh-taskbridge/SKILL.md`）：只有在用户明确指派
+  （例如写出 `$dsh-taskbridge`、或明确要求把该实现/验证任务交给 DSH / TaskBridge）时才派发；
   仅仅在无关问题里提到 DSH / DeepSeek / 本插件**不是**派发请求。派发前先调用
   `delegate_status` 检查开关，再调用 `delegate_preflight` 读取工作区事实：干净仓库按插件设置里
   的 **worktree** 隔离派发；**脏仓库不会被自动降级**，指挥官根据任务和变更路径判断能否安全共享，
   并在派工前说明事实与理由；归属或风险不清时才暂停询问。决定共享后用 `allowShared: true` 再预检，
   并在提交任务时只覆盖 `{ isolation: "shared" }`；无法判断或其他原因导致 `block` 时停止并报告。
   派工说明里要带上工作区事实与隔离理由。provider / 模型 / 推理强度仍由插件设置决定（普通任务无默认总时长上限），
-  再通过 `delegate_wait` 静默等待**同一个**任务，把状态、实际 provider/model/effort、
-  变更文件、验证证据交回 Codex。子智能体不得为了“让预检通过”去提交、stash、清理或回滚工作区。
+  再由当前会话直接通过单条 `delegate_wait` 链静默等待**同一个**任务，并在交付后核对状态、实际
+  provider/model/effort、变更文件与验证证据。不得为了“让预检通过”去提交、stash、清理或回滚工作区。
   执行完成不等于验收：验收仍由 Codex 负责。
-  **跟进规则**同样写在 agent 文件里：只有属于同一个先前任务的修改/纠正/重试才带上最新的那个
+  **跟进规则**同样写在技能文件里：只有属于同一个先前任务的修改/纠正/重试才带上最新的那个
   任务 id 作为 `continueFromTaskId`；无关任务一律省略，省略即新开对话。隔离工作树的跟进任务
   保持父任务的原始授权路径，由插件恢复同一棵内部工作树。
 
 也可以用命令行执行同一套动作（脚本化 / CI 用，与设置页共用一份实现）：
 
 ```bash
-node bin/dsh-delegate-codex-agent.js install   # 安装/更新子智能体 + MCP 条目
+node bin/dsh-delegate-codex-agent.js install   # 安装/更新原生技能 + MCP 条目（并清理未修改旧子智能体）
 node bin/dsh-delegate-codex-agent.js status    # 只读诊断
 node bin/dsh-delegate-codex-agent.js repair    # 只修复 MCP 条目
 node bin/dsh-delegate-codex-agent.js remove    # 只删除插件托管项
@@ -437,7 +464,7 @@ node bin/dsh-delegate-codex-agent.js remove    # 只删除插件托管项
 退出码：`0` 完成，`2` 因冲突/拒绝而未改动，`1` 失败。
 
 已安装的托管 MCP 条目会在插件启动时**自动**原地补齐缺失的 `tool_timeout_sec`（入口脚本正好是
-本安装时）。入口路径已经指向旧安装的条目不会被启动自检改写：请用「安装 / 更新 TaskBridge 智能体」或
+本安装时）。入口路径已经指向旧安装的条目不会被启动自检改写：请用「安装 / 更新 TaskBridge 技能」或
 「仅修复 MCP 配置」显式采纳；仍存在的旧包须证明身份，已卸载的同级旧包按 1.3.2 的标准路径规则迁移。显式按钮仍然是
 未安装时唯一会创建条目的动作。
 
@@ -486,10 +513,9 @@ worker 请求把**某一次调用**的沙箱权限提升时，那次调用会暂
 - **绑定**：任务、Session、工具名、一次性 `requestId`、原生 `callId`，以及对**真实参数**的
   精确指纹。真实参数从 Session 日志的 `tool/call` 事件按 `callId` 读取，**不是** worker 自己
   写的理由；那段理由会作为「工作进程的说法」单独标注，不参与决定。
-- **不是授权扩张**：它不能创建或扩大任何账号/工作区/会话授权，不能修改设置、凭据、本机开关、
-  提供方、模型、推理强度或隔离方式，也不能预先批准后续调用。`allow-once` 只对那一次调用有效，
-  下一次提权要重新请求；会话的常规沙箱模式始终是 `workspace-write`。
-- **不是自动放行、不是第二个模型审查、不依赖人工点击**：决定者是当前的本机指挥官。
+- **不是授权扩张**：它不能创建或扩大任何账号/工作区/跨任务或长期会话授权，不能修改设置、凭据、本机开关、
+  提供方、模型、推理强度或隔离方式。会话的常规沙箱模式是 `workspace-write`。
+- **审批决定由本机指挥官逐次给出。** 每次 `allow-once` 仅放行附有本次参数指纹的这一次调用，即使后续调用的工具和参数完全相同，也须重新审批。
 - **允许的代价**：`allow-once` 必须同时满足——报出该请求的精确 `fingerprint`；发布的参数是
   **完整**的（`permission.pending.completeness` 为 `complete`，没有被任何上限截断）；决定时
   重新读取 Session 日志中同一位置的 `tool/call` 且内容逐字节一致；该调用所在回合仍然打开。
@@ -529,14 +555,14 @@ worker 请求把**某一次调用**的沙箱权限提升时，那次调用会暂
   详情里显示阶段、最近进展、当前工具与其耗时、无进展诊断；旧版本写的记录会如实显示
   “未采集到”，不会编造空闲时间。
 
-Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作：`heartbeat` 是内部心跳，
+Codex 托管规则（1.1.0–1.8.x 为子智能体文件，1.9.0 起升级为原生技能 `skills/dsh-taskbridge/SKILL.md`）按「提交 → `delegate_wait` 同一任务」运作：`heartbeat` 是内部心跳，
 不会送到模型；`attention` 是提问、默认继续等；`permission` 审查这一次调用后决定再继续等；
 `ready`/`failed`/`cancelled` 只读**一次**完整证据；`interrupted`/`wait-limit` 立刻重新等待
 同一任务。托管 MCP 条目会写入 `tool_timeout_sec = 3660`，让认这个字段的客户端允许一次默认
 60 分钟的等待跑完；客户端如果应用自己的默认工具超时（Codex 的历史默认是一分钟），仍可能提前
 结束等待，这是插件不能解除的客户端限制。
 
-升级后的操作：设置页 → Codex 集成 → **安装 / 更新 TaskBridge 智能体**，然后让 Codex 重新载入
+升级后的操作：设置页 → Codex 集成 → **安装 / 更新 TaskBridge 技能**，然后让 Codex 重新载入
 （新开会话或重启）。
 
 完整说明见 [`docs/silent-wait.md`](./docs/silent-wait.md)。
@@ -632,7 +658,7 @@ Codex 子智能体现在按「提交 → `delegate_wait` 同一任务」运作�
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-taskbridge-1.8.1.tgz
+dsh plugin --profile web add ./dsh-taskbridge-1.9.0.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings
@@ -676,40 +702,32 @@ dsh plugin --profile web remove dsh-taskbridge
 - **串行宿主下没有通用的“并发”承诺**：插件自己的 MCP 传输支持并发，但客户端一次只转发一个调用时，
   同一条连接仍会被长等待占住。可用的是独立控制程序（`dsh-delegate-control status|cancel <taskId>`），
   它只有这两个动作，也不能改变宿主的调度方式。
-- **逐次授权桥只决定一次调用**：`allow-once` 只对那一次原生工具调用有效，会话的常规沙箱模式
-  仍是 `workspace-write`；它不能创建或扩大任何账号/工作区/会话授权，不能改设置/凭据/开关/
-  提供方/模型/隔离，也不能预先批准后续调用。它是本机指挥官的决定，不是自动放行规则、不是
-  第二个模型审查、也不依赖人工点击。
+- **逐次授权桥只决定一次调用。** 本机指挥官通过 `allow-once` 核验并放行本次原生工具调用。
+  会话的常规沙箱模式是 `workspace-write`。授权桥不能创建或扩大账号、工作区、跨任务或长期授权，
+  不能改设置、凭据、开关、提供方、模型或隔离方式。
 - **Git 仓库前提**：无论是默认 `worktree` 隔离还是 `shared` 共享模式，都要求授权目标目录是已初始化且至少有 1 次 commit 的 Git 仓库根目录，否则预检会显式拒绝（`block`）。`shared` 模式不是隔离，界面会如实标注。
 - **交付与验收分开**：执行交付后等待宿主审查，由指挥端明确写回结论，
   任务页才显示“审查通过”或“需要修正”。
 - **Codex 集成的限制**：
   - 当前已支持 Codex 与 Antigravity 接入；Claude Code 与 Claude Desktop 接入预计在 2.0 上线。
-  - **不宣称**当前 Codex 桌面版/CLI 支持用 `@dsh-taskbridge` 在输入框直接选中该子智能体：
-    这取决于 Codex 版本自身是否提供提及选择，仓库内没有官方文档或运行时证据支持该说法。
-    插件只保证子智能体文件与 MCP 条目存在；安装后必须让 Codex 重新载入。
-  - 仅管理 `agents/dsh-taskbridge.toml` 与 `config.toml` 里的 `mcp_servers.dsh-delegate`
-    一项；不修改 Codex 的其他设置，不删除用户自己写的同名文件。所有权按内容证明：
-    MCP 条目必须有本插件的托管标记注释，agent 文件必须与当前模板或某个**已发布版本逐字节相同**，
-    否则一律视为你的文件并拒绝改动。
-  - 只做结构化的**最小行区间**编辑（不重排、不重写整个 `config.toml`，保留 CRLF 行尾）；
-    遇到无法定位的 TOML 语法时整体拒绝写入，而不是猜测。
-  - 首次安装 agent 文件使用排他创建：若文件在状态读取与写入之间被别的进程创建，
-    会报告冲突而不会覆盖。
-  - 启动自检只补齐**已安装、入口正好是本安装**且能证明属于本插件的托管 MCP 条目缺失的
-    `tool_timeout_sec`，不会在未安装时创建条目，也不会采纳同名非托管条目或用户改写过的条目；
-    入口路径指向旧安装时只会报告冲突，需用显式按钮在证明该路径是同一包的真实安装后才会被采纳。
-    正常的 Codex 根目录符号链接／Windows junction 会解析到真实目录后操作，并保留原链接；agents 子目录及最终文件的链接仍拒绝。备份目录继续按既有边界规则校验。
+  - 1.9.0 起 Codex 改为托管原生技能 `skills/dsh-taskbridge/SKILL.md`（支持通过 `$dsh-taskbridge` 或明确文字指派激活，单链直调 `delegate_wait`）与 `config.toml` 里的 `mcp_servers.dsh-delegate` 一项；安装或更新后须新开 Codex 会话或重启 Codex 载入。
+  - 自动安全退役未经用户修改的旧版子智能体 `agents/dsh-taskbridge.toml` 与 `agents/dsh-delegate.toml`；不修改 Codex 的其他设置，不删除用户自己编辑过的旧子智能体或自定义同名技能。所有权按内容哈希证明：MCP 条目必须有本插件的托管标记注释，技能/旧子智能体文件必须与当前模板、已登记历史版本或本机所有权记录**逐字节相同**（仅兼容 CRLF/LF 行尾拼写差异），否则一律视为你的文件并拒绝改动。
+  - 只做结构化的**最小行区间**编辑（不重排、不重写整个 `config.toml`，保留 CRLF 行尾）；遇到无法定位的 TOML 语法时整体拒绝写入，而不是猜测。
+  - 首次安装技能文件使用排他创建：若文件在状态读取与写入之间被别的进程创建，会报告冲突而不会覆盖。
+  - 启动自检只刷新未修改的旧版托管技能（及安全退役未修改旧子智能体）并补齐**已安装、入口正好是本安装**且能证明属于本插件的托管 MCP 条目缺失的 `tool_timeout_sec`，不会在未安装时创建条目，也不会采纳同名非托管条目或用户改写过的条目；入口路径指向旧安装时只会报告冲突，需用显式按钮在证明该路径是同一包的真实安装后才会被采纳。
+  - 正常的 Codex 根目录符号链接／Windows junction 会解析到真实目录后操作，并保留原链接；`skills/`、`skills/dsh-taskbridge/`、`agents/` 子目录及最终文件的链接仍拒绝。备份目录与所有权目录继续按既有边界规则校验。
   - 安装/修复不会打开本机调用开关；开关仍由操作者在第 4 节的位置单独控制。
 
 ## 10. 开发
 
 ```bash
-npm install          # 安装开发依赖（仅本仓库内）
-npm test             # node --test --test-concurrency=1 tests/*.test.js
-npm run check:client # scripts/build-client.mjs --check，校验 lib/client.js 与源码一致
-npm run build:client # 由 src/client/index.jsx 重建 lib/client.js
-npm run pack:dry     # npm pack --dry-run
+npm install                # 安装开发依赖（仅本仓库内）
+npm test                   # node --test --test-concurrency=1 tests/*.test.js
+npm run check:integrations # 校验三端技能/子智能体产物与 integrations/ 分层源文件一致
+npm run build:integrations # 由 integrations/core + integrations/adapters 重建三端产物
+npm run check:client       # scripts/build-client.mjs --check，校验 lib/client.js 与源码一致
+npm run build:client       # 由 src/client/index.jsx 重建 lib/client.js
+npm run pack:dry           # npm pack --dry-run
 ```
 
 `lib/client.js` 是构建产物，必须与源码一致；`--check` 会重建到临时目录并对比。

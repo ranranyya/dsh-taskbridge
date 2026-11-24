@@ -12,6 +12,7 @@
 // `~/.dsh` or installed profile is read or written.
 
 import test from 'node:test';
+import { readCodexRuleFiles } from './helpers/codex-rule-files.js';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
@@ -19,14 +20,20 @@ import {
   statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { AGENT_FILENAME, KNOWN_AGENT_TEMPLATES, digest, isKnownPriorTemplate, renderAgentFile } from '../src/codex/installer.js';
-import { digestLf, ownershipRecordPath, pluginDataDirectory, recallTemplateDigest } from '../src/codex/agent-ownership.js';
+import { SKILL_DIR_NAME, SKILL_FILENAME, KNOWN_AGENT_TEMPLATES, digest, isKnownPriorTemplate, renderAgentFile } from '../src/codex/installer.js';
+import {
+  digestLf,
+  ownershipRecordPath,
+  pluginDataDirectory,
+  recallSkillTemplateDigest,
+  skillOwnershipRecordPath,
+} from '../src/codex/agent-ownership.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const TEMPLATE = readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8');
+const TEMPLATE = readFileSync(join(ROOT, 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME), 'utf8');
 
 // Extracted from the actual 1.6.1 tarball. Test.5 and test.6 shipped the same
 // body; renderAgentFile stamps the respective package version at install time.
@@ -53,7 +60,7 @@ function scratch(label) {
  * @param {object} options - `root`, `label`, `body`, `version`.
  * @returns {{ dir: string, import: () => Promise<object> }} the release.
  */
-function productRelease({ root, label, body = null, version = '1.6.1', template = TEMPLATE }) {
+function productRelease({ root, label, body = null, version = '1.6.1', template = TEMPLATE, referenceSuffix = '' }) {
   const dir = join(root, label);
   for (const relative of [
     'src/codex/installer.js',
@@ -69,9 +76,14 @@ function productRelease({ root, label, body = null, version = '1.6.1', template 
     mkdirSync(dirname(target), { recursive: true });
     copyFileSync(join(ROOT, relative), target);
   }
-  const contents = body === null ? template : `${body}\n${template}`;
-  mkdirSync(join(dir, 'codex'), { recursive: true });
-  writeFileSync(join(dir, 'codex', 'dsh-taskbridge.toml'), contents, 'utf8');
+  const installDir = join(dir, 'codex', 'skills', SKILL_DIR_NAME);
+  mkdirSync(installDir, { recursive: true });
+  const { reference, referencePath } = readCodexRuleFiles();
+  const referenceText = reference + referenceSuffix;
+  const referenceName = `rules-reference-${digestLf(referenceText)}.md`;
+  const entry = template.replace(basename(referencePath), referenceName);
+  writeFileSync(join(installDir, SKILL_FILENAME), body === null ? entry : `${entry}\n${body}`, 'utf8');
+  writeFileSync(join(installDir, referenceName), referenceText, 'utf8');
   // The release's own version, so `renderAgentFile` stamps the same line a real build would.
   const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
   writeFileSync(join(dir, 'package.json'), `${JSON.stringify({ ...manifest, version }, null, 2)}\n`);
@@ -93,7 +105,7 @@ function productRelease({ root, label, body = null, version = '1.6.1', template 
           useDirectoryClassifier: installer.useDirectoryClassifier,
           createCodexSeam: seam.createCodexSeam,
           // The release's template text, so a test can state what it writes.
-          readAgentTemplate: () => readFileSync(join(dir, 'codex', 'dsh-taskbridge.toml'), 'utf8'),
+          readAgentTemplate: () => readFileSync(join(dir, 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME), 'utf8'),
         };
       }
       return loaded;
@@ -133,7 +145,7 @@ function codexHome(root) {
   return {
     home,
     dshHome,
-    agentPath: join(home, 'agents', AGENT_FILENAME),
+    agentPath: join(home, 'skills', SKILL_DIR_NAME, SKILL_FILENAME),
     configPath: join(home, 'config.toml'),
     env: { CODEX_HOME: home, DSH_HOME: dshHome, DSH_DELEGATE_DISCOVERY_FILE: '', DSH_DELEGATE_BASE_URL: '' },
   };
@@ -141,8 +153,8 @@ function codexHome(root) {
 
 /** Record paths a release would write for one home (the layout is identical in every release). */
 function recordsFor(home, env) {
-  const dir = join(pluginDataDirectory(env), 'codex-agent-ownership');
-  return { dir, path: ownershipRecordPath(home, env) };
+  const dir = join(pluginDataDirectory(env), 'codex-skill-ownership');
+  return { dir, path: skillOwnershipRecordPath(home, env) };
 }
 
 /** The digest stored in a record file, or null when there is none. */
@@ -154,14 +166,15 @@ function storedDigest(home, env) {
 
 /** A stable description of everything a status read must not change. */
 function snapshot(home, env) {
-  const agent = statSync(join(home, 'agents', AGENT_FILENAME), { throwIfNoEntry: false });
+  const skillDir = join(home, 'skills', SKILL_DIR_NAME);
+  const agent = statSync(join(skillDir, SKILL_FILENAME), { throwIfNoEntry: false });
   const { path } = recordsFor(home, env);
   const record = path === null ? null : statSync(path, { throwIfNoEntry: false });
   return {
     agentMtime: agent?.mtimeMs ?? null,
     recordMtime: record?.mtimeMs ?? null,
     digest: storedDigest(home, env),
-    files: readdirSync(join(home, 'agents')).sort(),
+    files: existsSync(skillDir) ? readdirSync(skillDir).sort() : [],
   };
 }
 
@@ -230,6 +243,8 @@ test('a status read records NOTHING, even when the file is the current release t
     // The file is written directly (no install), so there is nothing to prove yet.
     mkdirSync(dirname(home.agentPath), { recursive: true });
     writeFileSync(home.agentPath, renderAgentFile(TEMPLATE, '1.6.1-test.5'), 'utf8');
+    const { referencePath } = readCodexRuleFiles();
+    copyFileSync(referencePath, join(dirname(home.agentPath), basename(referencePath)));
     const status = await a.runCodexAction('status', { codexHome: home.home, env: home.env });
     assert.equal(status.status.agent.state, 'installed', 'the live template reads back installed');
     assert.equal(storedDigest(home.home, home.env), null, 'a read never creates the record');
@@ -276,7 +291,11 @@ test('release B updates an unlisted companion using its recorded ownership', asy
     assert.equal(aDigest, digestLf(renderAgentFile(await a.readAgentTemplate(), '9.8.0')));
 
     // B: a DIFFERENT template body, same DSH_HOME. Its own version is unenumerated too.
-    const b = await productRelease({ root: s.root, label: 'b', version: '9.9.0', body: '# the B release body\n' }).import();
+    const oldReference = readCodexRuleFiles(home.agentPath);
+    const b = await productRelease({
+      root: s.root, label: 'b', version: '9.9.0', body: '# the B release body\n',
+      referenceSuffix: '\nB reference rules\n',
+    }).import();
     const bTemplate = await b.readAgentTemplate();
     assert.notEqual(bTemplate, TEMPLATE);
     const aFile = readFileSync(home.agentPath, 'utf8');
@@ -293,7 +312,12 @@ test('release B updates an unlisted companion using its recorded ownership', asy
     const refreshed = await b.refreshKnownAgentTemplate({ codexHome: home.home, env: home.env });
     assert.deepEqual(refreshed.refused, []);
     assert.deepEqual(refreshed.changed, ['agent']);
-    assert.equal(readFileSync(home.agentPath, 'utf8'), renderAgentFile(bTemplate, '9.9.0'), 'B wrote its own template');
+    const updated = readCodexRuleFiles(home.agentPath);
+    assert.equal(updated.entry, renderAgentFile(bTemplate, '9.9.0'), 'B wrote its own template');
+    assert.notEqual(updated.referencePath, oldReference.referencePath);
+    assert.match(updated.reference, /B reference rules/u);
+    assert.equal(readFileSync(oldReference.referencePath, 'utf8'), oldReference.reference,
+      'sessions with the previous entry can still load its reference');
     assert.equal(storedDigest(home.home, home.env), digestLf(renderAgentFile(bTemplate, '9.9.0')),
       'and B recorded its own template, replacing A\'s');
     assert.notEqual(storedDigest(home.home, home.env), aDigest);
@@ -403,7 +427,7 @@ test('a record reached through a linked ancestor is ignored, and the read create
       return; // A platform that cannot create one has nothing to prove here.
     }
     const linkedEnv = { ...home.env, DSH_HOME: link };
-    const digestSeen = await recallTemplateDigest({
+    const digestSeen = await recallSkillTemplateDigest({
       codexHome: home.home,
       env: linkedEnv,
       classify: async (path) => {
@@ -426,9 +450,9 @@ test('a record reached through a linked ancestor is ignored, and the read create
 // ---------------------------------------------------------------------------
 
 for (const [label, mutate] of [
-  ['an added comment', (text) => `# my own note\n${text}`],
-  ['a changed body character', (text) => text.replace('name = "dsh-taskbridge"', 'name = "dsh-taskbridgE"')],
-  ['only the version line', (text) => text.replace(/^version = ".*"$/mu, 'version = "0.9.0"')],
+  ['an added comment', (text) => `${text}\n<!-- my own note -->\n`],
+  ['a changed body character', (text) => text.replace('name: dsh-taskbridge', 'name: dsh-taskbridgE')],
+  ['only the version line', (text) => text.replace(/^<!-- dsh-taskbridge-version: .* -->$/mu, '<!-- dsh-taskbridge-version: 0.9.0 -->')],
 ]) {
   test(`a recorded release template customised with ${label} is preserved byte-identically`, async () => {
     const s = scratch('user-edit');
@@ -501,10 +525,10 @@ test('an unusable DSH_HOME or a damaged record is simply no record', async () =>
     ];
     for (const [label, contents] of crafted) {
       writeFileSync(path, contents, 'utf8');
-      assert.equal(await recallTemplateDigest({ codexHome: home.home, env: home.env, classify: (p) => (existsSync(p) ? 'directory' : 'missing') }), null, `${label}: no record`);
+      assert.equal(await recallSkillTemplateDigest({ codexHome: home.home, env: home.env, classify: (p) => (existsSync(p) ? 'directory' : 'missing') }), null, `${label}: no record`);
     }
     writeFileSync(path, original, 'utf8');
-    assert.notEqual(await recallTemplateDigest({
+    assert.notEqual(await recallSkillTemplateDigest({
       codexHome: home.home, env: home.env,
       classify: async (p) => {
         const info = lstatSync(p, { throwIfNoEntry: false });

@@ -234,7 +234,7 @@ function sequenceRequests() {
 test('waitAfterDecision is an OPTIONAL boolean, and the historical argument set is unchanged', () => {
   const tool = TOOLS.find((entry) => entry.name === 'delegate_permission_decide');
   assert.deepEqual(Object.keys(tool.inputSchema.properties), [
-    'taskId', 'requestId', 'decision', 'reason', 'fingerprint', 'waitAfterDecision',
+    'taskId', 'requestId', 'decision', 'reason', 'fingerprint', 'scope', 'waitAfterDecision',
   ]);
   const field = tool.inputSchema.properties.waitAfterDecision;
   assert.equal(field.type, 'boolean', 'a model that sends "true" must be refused, not coerced');
@@ -1447,8 +1447,9 @@ test('the worker prompt states how to read logs, run tests and ask for extra per
   assert.match(flat, /Ask for extra permission only for the one complete, bounded command that genuinely needs it/u);
   assert.match(flat, /A permission granted for one call never covers a later call/u);
   assert.match(flat, /never widens the sandbox permanently/u);
-  // One combined command with a saved log; a filter change is not a reason to re-run.
-  assert.match(flat, /Run one combined test command, save its FULL stdout\/stderr, its real exit code/u);
+  // One combined command without creating workspace temp logs; a filter change is not a reason to re-run.
+  assert.match(flat, /Run one combined test command/u);
+  assert.match(flat, /Do NOT create `\.cache\/` or temporary log files inside the workspace/u);
   assert.match(flat, /Do not re-run a test merely to change a filter/u);
   assert.match(flat, /`Select-String` pattern or a `Select-Object -First N`/u);
   // A missing dependency is verified, never papered over with access.

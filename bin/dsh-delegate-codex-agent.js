@@ -66,10 +66,14 @@ export async function manageCodexAgent(action, { codexHome = resolveCodexHome(),
  */
 function render(outcome) {
   const { status } = outcome;
+  const skill = status.skill ?? status.agent;
+  const entryLine = status.mcp.desired
+    ? `entry ${status.mcp.desired.command} ${status.mcp.desired.args.join(' ')}`
+    : 'entry (unresolved: no provable Node.js runtime)';
   const lines = [
-    `agent ${status.agent.state}: ${status.agent.path}`,
+    `skill ${skill.state}: ${skill.path}`,
     `mcp   ${status.mcp.state}: ${status.mcp.path}`,
-    `entry ${status.mcp.desired.command} ${status.mcp.desired.args.join(' ')}`,
+    entryLine,
     `ready ${status.ready === true ? 'yes' : 'no'} (the DSH switch is not changed by this command)`,
   ];
   for (const entry of outcome.changed) lines.push(`changed: ${entry}`);
@@ -82,8 +86,9 @@ function printHelp() {
   process.stdout.write([
     'Usage: dsh-delegate-codex-agent <install|status|repair|remove>',
     'Uses CODEX_HOME when set; otherwise uses ~/.codex.',
-    'install/repair write agents/dsh-taskbridge.toml and register mcp_servers.dsh-delegate in config.toml.',
-    'remove deletes only files this plugin still owns; a modified file is left untouched.',
+    'install writes skills/dsh-taskbridge/SKILL.md, safely retires untouched legacy agents/dsh-taskbridge.toml, and registers mcp_servers.dsh-delegate in config.toml.',
+    'repair updates only mcp_servers.dsh-delegate in config.toml without touching skill or agent files.',
+    'remove deletes only files this plugin still owns; any user-modified file is left untouched.',
     'Never enables the DSH local-call switch and never edits unrelated Codex settings.',
   ].join('\n') + '\n');
 }

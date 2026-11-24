@@ -187,11 +187,22 @@ test('agent installed, MCP configured and the DSH switch are three independent r
 });
 
 test('an outcome is rendered from what changed and what was refused, not from optimism', () => {
-  assert.match(describeCodexOutcome({ action: 'install', changed: ['agent', 'mcp'], refused: [] }), /已写入：子智能体文件、MCP 条目/u);
+  assert.match(describeCodexOutcome({ action: 'install', changed: ['agent', 'mcp'], refused: [] }), /已写入：技能文件（SKILL\.md）、MCP 条目/u);
   assert.match(
     describeCodexOutcome({ action: 'install', changed: ['mcp'], refused: [{ target: 'agent', code: 'AGENT_USER_MODIFIED' }] }),
-    /未改动：子智能体文件/u,
+    /未改动：技能文件（SKILL\.md）/u,
   );
+  // U2: remove reports 已移除 (never 已写入), and retiring legacyAgent beside a user-modified skill never contradicts itself.
+  const removed = describeCodexOutcome({ action: 'remove', changed: ['agent', 'mcp'], refused: [] });
+  assert.match(removed, /已移除：技能文件（SKILL\.md）、MCP 条目/u);
+  assert.doesNotMatch(removed, /已写入/u);
+  const mixed = describeCodexOutcome({
+    action: 'install',
+    changed: ['legacyAgent'],
+    refused: [{ target: 'agent', code: 'AGENT_USER_MODIFIED' }],
+  });
+  assert.match(mixed, /已清理：旧版子智能体文件；未改动：技能文件（SKILL\.md）/u);
+  assert.doesNotMatch(mixed, /已写入：技能文件/u);
   assert.match(describeCodexOutcome({ action: 'remove', changed: [], refused: [] }), /没有需要移除/u);
   assert.match(describeCodexOutcome({ action: 'install', changed: [], refused: [] }), /已是最新/u);
   assert.equal(describeCodexOutcome(null), '');
@@ -202,8 +213,8 @@ test('an outcome is rendered from what changed and what was refused, not from op
 // ---------------------------------------------------------------------------
 
 test('the built page carries the Codex panel, one explicit button per action', () => {
-  assert.match(BUNDLE, /Codex 集成（子智能体 \+ MCP）/u);
-  assert.match(BUNDLE, /安装 \/ 更新 TaskBridge 智能体/u);
+  assert.match(BUNDLE, /Codex 集成（技能 Skill \+ MCP）/u);
+  assert.match(BUNDLE, /安装 \/ 更新 TaskBridge 技能/u);
   assert.match(BUNDLE, /仅修复 MCP 配置/u);
   assert.match(BUNDLE, /移除插件托管项/u);
   assert.match(BUNDLE, /刷新状态/u);
@@ -221,20 +232,15 @@ test('the built page carries the Codex panel, one explicit button per action', (
 
 test('the page states the reload requirement, the limits, and that it never enables the switch', () => {
   assert.match(PAGE_SOURCE, /新开会话或重启 Codex/u);
-  // The `@` claim is stated as *not* made: the page must say the Codex surface
-  // decides whether a mention selects the agent, and must not promise it.
-  assert.match(PAGE_SOURCE, /不宣称当前 Codex 桌面版\/CLI 能在输入框用 @dsh-taskbridge 直接选中/u);
-  assert.match(PAGE_SOURCE, /取决于 Codex 版本自身是否提供提及选择/u);
+  assert.match(PAGE_SOURCE, /skills\/dsh-taskbridge\/SKILL\.md/u);
+  assert.match(PAGE_SOURCE, /不再派生子智能体并做 wait_agent 短轮询/u);
   assert.doesNotMatch(PAGE_SOURCE, /支持在输入框直接输入 @dsh-taskbridge/u, 'the old claim must be gone');
   assert.match(PAGE_SOURCE, /不会替你打开该开关/u);
-  // The page states the truth about writes: the FIRST installation is only ever a click,
-  // and an already-installed managed entry is upgraded in place at the next startup. The
-  // old sentence ("only a click writes / installing the plugin never changes Codex")
-  // contradicted the startup upgrade and must be gone.
   assert.match(PAGE_SOURCE, /首次安装只会由你点击触发/u);
-  assert.match(PAGE_SOURCE, /不会自动创建子智能体文件或 MCP 条目/u);
-  assert.match(PAGE_SOURCE, /插件下次启动会把本插件自己写入的过期托管条目就地更新/u);
-  assert.match(PAGE_SOURCE, /不会改写非托管、被你改过的条目/u);
+  assert.match(PAGE_SOURCE, /不会自动创建技能文件或 MCP 条目/u);
+  assert.match(PAGE_SOURCE, /安全移除旧文件/u);
+  assert.match(PAGE_SOURCE, /全套 11 个 delegate_\* 工具/u);
+  assert.match(PAGE_SOURCE, /不触碰非托管条目/u);
   assert.doesNotMatch(PAGE_SOURCE, /只有你点击才会写文件/u, 'the unconditional claim must be gone');
   assert.doesNotMatch(PAGE_SOURCE, /打开本页或安装插件都不会改动 Codex/u, 'the contradicting claim must be gone');
   assert.match(PAGE_SOURCE, /没有本插件托管标记注释的同名 MCP 条目也视为你自己写的/u);

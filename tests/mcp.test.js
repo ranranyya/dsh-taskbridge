@@ -129,7 +129,7 @@ test('the MCP surface exposes exactly eleven bounded tools and no control-plane 
   assert.ok(decide !== undefined);
   assert.deepEqual(
     Object.keys(decide.inputSchema.properties).sort(),
-    ['decision', 'fingerprint', 'reason', 'requestId', 'taskId', 'waitAfterDecision'],
+    ['decision', 'fingerprint', 'reason', 'requestId', 'scope', 'taskId', 'waitAfterDecision'],
   );
   assert.equal(decide.inputSchema.properties.waitAfterDecision.type, 'boolean');
   assert.deepEqual(decide.inputSchema.properties.decision.enum, ['allow-once', 'reject']);

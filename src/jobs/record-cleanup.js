@@ -97,6 +97,7 @@ function cleanupContext(engine, archived, plans) {
   const tasks = new Map([...archivedById, ...liveById]);
   const continuations = new Map();
   const taskChildren = new Map();
+  const liveReuseChildren = new Map();
   const planParents = new Set(plans.map((node) => node.parentNodeId));
   const remember = (map, parent, child) => {
     if (typeof parent !== 'string' || parent === '' || parent === child) return;
@@ -108,10 +109,15 @@ function cleanupContext(engine, archived, plans) {
     remember(taskChildren, row.parentNodeId, row.taskId);
     remember(taskChildren, row.planNodeId, row.taskId);
   }
+  for (const row of tasks.values()) {
+    if (!FINISHED.has(row.state)) {
+      remember(liveReuseChildren, row.reuseWorktreeFromTaskId, row.taskId);
+    }
+  }
   const tree = buildTaskTree({ planNodes: plans, tasks: [...tasks.values()] });
   const byChain = new Map();
   for (const root of tree.roots) collectChains(root, byChain);
-  return { byChain, liveById, archivedById, continuations, taskChildren, planParents, engine };
+  return { byChain, liveById, archivedById, continuations, taskChildren, liveReuseChildren, planParents, engine };
 }
 
 function blockersFor(chain, context) {
@@ -130,6 +136,9 @@ function blockersFor(chain, context) {
       if (!members.has(child)) blockers.add(CLEANUP_CODES.nextRound);
     }
     for (const child of context.taskChildren.get(taskId) ?? []) {
+      if (!members.has(child)) blockers.add(CLEANUP_CODES.hierarchyChildren);
+    }
+    for (const child of context.liveReuseChildren.get(taskId) ?? []) {
       if (!members.has(child)) blockers.add(CLEANUP_CODES.hierarchyChildren);
     }
     if (context.planParents.has(taskId)) blockers.add(CLEANUP_CODES.planChildren);
@@ -348,6 +357,44 @@ async function tryDeleteHostWorkspace(deps, workspaceId) {
   return false;
 }
 
+function collectReservedReuseRefs(rows, knownRowsById, sessionByTask, engine) {
+  const paths = [];
+  const sessionIds = [];
+  const workspaceIds = [];
+  const upstreamTaskIds = new Set();
+  if (typeof engine?.reservedWorktreePathsForCleanup === 'function') {
+    for (const candidate of engine.reservedWorktreePathsForCleanup()) {
+      if (typeof candidate === 'string' && candidate.trim() !== '') paths.push(candidate.trim());
+    }
+  }
+  if (typeof engine?.reservedContinuationRefsForCleanup === 'function') {
+    const refs = engine.reservedContinuationRefsForCleanup();
+    for (const id of Array.isArray(refs?.sessionIds) ? refs.sessionIds : []) {
+      if (typeof id === 'string' && id.trim() !== '') sessionIds.push(id.trim());
+    }
+    for (const id of Array.isArray(refs?.workspaceIds) ? refs.workspaceIds : []) {
+      if (typeof id === 'string' && id.trim() !== '') workspaceIds.push(id.trim());
+    }
+  }
+  for (const row of rows) {
+    if (FINISHED.has(row?.state)) continue;
+    const reuseId = firstNonEmpty(row?.reuseWorktreeFromTaskId);
+    const contId = firstNonEmpty(row?.continueFromTaskId);
+    const upstreamId = firstNonEmpty(reuseId, contId);
+    if (upstreamId === null) continue;
+    upstreamTaskIds.add(upstreamId);
+    const upstreamFacts = extractTaskFacts(knownRowsById.get(upstreamId) ?? null, sessionByTask.get(upstreamId) ?? null);
+    if (upstreamFacts.executionPath !== null) {
+      const execKey = sessionPathKey(upstreamFacts.executionPath);
+      const sourceKey = sessionPathKey(upstreamFacts.sourcePath);
+      if (execKey !== null && execKey !== sourceKey) paths.push(upstreamFacts.executionPath);
+    }
+    if (upstreamFacts.workspaceId !== null) workspaceIds.push(upstreamFacts.workspaceId);
+    if (contId !== null && upstreamFacts.sessionId !== null) sessionIds.push(upstreamFacts.sessionId);
+  }
+  return { paths, sessionIds, workspaceIds, upstreamTaskIds };
+}
+
 async function performLinkedCleanup(deps, { options, deletedTaskIds, deletedRows, remainingRows, plans }) {
   const deletedSet = new Set(deletedTaskIds);
   let sessionRows = [];
@@ -359,6 +406,11 @@ async function performLinkedCleanup(deps, { options, deletedTaskIds, deletedRows
     }
   }
   const sessionByTask = new Map(sessionRows.map((row) => [row.taskId, row]));
+  const knownRowsById = new Map(
+    [...deletedRows, ...remainingRows]
+      .filter((row) => typeof row?.taskId === 'string' && row.taskId !== '')
+      .map((row) => [row.taskId, row]),
+  );
 
   const activeSessionIds = new Set();
   const activeWorkspaceIds = new Set();
@@ -369,6 +421,13 @@ async function performLinkedCleanup(deps, { options, deletedTaskIds, deletedRows
     if (facts.workspaceId !== null) activeWorkspaceIds.add(facts.workspaceId);
     const execKey = sessionPathKey(facts.executionPath);
     if (execKey !== null) activeExecKeys.add(execKey);
+  }
+  const reservedLinked = collectReservedReuseRefs(remainingRows, knownRowsById, sessionByTask, deps?.engine);
+  for (const sid of reservedLinked.sessionIds) activeSessionIds.add(sid);
+  for (const wid of reservedLinked.workspaceIds) activeWorkspaceIds.add(wid);
+  for (const reservedPath of reservedLinked.paths) {
+    const reservedKey = sessionPathKey(reservedPath);
+    if (reservedKey !== null) activeExecKeys.add(reservedKey);
   }
 
   const deletedFacts = deletedTaskIds.map((taskId) => {
@@ -527,6 +586,11 @@ export async function runOrphanCleanup(deps, body) {
   const activeExecPaths = [];
   const knownSourcePaths = new Set();
 
+  const knownRowsById = new Map(
+    allExisting
+      .filter((row) => typeof row?.taskId === 'string' && row.taskId !== '')
+      .map((row) => [row.taskId, row]),
+  );
   for (const row of allExisting) {
     const facts = extractTaskFacts(row, sessionByTask.get(row.taskId));
     if (facts.sessionId !== null) activeSessionIds.add(facts.sessionId);
@@ -538,8 +602,18 @@ export async function runOrphanCleanup(deps, body) {
       if (key !== null) activeExecKeys.add(key);
     }
   }
+  const reservedOrphan = collectReservedReuseRefs(allExisting, knownRowsById, sessionByTask, deps?.engine);
+  for (const sid of reservedOrphan.sessionIds) activeSessionIds.add(sid);
+  for (const wid of reservedOrphan.workspaceIds) activeWorkspaceIds.add(wid);
+  for (const reservedPath of reservedOrphan.paths) {
+    activeExecPaths.push(reservedPath);
+    const key = sessionPathKey(reservedPath);
+    if (key !== null) activeExecKeys.add(key);
+  }
 
-  const orphanRows = sessionRows.filter((row) => typeof row?.taskId === 'string' && !existingTaskIds.has(row.taskId));
+  const orphanRows = sessionRows.filter(
+    (row) => typeof row?.taskId === 'string' && !existingTaskIds.has(row.taskId) && !reservedOrphan.upstreamTaskIds.has(row.taskId),
+  );
   const orphanTaskIds = orphanRows.map((row) => row.taskId);
 
   const archivedSessionIds = [];

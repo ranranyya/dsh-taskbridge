@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CODEX_ACTIONS, ROUTES, createStore, defaultDraft, documentFromDraft, draftFromSettings, exportDocument, formatDuration, hasLiveTasks, isLiveTask, minutesToSeconds, monitoringDraftOf, monitoringOf, monitoringText, precheckDraft, precheckMonitoring, previewEffective, secondsToMinutes, taskActivity, taskProgress } from '../src/client/api.js';
+import { ApiError, CODEX_ACTIONS, ROUTES, createStore, defaultDraft, documentFromDraft, draftFromSettings, exportDocument, formatDuration, hasLiveTasks, isLiveTask, minutesToSeconds, monitoringDraftOf, monitoringOf, monitoringText, precheckDraft, precheckMonitoring, previewEffective, secondsToMinutes, taskActivity, taskProgress } from '../src/client/api.js';
 import {
   CONVERSATION_LABELS,
   CONVERSATION_MODES,
@@ -586,4 +586,116 @@ test('a refresh in flight suppresses a second one instead of overlapping', async
   assert.equal(listCalls, 1, 'the overlapping call never reached the host');
   resolveList({ ok: true, tasks: [] });
   await first;
+});
+
+test('init() retries transient startup 404s cleanly without stacking error banners', async () => {
+  let statusAttempts = 0;
+  let settingsCalls = 0;
+  let nativeCalls = 0;
+  let taskCalls = 0;
+  const store = createStore({
+    initRetryDelaysMs: [1, 1, 1],
+    api: {
+      async getStatus() {
+        statusAttempts += 1;
+        if (statusAttempts < 3) {
+          throw new ApiError('HTTP_404', 'the settings service answered HTTP 404', { status: 404 });
+        }
+        return { ok: true, delegation: { authorized: true, mode: 'switch' } };
+      },
+      async getSettings() {
+        settingsCalls += 1;
+        return { ok: true, settings: { delegationEnabled: true, providers: [] } };
+      },
+      async getNativeProviders() {
+        nativeCalls += 1;
+        return { ok: true, providers: [] };
+      },
+      async listTasks() {
+        taskCalls += 1;
+        return { ok: true, tasks: [] };
+      },
+      async getCodexStatus() { return { ok: true, codex: null }; },
+      async getAntigravityStatus() { return { ok: true, antigravity: null }; },
+      async getCatalog() { return { ok: true, catalog: [], effective: null }; },
+    },
+  });
+
+  await store.init();
+  const snap = store.getSnapshot();
+  assert.equal(statusAttempts, 3, 'retried /status until backend routes registered');
+  assert.equal(settingsCalls, 1);
+  assert.equal(nativeCalls, 1);
+  assert.equal(taskCalls, 1);
+  assert.equal(snap.status.delegation.authorized, true);
+  assert.equal(snap.notices.length, 0, 'transient startup info banner dismissed and zero 404 error notices emitted');
+  assert.equal(snap.nativeProvidersError, null);
+  assert.equal(snap.tasksError, null);
+});
+
+test('init() surfaces a single deduplicated error after retries exhaust and clears it on recovery', async () => {
+  let fail = true;
+  const store = createStore({
+    initRetryDelaysMs: [1, 1],
+    api: {
+      async getStatus() {
+        if (fail) throw new ApiError('HTTP_404', 'the settings service answered HTTP 404', { status: 404 });
+        return { ok: true, delegation: { authorized: false, mode: 'switch' } };
+      },
+      async getSettings() { return { ok: true, settings: { delegationEnabled: false, providers: [] } }; },
+      async getNativeProviders() { return { ok: true, providers: [] }; },
+      async listTasks() { return { ok: true, tasks: [] }; },
+      async getCodexStatus() { return { ok: true, codex: null }; },
+      async getAntigravityStatus() { return { ok: true, antigravity: null }; },
+      async getCatalog() { return { ok: true, catalog: [], effective: null }; },
+    },
+  });
+
+  await store.init();
+  const failedSnap = store.getSnapshot();
+  const errors = failedSnap.notices.filter((n) => n.level === 'error');
+  assert.equal(errors.length, 1, 'exhausted startup retries emit exactly one error banner, not four');
+  assert.match(errors[0].text, /404/u);
+
+  // Explicit duplicate notify calls also collapse into one notice.
+  store.notify('error', errors[0].text);
+  store.notify('error', errors[0].text);
+  assert.equal(store.getSnapshot().notices.filter((n) => n.level === 'error').length, 1);
+
+  fail = false;
+  await store.init();
+  const recoveredSnap = store.getSnapshot();
+  assert.equal(recoveredSnap.notices.filter((n) => n.level === 'error').length, 0, 'recovery clears stale startup error');
+  assert.equal(recoveredSnap.nativeProvidersError, null);
+});
+
+test('dispose() cancels an in-flight init() startup retry cleanly', async () => {
+  let statusCalls = 0;
+  let scheduledFn = null;
+  let cancelled = false;
+  const store = createStore({
+    initRetryDelaysMs: [5000],
+    schedule(fn) {
+      scheduledFn = fn;
+      return 'timer-1';
+    },
+    cancelSchedule(handle) {
+      if (handle === 'timer-1') cancelled = true;
+    },
+    api: {
+      async getStatus() {
+        statusCalls += 1;
+        throw new ApiError('HTTP_404', 'the settings service answered HTTP 404', { status: 404 });
+      },
+    },
+  });
+
+  const pending = store.init();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(statusCalls, 1);
+  assert.equal(typeof scheduledFn, 'function');
+  store.dispose();
+  await pending;
+  assert.equal(cancelled, true, 'dispose cancels the retry timer');
+  assert.equal(statusCalls, 1, 'no post-dispose retry request fires');
 });

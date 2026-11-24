@@ -884,7 +884,7 @@ export const CODEX_ACTIONS = Object.freeze(['install', 'repair', 'remove']);
  * configured, and both can be ready while the local-call switch is still off.
  */
 export const CODEX_TARGETS = Object.freeze([
-  { key: 'agent', label: 'Codex 子智能体文件' },
+  { key: 'agent', label: 'Codex 原生技能（skills/dsh-taskbridge/SKILL.md）' },
   { key: 'mcp', label: 'Codex MCP 条目' },
   { key: 'switch', label: 'DSH 本机调用开关' },
 ]);
@@ -925,7 +925,7 @@ export function codexTargetView(codex, switchState, target) {
         : '已关闭：Codex 可以查询状态，但新任务会被拒绝；本页不会替你打开它。',
     };
   }
-  const block = target === 'agent' ? codex?.agent : codex?.mcp;
+  const block = target === 'agent' ? (codex?.skill ?? codex?.agent) : codex?.mcp;
   if (block === null || block === undefined || typeof block !== 'object') {
     return { key: target, label, state: 'unknown', tone: 'off', detail: '宿主尚未回报该状态。' };
   }
@@ -961,11 +961,18 @@ export function codexTargetView(codex, switchState, target) {
  */
 export function describeCodexOutcome(outcome) {
   if (outcome === null || outcome === undefined) return '';
-  const names = { agent: '子智能体文件', mcp: 'MCP 条目' };
-  const changed = Array.isArray(outcome.changed) ? outcome.changed.map((key) => names[key] ?? key) : [];
+  const names = { agent: '技能文件（SKILL.md）', legacyAgent: '旧版子智能体文件', mcp: 'MCP 条目' };
+  const rawChanged = Array.isArray(outcome.changed) ? outcome.changed : [];
   const refused = Array.isArray(outcome.refused) ? outcome.refused : [];
   const parts = [];
-  if (changed.length > 0) parts.push(`已写入：${changed.join('、')}`);
+  if (outcome.action === 'remove') {
+    if (rawChanged.length > 0) parts.push(`已移除：${rawChanged.map((key) => names[key] ?? key).join('、')}`);
+  } else {
+    const written = rawChanged.filter((key) => key !== 'legacyAgent').map((key) => names[key] ?? key);
+    const cleaned = rawChanged.filter((key) => key === 'legacyAgent').map((key) => names[key] ?? key);
+    if (written.length > 0) parts.push(`已写入：${written.join('、')}`);
+    if (cleaned.length > 0) parts.push(`已清理：${cleaned.join('、')}`);
+  }
   if (refused.length > 0) parts.push(`未改动：${refused.map((entry) => names[entry?.target] ?? entry?.target ?? '未知').join('、')}`);
   if (parts.length === 0) {
     return outcome.action === 'remove' ? '没有需要移除的插件托管文件。' : '已是最新，没有需要写入的内容。';
@@ -2570,6 +2577,16 @@ export function planCreateRequest(draft) {
  * @param {object} options - `api` transport, `now` clock.
  * @returns {object} store with `subscribe`, `getSnapshot` and action methods.
  */
+/** Backoff schedule (ms) when `init()` hits a startup 404 right after "Enable immediately". */
+const DEFAULT_INIT_RETRY_DELAYS_MS = Object.freeze([250, 500, 1000, 1500, 2000, 2500, 3000]);
+
+/** Whether an error indicates the plugin backend HTTP routes have not mounted yet. */
+function isStartupRoutePendingError(error) {
+  return error?.code === 'HTTP_404'
+    || error?.code === 'USER_PLANE_UNKNOWN_ROUTE'
+    || error?.code === 'USER_PLANE_UNREACHABLE';
+}
+
 export function createStore(options = {}) {
   const api = options.api ?? createApi();
   // The task-record cleanup projection. It is injected rather than imported so this
@@ -2583,6 +2600,9 @@ export function createStore(options = {}) {
   const saveDebounceMs = Number.isFinite(options.saveDebounceMs) && options.saveDebounceMs >= 0
     ? Math.trunc(options.saveDebounceMs)
     : 700;
+  const initRetryDelaysMs = Array.isArray(options.initRetryDelaysMs)
+    ? options.initRetryDelaysMs.filter((ms) => Number.isFinite(ms) && ms >= 0).map((ms) => Math.trunc(ms))
+    : DEFAULT_INIT_RETRY_DELAYS_MS;
   const scheduleImpl = typeof options.schedule === 'function'
     ? options.schedule
     : (fn, ms) => setTimeout(fn, ms);
@@ -2604,6 +2624,13 @@ export function createStore(options = {}) {
   let saveTimer = null;
   /** Explicit discard marker: the next debounce tick must not resurrect edits. */
   let saveSuppressed = false;
+  /** Coalesced in-flight `init()` promise so remounting while bootstrapping never overlaps. */
+  let initInFlight = null;
+  /** Pending startup retry timer handle and canceller for `dispose()`. */
+  let initRetryTimer = null;
+  let cancelInitRetryWait = null;
+  /** Last startup-failure notice emitted by `init()`, cleared automatically on recovery. */
+  let initErrorNoticeId = null;
   /**
    * Sequence of `openTask` calls. A detail read may only publish its answer if no
    * NEWER read started meanwhile, so a slow response for an old row cannot replace the
@@ -2710,12 +2737,15 @@ export function createStore(options = {}) {
   }
 
   /**
-   * Append one operator-facing message.
+   * Append one operator-facing message, deduplicating identical live notices so
+   * parallel transient failures never stack repeated identical banners.
    * @param {'info'|'error'|'success'} level - severity.
    * @param {string} text - Chinese text.
    * @returns {number} notice id.
    */
   function notify(level, text) {
+    const existing = state.notices.find((notice) => notice.level === level && notice.text === text);
+    if (existing !== undefined) return existing.id;
     const id = state.revision + 1 + Math.random();
     patch({ notices: [...state.notices, { id, level, text }].slice(-6) });
     return id;
@@ -2723,6 +2753,31 @@ export function createStore(options = {}) {
 
   function dismissNotice(id) {
     patch({ notices: state.notices.filter((notice) => notice.id !== id) });
+  }
+
+  /** Wait `ms` before retrying startup readiness; resolves `false` if disposed meanwhile. */
+  function waitForInitRetry(ms) {
+    return new Promise((resolve) => {
+      if (disposed) {
+        resolve(false);
+        return;
+      }
+      let settled = false;
+      const finish = (keepGoing) => {
+        if (settled) return;
+        settled = true;
+        initRetryTimer = null;
+        cancelInitRetryWait = null;
+        resolve(keepGoing);
+      };
+      cancelInitRetryWait = () => {
+        if (initRetryTimer !== null) {
+          try { cancelScheduleImpl(initRetryTimer); } catch { /* ignore */ }
+        }
+        finish(false);
+      };
+      initRetryTimer = scheduleImpl(() => finish(!disposed), Math.max(0, ms));
+    });
   }
 
   async function track(key, work) {
@@ -3868,20 +3923,87 @@ export function createStore(options = {}) {
       });
     },
 
-    /** Load everything the page needs; the catalog is loaded but not awaited. */
+    /**
+     * Load everything the page needs; tolerates the short cold-start window right after
+     * "Enable immediately" when the frontend mounts before backend HTTP routes finish
+     * registering, retrying `/status` silently instead of stacking 404 banners.
+     */
     async init() {
-      await Promise.all([store.refreshStatus(), store.loadSettings(), store.loadNativeProviders(), store.loadTasks()]);
-      // Diagnostic read only. `init` must never perform a Codex write: installing
-      // files is an explicit operator action, not a side effect of opening a page.
-      void store.refreshCodexStatus();
-      void store.refreshAntigravityStatus();
-      void store.loadCatalog();
+      if (disposed) return;
+      if (initInFlight !== null) return await initInFlight;
+      const run = (async () => {
+        let startupNoticeId = null;
+        let statusOutcome = null;
+        let statusReady = false;
+        let lastStartupError = null;
+
+        for (let attempt = 0; attempt <= initRetryDelaysMs.length; attempt += 1) {
+          if (disposed) return;
+          statusOutcome = await track('status', async () => {
+            try {
+              const body = await api.getStatus();
+              patch({ status: body });
+              return { ok: true, body };
+            } catch (error) {
+              return { ok: false, error };
+            }
+          });
+          if (statusOutcome.ok) {
+            statusReady = true;
+            break;
+          }
+          if (!isStartupRoutePendingError(statusOutcome.error) || attempt === initRetryDelaysMs.length) {
+            lastStartupError = statusOutcome.error;
+            break;
+          }
+          if (startupNoticeId === null) {
+            startupNoticeId = notify('info', '插件服务正在启动，正在自动重试连接…');
+          }
+          const keepGoing = await waitForInitRetry(initRetryDelaysMs[attempt]);
+          if (!keepGoing || disposed) return;
+        }
+
+        if (startupNoticeId !== null) {
+          dismissNotice(startupNoticeId);
+          startupNoticeId = null;
+        }
+        if (disposed) return;
+
+        if (statusReady && initErrorNoticeId !== null) {
+          dismissNotice(initErrorNoticeId);
+          initErrorNoticeId = null;
+        }
+
+        if (!statusReady) {
+          const err = lastStartupError ?? statusOutcome?.error;
+          if (err !== undefined && err !== null) {
+            initErrorNoticeId = notify('error', describeError(err));
+            if (isStartupRoutePendingError(err)) {
+              patch({ nativeProvidersError: describeError(err), tasksError: err });
+              return;
+            }
+          }
+        }
+
+        await Promise.all([store.loadSettings(), store.loadNativeProviders(), store.loadTasks()]);
+        if (disposed) return;
+        // Diagnostic read only. `init` must never perform a Codex write: installing
+        // files is an explicit operator action, not a side effect of opening a page.
+        void store.refreshCodexStatus();
+        void store.refreshAntigravityStatus();
+        void store.loadCatalog();
+      })().finally(() => {
+        if (initInFlight === run) initInFlight = null;
+      });
+      initInFlight = run;
+      return await run;
     },
 
     /** Release subscriptions and drop the one-time token. */
     dispose() {
       cancelPendingSave();
       disposed = true;
+      if (typeof cancelInitRetryWait === 'function') cancelInitRetryWait();
       state = { ...state, token: null, tokenConnectionId: null };
       listeners.clear();
     },

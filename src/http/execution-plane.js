@@ -237,6 +237,15 @@ async function submitTask({ req, res, connection, deps }) {
   const continueFromTaskId = body.continueFromTaskId === undefined || body.continueFromTaskId === null
     ? undefined
     : body.continueFromTaskId;
+  if (body.reuseWorktreeFromTaskId !== undefined && body.reuseWorktreeFromTaskId !== null
+    && typeof body.reuseWorktreeFromTaskId !== 'string') {
+    throw new HttpError(400, 'JOB_ISOLATION_REFUSED', 'reuseWorktreeFromTaskId must be a string', {
+      field: 'reuseWorktreeFromTaskId',
+    });
+  }
+  const reuseWorktreeFromTaskId = typeof body.reuseWorktreeFromTaskId === 'string'
+    ? body.reuseWorktreeFromTaskId
+    : undefined;
   // The Agent Teams decision travels as the commander's own field and is folded into the
   // existing overrides channel (the engine's per-task choice path). A non-boolean is
   // refused here rather than reaching the engine's sanitiser as a coercible value.
@@ -277,6 +286,7 @@ async function submitTask({ req, res, connection, deps }) {
       ...(body.title === undefined ? {} : { title: body.title }),
       overrides,
       ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
+      ...(reuseWorktreeFromTaskId === undefined ? {} : { reuseWorktreeFromTaskId }),
       ...hierarchyFields,
       ...goalField,
     });
@@ -297,6 +307,7 @@ async function submitTask({ req, res, connection, deps }) {
     ...(body.title === undefined ? {} : { title: body.title }),
     overrides,
     ...(continueFromTaskId === undefined ? {} : { continueFromTaskId }),
+    ...(reuseWorktreeFromTaskId === undefined ? {} : { reuseWorktreeFromTaskId }),
     ...hierarchyFields,
     ...goalField,
   });
@@ -383,6 +394,11 @@ async function decidePermission({ req, res, connection, deps }) {
   if (body.fingerprint !== undefined && body.fingerprint !== null && typeof body.fingerprint !== 'string') {
     throw new HttpError(400, 'PERMISSION_FINGERPRINT_INVALID', 'fingerprint must be a string when present');
   }
+  if (body.scope !== undefined && body.scope !== null && body.scope !== 'once' && body.scope !== 'task-command') {
+    throw new HttpError(400, 'PERMISSION_DECISION_INVALID', 'scope must be once or task-command when present', {
+      field: 'scope',
+    });
+  }
   const result = await deps.engine.decidePermission({
     // The verified connection, not `body.connectionId`: a caller cannot name an owner.
     connectionId: connection.connectionId,
@@ -391,6 +407,7 @@ async function decidePermission({ req, res, connection, deps }) {
     decision: body.decision,
     ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
     ...(typeof body.fingerprint === 'string' ? { fingerprint: body.fingerprint } : {}),
+    ...(typeof body.scope === 'string' ? { scope: body.scope } : {}),
   });
   sendJson(res, 200, { ok: true, ...result });
 }

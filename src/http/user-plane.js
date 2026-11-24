@@ -923,6 +923,9 @@ async function runCodexIntegration(deps, action) {
       'this host does not expose the Codex integration, so nothing can be installed or reported',
     );
   }
+  if (deps.codexStartupRefresh) {
+    try { await deps.codexStartupRefresh; } catch { /* startup refresh logs its own warning */ }
+  }
   let outcome;
   try {
     outcome = action === 'status' ? await seam.status() : await seam.run(action);
@@ -963,6 +966,9 @@ async function runAntigravityIntegration(deps, action) {
       'ANTIGRAVITY_INTEGRATION_UNAVAILABLE',
       'this host does not expose the Antigravity integration, so nothing can be installed or reported',
     );
+  }
+  if (deps.antigravityStartupRefresh) {
+    try { await deps.antigravityStartupRefresh; } catch { /* startup refresh logs its own warning */ }
   }
   let outcome;
   try {

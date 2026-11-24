@@ -38,8 +38,11 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 /** Schema version of the record this module writes. */
 export const OWNERSHIP_SCHEMA_VERSION = 1;
 
-/** Directory, inside the plugin data directory, that holds one file per Codex home. */
+/** Directory, inside the plugin data directory, that holds one legacy agent record per Codex home. */
 export const OWNERSHIP_DIR_NAME = 'codex-agent-ownership';
+
+/** Directory, inside the plugin data directory, that holds one skill record per Codex home. */
+export const SKILL_OWNERSHIP_DIR_NAME = 'codex-skill-ownership';
 
 /** A digest: lowercase hex SHA-256. */
 const SHA256 = /^[0-9a-f]{64}$/u;
@@ -73,12 +76,17 @@ export function pluginDataDirectory(env = process.env) {
  * @param {Record<string, string | undefined>} [env] - environment (`DSH_HOME`).
  * @returns {string | null} absolute record path, or null when the data directory is unusable.
  */
-export function ownershipRecordPath(codexHome, env = process.env) {
+export function ownershipRecordPath(codexHome, env = process.env, dirName = OWNERSHIP_DIR_NAME) {
   const dataDir = pluginDataDirectory(env);
   if (dataDir === null) return null;
   if (typeof codexHome !== 'string' || codexHome.trim() === '' || !isAbsolute(codexHome)) return null;
   const key = createHash('sha256').update(resolve(codexHome), 'utf8').digest('hex');
-  return join(dataDir, OWNERSHIP_DIR_NAME, `${key}.json`);
+  return join(dataDir, dirName, `${key}.json`);
+}
+
+/** The skill ownership record path for one Codex home. */
+export function skillOwnershipRecordPath(codexHome, env = process.env) {
+  return ownershipRecordPath(codexHome, env, SKILL_OWNERSHIP_DIR_NAME);
 }
 
 /**
@@ -94,14 +102,35 @@ export function ownershipRecordPath(codexHome, env = process.env) {
  *   platform attribute read. Injected so this module never grows a second, weaker copy of it.
  * @returns {Promise<{ ok: boolean, missing: boolean, reason: string }>} verdict.
  */
-async function inspectRealChain(target, classify) {
+export function chainPathsOf(target) {
   const absolute = resolve(target);
   const root = rootOf(absolute);
+  const paths = [root];
   let current = root;
-  if ((await classify(root)) !== 'directory') return { ok: false, missing: false, reason: 'ancestor-not-a-directory' };
   for (const part of absolute.slice(root.length).split(/[\\/]+/u).filter((part) => part !== '')) {
     current = join(current, part);
-    const kind = await classify(current);
+    paths.push(current);
+  }
+  return paths;
+}
+
+async function inspectRealChain(target, classify, classifyMany = null) {
+  const paths = chainPathsOf(target);
+  if (typeof classifyMany === 'function') {
+    const verdicts = await classifyMany(paths);
+    if (verdicts.get(paths[0]) !== 'directory') return { ok: false, missing: false, reason: 'ancestor-not-a-directory' };
+    for (let i = 1; i < paths.length; i += 1) {
+      const kind = verdicts.get(paths[i]);
+      if (kind === 'directory') continue;
+      if (kind === 'missing') return { ok: false, missing: true, reason: 'ancestor-missing' };
+      if (kind === 'link') return { ok: false, missing: false, reason: 'ancestor-is-a-link' };
+      return { ok: false, missing: false, reason: 'ancestor-not-a-directory' };
+    }
+    return { ok: true, missing: false, reason: 'ok' };
+  }
+  if ((await classify(paths[0])) !== 'directory') return { ok: false, missing: false, reason: 'ancestor-not-a-directory' };
+  for (let i = 1; i < paths.length; i += 1) {
+    const kind = await classify(paths[i]);
     if (kind === 'directory') continue;
     if (kind === 'missing') return { ok: false, missing: true, reason: 'ancestor-missing' };
     if (kind === 'link') return { ok: false, missing: false, reason: 'ancestor-is-a-link' };
@@ -135,11 +164,11 @@ function rootOf(absolute) {
  * @param {object} options - `codexHome` (real, pinned), `env`, `classify` (see {@link inspectRealChain}).
  * @returns {Promise<string | null>} LF-normalized template digest, or null.
  */
-export async function recallTemplateDigest({ codexHome, env = process.env, classify } = {}) {
-  const path = ownershipRecordPath(codexHome, env);
+export async function recallTemplateDigest({ codexHome, env = process.env, classify, classifyMany = null, dirName = OWNERSHIP_DIR_NAME } = {}) {
+  const path = ownershipRecordPath(codexHome, env, dirName);
   if (path === null) return null;
-  if (typeof classify !== 'function') return null;
-  const chain = await inspectRealChain(dirname(path), classify);
+  if (typeof classify !== 'function' && typeof classifyMany !== 'function') return null;
+  const chain = await inspectRealChain(dirname(path), classify, classifyMany);
   if (chain.ok !== true) return null;
   const info = await lstat(path).catch(() => null);
   // A junction is a directory to `lstat`, and a symlink is not a regular file: both are refused.
@@ -181,8 +210,10 @@ export async function rememberTemplateDigest({
   writeFileAtomic,
   mkdir: makeDirectory,
   classify,
+  classifyMany = null,
+  dirName = OWNERSHIP_DIR_NAME,
 } = {}) {
-  const path = ownershipRecordPath(codexHome, env);
+  const path = ownershipRecordPath(codexHome, env, dirName);
   if (path === null) return { ok: false, reason: 'record-path-unusable' };
   if (typeof template !== 'string' || template === '') return { ok: false, reason: 'no-template' };
   if (typeof classify !== 'function') return { ok: false, reason: 'no-classifier' };
@@ -199,7 +230,7 @@ export async function rememberTemplateDigest({
   }
   if (current !== template) return { ok: false, reason: 'agent-not-this-template' };
 
-  const chain = await inspectRealChain(dirname(path), classify);
+  const chain = await inspectRealChain(dirname(path), classify, classifyMany);
   if (chain.ok !== true) {
     if (chain.reason !== 'ancestor-missing') return { ok: false, reason: chain.reason };
     // The record directory does not exist yet: create it one level at a time and re-prove.
@@ -265,6 +296,35 @@ async function createArchiveDirectory(directory, classify, makeDirectory) {
  * @param {string} text - agent file or template text.
  * @returns {string} lowercase hex SHA-256.
  */
+export async function recallSkillTemplateDigest({ codexHome, env = process.env, classify, classifyMany = null } = {}) {
+  return await recallTemplateDigest({ codexHome, env, classify, classifyMany, dirName: SKILL_OWNERSHIP_DIR_NAME });
+}
+
+export async function rememberSkillTemplateDigest({
+  codexHome,
+  env = process.env,
+  template,
+  skillPath,
+  readFile: read = readFile,
+  writeFileAtomic,
+  mkdir: makeDirectory,
+  classify,
+  classifyMany = null,
+} = {}) {
+  return await rememberTemplateDigest({
+    codexHome,
+    env,
+    template,
+    agentPath: skillPath,
+    readFile: read,
+    writeFileAtomic,
+    mkdir: makeDirectory,
+    classify,
+    classifyMany,
+    dirName: SKILL_OWNERSHIP_DIR_NAME,
+  });
+}
+
 export function digestLf(text) {
   return createHash('sha256').update(String(text).replace(/\r\n/gu, '\n'), 'utf8').digest('hex');
 }

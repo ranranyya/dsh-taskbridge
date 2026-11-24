@@ -596,6 +596,16 @@ test('continueFromTaskId continues that task thread through the real engine', as
     assert.equal(chained.execution.conversation.sessionId, root.execution.conversation.sessionId);
     assert.equal(sessionController.creates.length, 1);
 
+    const worker = sessionController.agents.get(root.execution.conversation.sessionId);
+    assert.equal(worker.followups.length, 3, 'each submission drives one worker turn');
+    for (const message of worker.followups) {
+      const completion = message.content[0].text.split('\n## Completion\n').at(-1);
+      assert.match(completion, /Before delivery, do one self-review/u);
+      assert.match(completion, /review your diff, new files, and test results/u);
+      assert.match(completion, /Fix concrete in-scope issues and rerun affected checks/u);
+      assert.match(completion, /check findings against the evidence and keep the work read-only/u);
+    }
+
     // The map holds identity and provenance only — no prompt, no model output.
     const stored = JSON.parse(await readFile(join(handle.directory, 'dsh-delegate', 'sessions.json'), 'utf8'));
     const record = stored.sessions.find((entry) => entry.taskId === root.taskId);

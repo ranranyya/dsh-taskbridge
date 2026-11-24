@@ -343,17 +343,14 @@ test('apply wires only the record entry: no workspace-region view, and the manag
   }
 });
 
-test('plugin startup refreshes exact shipped Codex agents and leaves unknown files alone', async () => {
+test('plugin startup migrates exact shipped Codex agents to native skill and leaves unknown files alone', async () => {
   const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const { cleanup } = await import('./helpers/fakes.js');
   const prior = readFileSync(new URL('./fixtures/codex-agent-0.1.7.toml', import.meta.url), 'utf8')
     .replace(/\r?\n/gu, '\r\n');
-  const current = readFileSync(new URL('../codex/dsh-taskbridge.toml', import.meta.url), 'utf8');
-  // The managed agent is WRITTEN with LF terminators (`renderAgentFile` folds the template's
-  // CRLF spelling); the migration's product is those exact LF bytes, so the expectation is
-  // the rendered form, not the template file's own spelling.
+  const current = readFileSync(new URL('../codex/skills/dsh-taskbridge/SKILL.md', import.meta.url), 'utf8');
   const currentRendered = current.replace(/\r\n/gu, '\n');
 
   for (const entry of [
@@ -367,9 +364,9 @@ test('plugin startup refreshes exact shipped Codex agents and leaves unknown fil
     let handle;
     try {
       handle = await applyWithRealRuntime({ codexHome });
-      const migratedPath = join(codexHome, 'agents', 'dsh-taskbridge.toml');
+      const migratedPath = join(codexHome, 'skills', 'dsh-taskbridge', 'SKILL.md');
       assert.equal(readFileSync(entry.name === 'known' ? migratedPath : agentPath, 'utf8'), entry.expected);
-      assert.equal(existsSync(agentPath), entry.name === 'edited', 'only a recognized legacy agent is migrated');
+      assert.equal(existsSync(agentPath), entry.name === 'edited', 'only a recognized legacy agent is migrated and retired');
       assert.equal(existsSync(migratedPath), entry.name === 'known');
       assert.equal(existsSync(join(codexHome, 'config.toml')), false, 'startup migration must not install an MCP entry');
     } finally {
@@ -585,6 +582,114 @@ test('an empty provider configuration stays inert through apply', async () => {
   }
 });
 
+test('user-plane routes serve 200 immediately while Codex startup refresh is still running', async () => {
+  const { LlmRuntime } = await import('@deepseek-ai/dsh-llm');
+  const { mkdtempSync, mkdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { cleanup } = await import('./helpers/fakes.js');
+  const directory = mkdtempSync(join(tmpdir(), 'dsh-delegate-startup-order-'));
+  const codexHome = join(directory, 'codex-home');
+  mkdirSync(codexHome, { recursive: true });
+
+  let releaseClassifier;
+  let classifierReached;
+  const classifierGate = new Promise((resolve) => { releaseClassifier = resolve; });
+  const reachedPromise = new Promise((resolve) => { classifierReached = resolve; });
+
+  const defaultClassify = async (paths) => {
+    const { lstatSync } = await import('node:fs');
+    const kinds = new Map();
+    for (const path of paths) {
+      let info = null;
+      try { info = lstatSync(path); } catch { info = null; }
+      if (info === null) kinds.set(path, 'missing');
+      else if (info.isSymbolicLink()) kinds.set(path, 'link');
+      else if (info.isDirectory()) kinds.set(path, 'directory');
+      else kinds.set(path, 'other');
+    }
+    return kinds;
+  };
+
+  let blockedOnce = false;
+  useDirectoryClassifier(async (paths) => {
+    if (!blockedOnce && paths.some((p) => String(p).includes('codex-home'))) {
+      blockedOnce = true;
+      classifierReached();
+      await classifierGate;
+    }
+    return await defaultClassify(paths);
+  });
+
+  const routes = new Map();
+  const ctx = {
+    logger: { info() {}, warn() {}, debug() {}, error() {} },
+    reflect: { provide: () => () => {} },
+    events: { dispatch: () => [] },
+    effect() { return () => {}; },
+    waterfall: () => Promise.resolve([]),
+    get() { return null; },
+    provide() {},
+    agents: { create: async () => ({}) },
+    sessions: {},
+    tools: {},
+    webServer: { host: '127.0.0.1', port: 3210, register: () => () => {} },
+    connection: {
+      fetch: {
+        register(route) {
+          routes.set(route.path, route);
+          return () => routes.delete(route.path);
+        },
+      },
+    },
+  };
+  ctx.llm = new LlmRuntime(ctx);
+
+  const previousHome = process.env.DSH_HOME;
+  const previousCodexHome = process.env.CODEX_HOME;
+  const previousAgyHome = process.env.ANTIGRAVITY_CONFIG_DIR;
+  process.env.DSH_HOME = directory;
+  process.env.CODEX_HOME = codexHome;
+  process.env.ANTIGRAVITY_CONFIG_DIR = join(directory, 'agy-home');
+
+  try {
+    const applyPromise = entry.apply(ctx, { dataDir: directory });
+    await reachedPromise;
+
+    assert.equal(routes.has('/api/dsh-delegate/status'), true,
+      'user-plane /status route must already be registered before slow Codex startup check finishes');
+    const statusRes = await routes.get('/api/dsh-delegate/status').fetch(
+      new Request('http://127.0.0.1/api/dsh-delegate/status', { method: 'GET' }),
+    );
+    assert.equal(statusRes.status, 200);
+    const statusBody = await statusRes.json();
+    assert.equal(statusBody.ok, true);
+
+    // A /codex read that arrives during startup waits for the startup refresh instead of racing it.
+    let codexSettled = false;
+    const codexPromise = routes.get('/api/dsh-delegate/codex').fetch(
+      new Request('http://127.0.0.1/api/dsh-delegate/codex', { method: 'GET' }),
+    ).then((res) => { codexSettled = true; return res; });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(codexSettled, false, '/codex must wait until the in-flight startup refresh finishes');
+
+    releaseClassifier();
+    const [codexRes] = await Promise.all([codexPromise, applyPromise]);
+    assert.equal(codexRes.status, 200);
+    assert.equal((await codexRes.json()).ok, true);
+  } finally {
+    releaseClassifier();
+    useDirectoryClassifier(defaultClassify);
+    process.env.DSH_HOME = previousHome;
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+    if (previousAgyHome === undefined) delete process.env.ANTIGRAVITY_CONFIG_DIR;
+    else process.env.ANTIGRAVITY_CONFIG_DIR = previousAgyHome;
+    await cleanup(directory);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 // A host hot update replaces `package.json` on disk while THIS module instance stays
 // loaded. The activation must stamp the integration with the version on disk, not with
 // the one its process-lifetime memo still answers — otherwise the next start (reading the
@@ -600,10 +705,10 @@ test('a re-activation after a hot update stamps the Codex agent with the version
   // The forced re-read the entry performs must return the SAME fact here, proving it goes
   // to disk rather than to a stale constant captured at import time. A stale constant is
   // what this test would catch: `PLUGIN_VERSION` used to be evaluated once at module load.
-  const template = readFileSync(new URL('../codex/dsh-taskbridge.toml', import.meta.url), 'utf8');
+  const template = readFileSync(new URL('../codex/skills/dsh-taskbridge/SKILL.md', import.meta.url), 'utf8');
   const rendered = await renderAgentFile(template, onDisk);
-  assert.match(rendered, new RegExp(`^version = "${onDisk.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}"$`, 'mu'),
-    'the rendered agent carries the manifest version, not a remembered one');
+  assert.match(rendered, new RegExp(`^<!-- dsh-taskbridge-version: ${onDisk.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')} -->$`, 'mu'),
+    'the rendered skill carries the manifest version, not a remembered one');
   // And the entry module no longer exports/uses a frozen constant.
   const entrySource = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
   assert.equal(/const PLUGIN_VERSION = reportedVersion\(\)/u.test(entrySource), false,

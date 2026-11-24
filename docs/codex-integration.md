@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.8.1 (Codex and Antigravity integrations both supported, with full 1.8.0 and earlier upgrade recognition). This automatic installer covers Codex; Antigravity integration is documented in `docs/antigravity-integration.md`, and Claude Code / Claude Desktop integration is planned for 2.0.
+Status: implemented in 1.9.0 (Codex migrated from legacy subagent `agents/dsh-taskbridge.toml` to native skill `skills/dsh-taskbridge/SKILL.md`, with safe automatic retirement of untouched 0.1.6–1.8.x legacy subagents; Antigravity integration is documented in `docs/antigravity-integration.md`, and Claude Code / Claude Desktop integration is planned for 2.0).
 
 The 1.7.0 release also makes future managed upgrades self-recognising: the two exact
 companions this machine really held (`1.6.1` in both terminator spellings and the local
@@ -28,9 +28,37 @@ Review notes accept up to 8000 code points after trimming and are stored redacte
 See the [release notes](https://github.com/ranranyya/dsh-taskbridge/blob/master/docs/releases/1.4.1.zh.md) for validation boundaries.
 
 This document is the contract between the plugin's settings page (browser half),
-the host-side installer (`src/codex/installer.js`) and the two files it manages.
+the host-side installer (`src/codex/installer.js`) and the skill files and MCP entry it manages.
 It is written so a reviewer can check the code against it without reading the
 README.
+
+## Native Codex Skill migration (1.9.0)
+
+Starting in `1.9.0`, the managed Codex target is the native skill
+`$CODEX_HOME/skills/dsh-taskbridge/SKILL.md` (with independent ownership digests in
+`codex-skill-ownership`). Installing a native skill instead of a subagent allows the active
+Codex session to read the workflow directly and drive one `delegate_submit` +
+`delegate_wait` chain (using `tool_timeout_sec = 3660`) instead of wrapping dispatch in
+`spawn_agent` + short-timeout `wait_agent` polling loops.
+
+The generated entry carries the ordinary flow and links a same-directory rules reference for
+multi-stage planning and uncommon events. Installation publishes the reference before switching
+`SKILL.md`. Older references remain available to Codex sessions that already loaded a previous
+entry. Startup restores a missing reference for an unchanged entry. An edited reference makes
+both files operator-managed. Uninstall removes the unchanged active pair after proving ownership.
+
+An explicit `install`, startup refresh, or `remove` inspects `$CODEX_HOME/agents/dsh-taskbridge.toml`
+and `$CODEX_HOME/agents/dsh-delegate.toml` against both `KNOWN_AGENT_TEMPLATES` (`0.1.6`–`1.8.x`)
+and historical `codex-agent-ownership` records. Untouched legacy managed subagent files are
+unlinked ONLY after re-proving their exact bytes (and, on install/refresh, after confirming
+`skills/dsh-taskbridge/SKILL.md` is ready). Any user-modified legacy file is preserved untouched
+and surfaced via `LEGACY_AGENT_USER_MODIFIED`. Boundary checks cover `$CODEX_HOME`, `skills/`,
+`skills/dsh-taskbridge/`, and `agents/`.
+
+The action result's `changed` array reports `agent` for a write or removal of
+`SKILL.md`, `legacyAgent` for removal of one or more managed legacy TOML files,
+and `mcp` for a change to the MCP entry. An install that writes the skill and
+retires a legacy file includes both `agent` and `legacyAgent`.
 
 ## TaskBridge companion migration (1.3.2)
 
@@ -66,9 +94,9 @@ The goal is fixed at task creation. The completion summary exists only under `ho
 
 | Path | Owner | The plugin may | The plugin may never |
 | --- | --- | --- | --- |
-| `$CODEX_HOME/agents/dsh-taskbridge.toml` | managed copy of `codex/dsh-taskbridge.toml` | create it **exclusively** on explicit install when absent; refresh a byte-exact known build during plugin startup or explicit install; delete it on `remove` only after re-reading it and finding the same bytes it classified | overwrite or delete a file that is not that exact build — including a file with an old version line whose body was edited, and including a file that changed in the window between the status read and the write/removal |
+| `$CODEX_HOME/skills/dsh-taskbridge/SKILL.md` | managed copy of `codex/skills/dsh-taskbridge/SKILL.md` | create it **exclusively** on explicit install (or legacy migration) when absent; refresh a byte-exact known build during plugin startup or explicit install; delete it on `remove` only after re-reading it and finding the same bytes it classified (and unlink untouched legacy `agents/dsh-taskbridge.toml` / `agents/dsh-delegate.toml` after re-proving their bytes) | overwrite or delete a file that is not that exact build — including a skill or legacy agent file whose body was edited, and including a file that changed in the window between the status read and the write/removal |
 | `$CODEX_HOME/config.toml`, table `mcp_servers.dsh-delegate` | operator, with one managed entry | add the entry when absent; update `command`/`args`/its own `env.DSH_DELEGATE_DISCOVERY_FILE` when the entry carries **the plugin marker** *and* is the exact shape this plugin writes; on an explicit `install`/`repair` only, adopt a recorded `args[0]` that is a PROVED real installation of this package (manifest `name` + `bin["dsh-delegate-mcp"]` mapping) | touch any other key, table, comment or ordering; adopt, update or delete an unmarked same-name entry, even one whose values coincide; adopt a differing script path from the automatic startup check |
-| `$CODEX_HOME` and `$CODEX_HOME/agents` | Codex | resolve and pin a normal root symlink/junction to its real directory; inspect the real root and agents directory; create missing agents (`0700`) | retarget or delete the root alias; follow a link in the agents subdirectory or final file; write through an unusable or unverified target |
+| `$CODEX_HOME`, `$CODEX_HOME/skills`, `$CODEX_HOME/skills/dsh-taskbridge` and `$CODEX_HOME/agents` | Codex | resolve and pin a normal root symlink/junction to its real directory; inspect all 4 boundary levels in one batched Windows check; create missing `skills/dsh-taskbridge` (`0700`) on explicit install | retarget or delete the root alias; follow a link in `skills/`, `skills/dsh-taskbridge/`, `agents/` or the final file; write through an unusable or unverified target |
 | DSH local-call switch | operator | report it | change it |
 
 `$CODEX_HOME` resolution: `CODEX_HOME` when set and absolute; otherwise
@@ -78,16 +106,15 @@ nobody named.
 
 ### 1.1 Link boundaries
 
-`lstat` on the final file is not enough: if `$CODEX_HOME/agents` is a junction,
-`mkdir -p` and the file create walk *through* it and write
-`agents/dsh-taskbridge.toml` outside the Codex home entirely. Since 1.5.1 the selected HOME root is first pinned to its real directory; that real root and the agents subdirectory are then inspected as boundaries:
+`lstat` on the final file is not enough: if `$CODEX_HOME/skills`, `$CODEX_HOME/skills/dsh-taskbridge`, or `$CODEX_HOME/agents` is a junction,
+`mkdir -p` and the file create would walk *through* it and write outside the Codex home entirely. Since 1.5.1 the selected HOME root is first pinned to its real directory; since 1.9.0 that real root plus `skills/`, `skills/dsh-taskbridge/` and `agents/` are inspected together as boundaries:
 
-| `$CODEX_HOME` | `$CODEX_HOME/agents` | result |
+| `$CODEX_HOME` | `skills/` · `skills/dsh-taskbridge/` · `agents/` | result |
 | --- | --- | --- |
-| real directory | missing | normal: install creates `agents` (`0700`) |
+| real directory | missing | normal: explicit `install` creates `skills/dsh-taskbridge` (`0700`) |
 | real directory | real directory | normal |
-| real directory | link (symlink or junction) | `agent.state = conflict`, `reason = agents-dir-is-link`; install/repair/remove all refuse with `AGENT_PATH_CONFLICT` |
-| root symlink/junction with a real directory target | checked under the pinned real target | normal root alias; alias preserved, agents/file links still refused |
+| real directory | link (symlink or junction) | `agent.state = conflict`, `reason = skills-dir-is-link` / `skill-dir-is-link` / `agents-dir-is-link`; install/repair/remove all refuse with `AGENT_PATH_CONFLICT` |
+| root symlink/junction with a real directory target | checked under the pinned real target | normal root alias; alias preserved, subdirectory/file links still refused |
 | could not be verified | — | `agent.state = conflict`, `reason = boundary-unverified`; same refusal |
 
 A **junction** is the case `lstat` cannot see: Windows reports it as an ordinary
@@ -108,7 +135,7 @@ a temporary directory on Windows (and skips elsewhere), not only through the tes
 classifier hook.
 
 The status document reports this as `boundary: { blocked, link, unknown, home,
-agents }`. A **failed** verification is a refusal, not a pass: if the platform
+skills, skillDir, agents }`. A **failed** verification is a refusal, not a pass: if the platform
 answer cannot be obtained (no spawnable shell, no PowerShell), the boundary is
 `unknown` and every action refuses, because "could not check" must never be read
 as "safe". The check is re-done at the start of every writing action from the
@@ -229,15 +256,15 @@ An `args[0]` that names `dsh-delegate-mcp.js` somewhere ELSE is a `conflict`
 (`args-shape-not-ours`) in a bare status read: the synchronous classifier cannot prove that
 a different path is this package, so it never labels one `outdated`. Only an explicit
 `install`/`repair` may adopt it, after the asynchronous proof below — and only with the
-config digest, the `$CODEX_HOME`/`agents` boundary and the current entry re-checked
+config digest, the `$CODEX_HOME`/`skills`/`skills/dsh-taskbridge`/`agents` boundary and the current entry re-checked
 immediately before the write. A different script name, a different command or an extra
 argument stays `conflict` everywhere.
 
-When `$CODEX_HOME` or `$CODEX_HOME/agents` is a link (or cannot be verified), the MCP
-target is reported as `conflict` with `reason` `codex-home-is-link`,
-`agents-dir-is-link` or `boundary-unverified` — the same verdict the agent target gets.
+When `$CODEX_HOME`, `$CODEX_HOME/skills`, `$CODEX_HOME/skills/dsh-taskbridge` or `$CODEX_HOME/agents` is a link (or cannot be verified), the MCP
+target is reported as `conflict` with `reason` `codex-home-is-link`, `skills-dir-is-link`, `skill-dir-is-link`,
+`agents-dir-is-link` or `boundary-unverified` — the same verdict the skill target gets.
 The entry is **not** read through the link, because a link bounds every write this
-module makes, not only the agent file.
+module makes, not only the skill file.
 
 Two rules are deliberate:
 
@@ -347,11 +374,12 @@ rather than thrown at the operator.
 
 `refreshKnownAgentTemplate({ refreshMcp: true })` — reached through the seam as
 `refreshManagedIntegration({ startupTarget, backupDir })` and called once by plugin
-activation — performs two independent upgrades:
+activation — checks the managed skill, legacy subagents and the MCP entry:
 
 | target | condition | write |
 | --- | --- | --- |
-| agent file | `outdated` (byte-exact published build) | replaced with this build's template |
+| Codex skill | `outdated` (known template or matching ownership record) | replaced with this build's template |
+| Legacy subagents | a `managed-legacy` file still matches the bytes read during inspection | installs the skill if absent, then retires the legacy file once the current or user-edited skill is present |
 | MCP entry | `outdated` **and** passing the write gate below | the owned values rewritten in place, in ONE atomic write |
 
 The automatic check only ever accepts THIS installation's exact entry point. The
@@ -387,10 +415,12 @@ because the proof is a filesystem one). There are exactly two accepted proofs:
      the same attribute read the boundary check uses);
    * `<root>/bin/dsh-delegate-mcp.js` is a regular, non-link file that IS the candidate
      (compared by `realpath`, so a link cannot smuggle in another program);
-   * `<root>/package.json` is a regular, non-link file that BOTH declares
-     `"name": "dsh-delegate"` AND maps `bin["dsh-delegate-mcp"]` to that very entry. A
+   * `<root>/package.json` is a regular, non-link file that declares one of this project's
+     own package names (`"dsh-taskbridge"`, `"dsh-taskdispatch"`, or `"dsh-delegate"`),
+     carries this project's GitHub repository provenance (`https://github.com/ranranyya/{dsh-taskbridge,dsh-taskdispatch,dsh-delegate}`),
+     AND maps `bin["dsh-delegate-mcp"]` to that very entry. A
      `./` prefix is allowed; an absolute path, a `..` segment, a trailing slash, a wrong
-     mapping, a missing mapping or no `bin` object is refused.
+     mapping, a missing mapping, a foreign repository or no `bin` object is refused.
 
 The `<root>` is derived with the host's `dirname`/`basename` rules (`packageEntryRoot`), so
 a POSIX leading `/` is preserved: splitting on `/` and rejoining would turn
@@ -448,10 +478,10 @@ instead of writing. The original file is always left exactly as it was on any re
 
 * an absent entry stays absent — the plugin never creates `config.toml` or the table at
   startup, so an upgrade can never turn a non-installation into an installation, and the
-  same is true of `agents/` and the agent file;
+  same is true of `skills/` when neither the skill nor a recognized legacy companion is present;
 * an unmarked entry, an operator-edited shape and any `conflict` are refused and left
   byte-identical (the outcome carries `MCP_ENTRY_CONFLICT` with the reason);
-* a link or unverifiable directory at `$CODEX_HOME` / `agents` is re-inspected immediately
+* a link or unverifiable directory at `$CODEX_HOME` / `skills` / `skills/dsh-taskbridge` / `agents` is re-inspected immediately
   before the write and produces ONE `AGENT_PATH_CONFLICT` refusal for the whole check, even
   when the visible state shows nothing stale: an upgrade that cannot be proved safe must not
   look successful;
@@ -480,8 +510,8 @@ A REFUSED install records nothing, so a refusal cannot become the remembered tar
 
 In 1.5.1 the selected home root is pinned by the installer to its real target after this precedence resolution. A normal root symlink/junction is supported; an unresolvable or unverifiable target is refused. A missing home remains `no-codex-home`; a null startup target does not silently fall back to another tree. The root alias is preserved, and links below it in agents or the final files remain forbidden.
 
-The explicit 安装 / 更新 TaskBridge 智能体 button (action `install`) is unchanged and remains
-the way to *create* the two managed targets. `status` reports the drift (`mcp.drift`)
+The explicit 「安装 / 更新 TaskBridge 技能」 button (action `install`) remains
+the way to *create* the managed native skill (`skills/dsh-taskbridge/SKILL.md`) and MCP entry (and safely retire untouched legacy `agents/dsh-taskbridge.toml` / `agents/dsh-delegate.toml`). `status` reports the drift (`mcp.drift`)
 and, when an entry is `outdated`, a note naming exactly which owned facts are stale.
 
 ---
@@ -494,9 +524,9 @@ Reachable only through the authenticated user plane (section 4) or the CLI
 | action | writes | never writes |
 | --- | --- | --- |
 | `status` | nothing | anything |
-| `install` | agent file (absent / older managed build) + MCP entry (absent / `outdated`) | a user's agent file, a conflicting MCP entry, the DSH switch |
-| `repair` | the MCP entry only (absent / `outdated`), exactly as `install` would; plus the marker line for an `unmanaged-entry-exact` definition | the agent file: it is **not created, not refreshed and not deleted**, nor is `agents/` created; no owned value of an unmarked entry is ever rewritten |
-| `remove` | deletes only owned targets | a user's agent file, a conflicting entry |
+| `install` | native skill `skills/dsh-taskbridge/SKILL.md` (absent / older managed build) + retires untouched legacy `.toml` subagents + MCP entry (absent / `outdated`) | a user-modified skill or legacy agent file, a conflicting MCP entry, the DSH switch |
+| `repair` | the MCP entry only (absent / `outdated`), exactly as `install` would; plus the marker line for an `unmanaged-entry-exact` definition | the skill or legacy agent files: they are **not created, not refreshed and not deleted**, nor is `skills/` or `agents/` created; no owned value of an unmarked entry is ever rewritten |
+| `remove` | deletes only owned skill, untouched legacy `.toml` files and owned MCP entry | a user-modified skill or legacy agent file, a conflicting entry |
 
 `install` is idempotent: a second run with nothing changed reports
 `changed: []` and does not rewrite either file.
@@ -528,10 +558,9 @@ The page's `init()` issues a `GET`; the three buttons are the only callers of th
 
 **The single write at plugin load is the integration refresh.** `apply()` calls the
 seam's `refreshManagedIntegration()` once — only when a Codex home directory exists — which
-refreshes `agents/dsh-taskbridge.toml` when its complete bytes equal one of the enumerated
-`KNOWN_AGENT_TEMPLATES` digests (section 5) **and** upgrades an already installed
+refreshes `skills/dsh-taskbridge/SKILL.md` when its complete bytes match a known prior build or recorded digest (and migrates/retires untouched legacy `agents/dsh-taskbridge.toml` / `agents/dsh-delegate.toml` matching `KNOWN_AGENT_TEMPLATES` or `codex-agent-ownership`), **and** upgrades an already installed
 `mcp_servers.dsh-delegate` entry that is provably this plugin's and merely stale
-(section 2.4). Apart from migrating an existing recognized legacy companion to its new name in 1.3.2, it never creates a missing agent, never creates `agents/`, never creates
+(section 2.4). It never performs a first-time install when neither the skill nor a recognized legacy companion is present, never creates
 the MCP entry, and never touches a `modified`/`conflict` file: everything else stays an
 explicit `install`. A refusal or failure is logged and startup continues, so a Codex
 problem cannot stop the plugin from loading.
@@ -562,12 +591,20 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.8.1",
-  "boundary": { "blocked": false, "link": null, "unknown": false, "home": "directory", "agents": "directory" },
-  "agent": {
-    "path": "…", "state": "installed", "installed": true, "managed": true,
+  "packageVersion": "1.9.0",
+  "boundary": {
+    "blocked": false, "link": null, "unknown": false,
+    "home": "directory", "skills": "directory", "skillDir": "directory", "agents": "directory"
+  },
+  "skill": {
+    "path": "…/skills/dsh-taskbridge/SKILL.md", "state": "installed", "installed": true, "managed": true,
     "reason": null, "expect": "<the exact bytes a refresh may replace>"
   },
+  "agent": {
+    "path": "…/skills/dsh-taskbridge/SKILL.md", "state": "installed", "installed": true, "managed": true,
+    "reason": null, "expect": "<compatibility alias of skill>"
+  },
+  "legacyAgents": { "state": "absent", "entries": [] },
   "mcp": {
     "path": "…", "exists": true, "serverName": "dsh-delegate",
     "state": "configured", "configured": true,
@@ -595,9 +632,9 @@ Boundary kinds: `directory`, `missing`, `link`, `other`, `unchecked` (for the le
 below a link, which is deliberately not inspected), and `unknown` when the platform
 answer could not be obtained.
 
-`boundary.blocked` is true when either directory is a link or could not be verified;
-`boundary.link` names the level (`codex-home` or `agents`) and is `null` otherwise.
-`agent.reason` carries `codex-home-is-link`, `agents-dir-is-link` or
+`boundary.blocked` is true when any checked boundary directory is a link or could not be verified;
+`boundary.link` names the level (`codex-home`, `skills`, `skillDir` or `agents`) and is `null` otherwise.
+`agent.reason` carries `codex-home-is-link`, `skills-dir-is-link`, `skill-dir-is-link`, `agents-dir-is-link` or
 `boundary-unverified` in that case, so the page can say which boundary it refused.
 
 `agent.expect` and `mcp.marked` are the two ownership facts: `expect` is what a
@@ -609,9 +646,9 @@ when the entry carries the plugin marker (i.e. when a `remove` may delete it).
 
 ---
 
-## 4.1 The preflight tool the agent depends on
+## 4.1 The preflight tool the skill depends on
 
-`delegate_preflight` is the fifth MCP tool and the only one that is not an
+`delegate_preflight` is a strictly read-only MCP tool that is not an
 authorization at all: it is a read-only measurement of one workspace, added so a
 dispatcher learns *before* submitting that a checkout is dirty, is not a
 repository, or needs an isolation decision — instead of learning it from a job that
@@ -645,28 +682,27 @@ remain those selected in the plugin settings.
 
 ---
 
-## 5. The agent file
+## 5. Skill ownership & historical legacy TOML identities
+
+From `1.9.0`, the active shipped file is the Markdown skill `$CODEX_HOME/skills/dsh-taskbridge/SKILL.md`
+(with `<!-- dsh-taskbridge-version: 1.9.0 -->` and its content-addressed `rules-reference-<sha256>.md`).
+Earlier `0.1.6`–`1.8.x` releases shipped a custom-agent TOML file:
 
 ```toml
-version = "1.0.0"   # stamped from package.json when written
+version = "1.0.0"   # stamped from package.json in 0.1.6–1.8.x legacy builds
 name = "dsh-delegate"
 description = "…"
 developer_instructions = """…"""
 ```
 
-The file is a custom-agent definition, not an MCP registration: it deliberately
-contains no `[mcp_servers.*]` table, because the agent inherits the parent Codex
-session's MCP tools, and a second definition would start a second server.
+Neither the active `SKILL.md` nor the historical `.toml` files contain an `[mcp_servers.*]`
+table, because the session/agent uses the parent Codex `config.toml` MCP registration, and a
+second definition would start a second server.
 
 **Ownership is content identity, not a heuristic.** `readAgentState` reports:
 
-* `installed` — byte-identical to the file this build would write;
-* `outdated` — byte-identical to one of the enumerated `KNOWN_AGENT_TEMPLATES`
-  digests (published builds only: `0.1.6`, both `0.1.7` builds, `0.1.8`, `0.1.9`,
-  `0.1.10` in both its CRLF and LF byte forms, `0.1.11`, `0.1.12`, `0.1.13`, `0.1.14`,
-  `1.0.0` and `1.1.0` in both byte forms, plus any later build listed when it is packed
-  and verified) **or** byte-identical to a template this plugin recorded writing into THIS
-  Codex home (section 5.0);
+* `installed` — same text (admitting only `\r\n` vs `\n` line-terminator spelling, rejecting lone `\r`) as the `SKILL.md` this build renders, with an intact matching reference file;
+* `outdated` — same text as one of the enumerated `KNOWN_SKILL_TEMPLATES` (`1.9.0` prereleases) or a recorded `codex-skill-ownership` digest for THIS Codex home (section 5.0); meanwhile `legacyAgents` classifies untouched `0.1.6`–`1.8.x` `.toml` files against `KNOWN_AGENT_TEMPLATES` and historical `codex-agent-ownership` records as `managed-legacy` for automatic retirement;
 * `modified`/`conflict` — everything else.
 
 Every release from `0.1.10` through `0.1.13` changes only the version line in the
@@ -723,22 +759,20 @@ digest was verified against `package/codex/dsh-delegate.toml` inside the packed
 `tests/fixtures/codex-agent-0.1.13.toml`, so the "unchanged `0.1.13` is refreshed" and
 "edited `0.1.13` is preserved" cases are both driven by real published bytes.
 
-**What the product does with line endings: nothing.** `readAgentState` and
-`refreshKnownAgent` read the file and hash it as it is; they never normalize CRLF to LF or
-the reverse, and never rewrite a file to change its endings. A digest taken over
-normalized text would not be an identity at all — it would let an edited file match a
-known build — so normalization is a defect, not a convenience. The earlier `0.1.10`
-entry `6583f08a…` was reported as a normalized digest; it is in fact the digest of the
-LF form of that release, which is why it is retained (not replaced) alongside the CRLF
-value. `tests/codex-integration.test.js` constructs both forms explicitly, pins each
-digest, and proves for each that a byte-exact file is refreshed while an edited one is
-refused.
+**Line endings in classification vs. write/delete verification (`1.5.3+`).** Classification
+(`sameAgentText` and `isKnownPriorTemplate`) folds `\r\n` to `\n` (while rejecting any leftover
+lone `\r`, BOM, tab, trailing space, blank line or version edit) so uniform LF, uniform CRLF, and
+mixed CRLF/LF spellings of the exact same published template are recognized without false conflicts;
+new managed files are written in LF, and every overwrite or unlink still re-reads the file and
+requires its exact raw bytes to match `expect`. Both LF and CRLF digests of historical releases
+remain enumerated in `KNOWN_AGENT_TEMPLATES` / `KNOWN_SKILL_TEMPLATES` and pinned by
+`tests/codex-integration.test.js` and `tests/codex-agent-line-endings.test.js`.
 
 A digest is added only for a build that was actually packed and verified, and the
 current template's digest is never in the list under an older label; the tests assert
 both facts (`tests/codex-integration.test.js`, `tests/package.test.js`).
 
-The 1.7.0 package recognizes these two earlier companion versions, each in both
+The 1.7.0 package recognized these two earlier companion versions, each in both
 terminator spellings, and all four are exact identities like every entry above:
 
 | Release | Digest enumerated in `KNOWN_AGENT_TEMPLATES` |
@@ -748,11 +782,8 @@ terminator spellings, and all four are exact identities like every entry above:
 | `1.6.1-test.5` | `bf698c861e7e560c555f8350b711db88627dce4a8752b2cbebe8748b6d640d37` (the packed agent, LF) |
 | `1.6.1-test.5` | `a45e12d0b234e80854e69429518a2def2d00338f968c2ecfc689307b792e4426` (same file, CRLF) |
 
-Both carry the SAME instruction body — the one `codex/dsh-taskbridge.toml` still holds —
-and differ only in the stamped `version` line, which is exactly why each needs its own
-exact identity: without them an untouched `1.6.1` or `1.6.1-test.5` installation hashes to
-"unknown content" and is reported `modified`, i.e. "somebody else's file", which is the
-false conflict this package removes.
+Both carried the SAME instruction body in the 1.6.1 sources and differed only in the
+stamped `version` line, so enumerating both avoided false `modified` conflicts on upgrade.
 
 At plugin startup, an `outdated` agent is refreshed automatically only when its
 bytes still match a known shipped build. This does not create a missing agent or
@@ -777,9 +808,12 @@ table: after an **explicit `install`** or the startup **`refreshKnownAgentTempla
 the agent file, and only when the file it re-reads is exactly the template this build renders,
 the plugin stores the digest of those bytes.
 
-* Path: `<DSH_HOME>/data/dsh-delegate/codex-agent-ownership/<sha256 of the real home>.json` — one
+* Path (1.9.0+ native skill): `<DSH_HOME>/data/dsh-delegate/codex-skill-ownership/<sha256 of the real home>.json` — one
   file per pinned Codex home, named by a digest of that home so no case equivalence is ever
-  inferred and two homes can never collide.
+  inferred and two homes can never collide. Legacy `<DSH_HOME>/data/dsh-delegate/codex-agent-ownership/`
+  records remain readable so untouched pre-1.9.0 `.toml` subagents migrate cleanly.
+* `npm run build:integrations` assembles `SKILL.md` and its rules reference from the shared
+  Layer 2 rules in `integrations/core/` through the Layer 1 Codex adapters.
 * Content: `{ "schemaVersion": 1, "codexHome": "<real home>", "templateLfSha256": "<64 hex>" }`.
   The digest is **LF-normalized** (the CRLF/LF spelling is not content, exactly as the table
   treats it), and it is the only digest. No template body, no `config.toml`, no model
@@ -818,9 +852,9 @@ The instructions must state all of the following. They are asserted in
 `tests/codex-integration.test.js` and `tests/package.test.js`, so an edit that drops
 one fails the build:
 
-1. **Explicit assignment only.** Dispatch only when the parent request explicitly
-   selects this agent (the exact mention `@dsh-taskbridge`, the agent picker, or an
-   explicit instruction to delegate this implementation task to DSH).
+1. **Explicit assignment only.** Dispatch only when the user explicitly
+   selects this skill (`$dsh-taskbridge`) or explicitly asks to delegate a Git
+   repository code implementation or verification task to DSH / TaskBridge.
 2. **Mention is not dispatch.** Text that merely mentions DSH, DeepSeek,
    dsh-delegate, delegation or the agent while asking something else is not a
    dispatch request, and neither is a question about the plugin, its settings or
@@ -829,8 +863,8 @@ one fails the build:
    review-only, summarising and status questions are answered in Codex.
 4. **Ambiguity is a question.** If it is unclear whether the task was assigned, ask
    once instead of dispatching.
-5. **Switch first, facts second.** Call `delegate_status` first; then call
-   `delegate_preflight` with the exact authorized workspace path. If either fails,
+5. **Switch first, facts second.** Call `delegate_status` first (once per session); then call
+   `delegate_preflight` with the exact authorized workspace path (or pass `autoPreflight: true, wait: true` on `delegate_submit` for a normal single-repo dispatch, resuming via `delegate_wait` on `submitReceipt.taskId` if `submitted: true` returns with `waitError`). If either fails,
    the tool is missing, the switch is off, or the answer is ambiguous, stop and
    report the bounded refusal. Leave the switch as set and use only the authorized
    TaskBridge execution path.
@@ -882,10 +916,11 @@ one fails the build:
    handing it to the model, so normal progress never wakes Codex.
    The roughly 25-second internal observation cadence belongs to the program, not to the
    agent: it is not a polling rate the model should imitate.
-10. **Each wait reason has a stated policy (1.1.0).**
-    - `attention` — the run has been completely silent past the configured attention
-      interval (ten minutes by default). It does **not** mean an ordinary wait ended: a
-      wait ending is `wait-limit`. It is a QUESTION, not a verdict: read the compact
+10. **Each wait reason has a stated policy (1.1.0+; delivery interval 40 min default from 1.7.0).**
+    - `attention` — either the run progress check (no new result delivered back to the host for the
+      operator-configured progress-check interval — **40 minutes by default**, adjustable or
+      disableable) or a `repeated-tool-failure` reminder. It does **not** mean an ordinary wait
+      ended: a wait ending is `wait-limit`. It is a QUESTION, not a verdict: read the compact
       diagnostic (phase, last activity, current tool and its elapsed time, self-check
       verdict) and **default to waiting again** on the same task. Never cancel, never mark
       failed, and never resubmit merely because a task is quiet or one tool or test is
@@ -971,11 +1006,11 @@ one fails the build:
     its exact `fingerprint`, passed to `delegate_permission_decide` with the `taskId`,
     `requestId`, `decision` (`allow-once`/`reject`) and a bounded `reason`. An invalid or
     stale allow grants nothing: re-read the current request and decide safely, and never
-    retry under broader settings. Waiting the SAME task continues after the decision, a
-    later request needs a fresh check, and an approval is one call only — never host
-    acceptance and never a standing sandbox grant. When dispatching on behalf of a
-    parent commander, the complete request evidence is preserved for that commander
-    rather than involving a separate review model.
+    retry under broader settings. Resume waiting on the same task after the decision.
+    Each approval covers one call (`scope: "once"`). The release treats the preview
+    value `scope: "task-command"` on an `allow-once` request as a single-call approval.
+    Make a fresh decision for each subsequent approval request. When dispatching on
+    behalf of a parent commander, preserve the complete request evidence for that commander.
 14. **No local implementation while a delegated worker runs (1.1.0).** Neither the
     dispatch companion nor the parent commander writes, patches or "just fixes" the
     implementation while a delegated task is running, waiting, or awaiting review: that
@@ -994,8 +1029,8 @@ one fails the build:
     by default; a directory-level reuse setting no longer exists. `continueFromTaskId`
     is passed **only** for a follow-up change, correction or retry that belongs to one
     earlier delegated task, and its value is the latest prior task id of that chain.
-    An unrelated task, a new topic or a different workspace omits the field entirely:
-    an id is never reused "to keep context" and never guessed. A follow-up to a
+    An unrelated task, a new topic or a different workspace omits `continueFromTaskId` entirely:
+    an id is never reused "to keep context" and never guessed. For a new dependent multi-stage subtask that starts a fresh DSH Session directly on an earlier accepted isolated worktree under the same source repository, pass `reuseWorktreeFromTaskId` instead (never combined with `continueFromTaskId`). A follow-up to a
     `worktree` task keeps its original source `workspacePath` for preflight and
     submit; the plugin resolves the same internal tree and continues its earlier
     uncommitted changes there. Never send the tree's internal execution path as the
@@ -1005,25 +1040,16 @@ one fails the build:
     Corrections are consolidated into one follow-up submission rather than a scatter of
     new tasks.
 
-### 5.2 What the file cannot guarantee: `@` selection
+### 5.2 Native Skill invocation (`$dsh-taskbridge`, 1.9.0+) vs. legacy `@` selection
 
-**This plugin does not claim that any Codex surface supports selecting the agent by
-typing `@dsh-taskbridge`.** Only verified facts are stated:
+From `1.9.0`, TaskBridge installs a **native Codex Skill** at
+`$CODEX_HOME/skills/dsh-taskbridge/SKILL.md`. An explicit `$dsh-taskbridge` activation or request
+to delegate to DSH / TaskBridge loads the entry. The active Codex session calls `delegate_submit` + a single direct `delegate_wait` chain without spawning
+a `spawn_agent` / `wait_agent` polling wrapper.
 
-* A custom-agent file at `$CODEX_HOME/agents/<name>.toml` is a Codex-recognised
-  definition, and the parent session's MCP tools are inherited by it — this is what
-  the installation relies on.
-* Whether the *current* Codex Desktop / CLI input box offers an `@`-mention picker
-  for that file is a property of the Codex build, not of this plugin. No official
-  documentation or runtime evidence in this repository establishes it for the
-  versions under test, so the wording here (and in the settings page) says the
-  mention *may* select the agent, and claims no more.
-
-Consequently the agent's own instructions treat `@dsh-taskbridge` as **one example**
-of an explicit selection, alongside the agent picker and an explicit instruction to
-delegate. If a Codex build does not offer `@` selection, the agent still works when
-chosen through whatever selection mechanism that build does provide. A new Codex
-session (or a restart) is required to load the new file and the new MCP entry.
+For pre-1.9.0 legacy subagent installations (`$CODEX_HOME/agents/dsh-taskbridge.toml`), this
+plugin never claimed `@dsh-taskbridge` picker support across all Codex builds. A new Codex session
+(or restart) is required after install or migration so Codex reloads the native skill and MCP entry.
 
 ---
 
@@ -1034,17 +1060,17 @@ session (or a restart) is required to load the new file and the new MCP entry.
 | `CODEX_HOME` relative | 400 `CODEX_HOME_INVALID`; nothing read or written |
 | `CODEX_HOME` unset | diagnosed against `~/.codex` |
 | `$CODEX_HOME` is a normal symlink or Windows junction | pin and verify its real directory target, preserve the root alias, then apply the same managed-content checks; broken or unverifiable targets are refused |
-| `$CODEX_HOME/agents` is a symlink or a Windows junction | `conflict` (`agents-dir-is-link`); install/repair/remove refuse with `AGENT_PATH_CONFLICT` and no file is created outside the home |
+| `$CODEX_HOME/skills`, `skills/dsh-taskbridge`, or `agents` is a symlink or Windows junction | `conflict` (`skills-dir-is-link` / `skill-dir-is-link` / `agents-dir-is-link`); install/repair/remove refuse with `AGENT_PATH_CONFLICT` and no file is created outside the home |
 | an ordinary real Windows directory | `directory` in every spelling of the helper's boolean (`dir/False`, `dir/false`); never reported as a link |
-| `repair` with the agent file missing or `outdated` | `changed: ["mcp"]` or `[]`; the agent file is not created and not refreshed, and `agents/` is not created |
+| `repair` with the skill file missing or `outdated` | `changed: ["mcp"]` or `[]`; the skill file is not created and not refreshed, and neither `skills/` nor `agents/` is created |
 | the boundary cannot be verified (no spawnable shell / no PowerShell) | `conflict` (`boundary-unverified`); everything refused, nothing assumed safe |
-| agents dir missing | created on install (`0700`) when the boundary is clean |
-| `agents/dsh-taskbridge.toml` is a symlink or a directory | `conflict`; untouched |
-| a different agent file appears between status and install | `modified`; untouched (first install is exclusive) |
-| an agent file is rewritten between the status read and `remove` | `AGENT_USER_MODIFIED` (`modified-before-removal`); the new bytes are kept |
-| the agent path is replaced by a directory / a link before `remove` | `AGENT_PATH_CONFLICT`; the entry is left in place |
-| an edited agent file with an old version line | `modified`; never refreshed, never removed |
-| a byte-exact previously published agent file | `outdated`; refreshed on install, removed on remove |
+| `skills/dsh-taskbridge` dir missing | created on explicit `install` (`0700`) when the boundary is clean |
+| `skills/dsh-taskbridge/SKILL.md` is a symlink or a directory | `conflict`; untouched |
+| a different skill file appears between status and install | `modified`; untouched (first install is exclusive) |
+| a skill file is rewritten between the status read and `remove` | `AGENT_USER_MODIFIED` (`modified-before-removal`); the new bytes are kept |
+| the skill path is replaced by a directory / a link before `remove` | `AGENT_PATH_CONFLICT`; the entry is left in place |
+| an edited skill file with an old version comment | `modified` (`reason: edited` if body matches current template); never refreshed, never removed |
+| a byte-exact previously published skill or legacy `.toml` | `outdated` / `managed-legacy`; refreshed/migrated on install or startup refresh, removed on `remove` |
 | `config.toml` is a symlink | `unreadable`; refused |
 | `config.toml` > 1 MiB | refused (`other`), untouched |
 | `config.toml` contains a NUL / control character | `CODEX_CONFIG_UNSUPPORTED`, untouched |

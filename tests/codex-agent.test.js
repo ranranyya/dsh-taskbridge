@@ -11,6 +11,7 @@
 // only the exact bundled template.
 
 import test from 'node:test';
+import { codexRuleText } from './helpers/codex-rule-files.js';
 import assert from 'node:assert/strict';
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -42,9 +43,7 @@ function isolatedEnv(codexHome) {
  * @returns {string} the template with normalised whitespace.
  */
 function shippedAgentText() {
-  return readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8')
-    .replace(/\s+/gu, ' ')
-    .trim();
+  return codexRuleText().replace(/\s+/gu, ' ').trim();
 }
 
 // The installer proves `$CODEX_HOME` and `$CODEX_HOME/agents` are real directories.
@@ -91,27 +90,27 @@ test('install is exclusive and idempotent, and does not disturb an existing conf
     assert.equal(installed.mcpState, 'configured');
     assert.equal((await manageCodexAgent('install', { codexHome, env })).state, 'installed');
     assert.equal((await manageCodexAgent('status', { codexHome, env })).state, 'installed');
-    assert.ok(readFileSync(installed.path, 'utf8').includes('name = "dsh-taskbridge"'));
+    assert.ok(readFileSync(installed.path, 'utf8').includes('name: dsh-taskbridge'));
     assert.ok(readFileSync(installed.mcpPath, 'utf8').startsWith(`model = "keep-me"`) || readFileSync(installed.mcpPath, 'utf8').includes(original));
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
-test('an existing custom agent is not overwritten or removed', async () => {
+test('an existing custom skill is not overwritten or removed', async () => {
   const codexHome = temporaryCodexHome();
-  const agentPath = join(codexHome, 'agents', 'dsh-taskbridge.toml');
-  const custom = 'name = "my-dsh-delegate"\n';
+  const skillPath = join(codexHome, 'skills', 'dsh-taskbridge', 'SKILL.md');
+  const custom = '---\nname: my-dsh-delegate\n---\ncustom skill\n';
   try {
-    mkdirSync(dirname(agentPath), { recursive: true });
-    writeFileSync(agentPath, custom);
+    mkdirSync(dirname(skillPath), { recursive: true });
+    writeFileSync(skillPath, custom);
 
     const env = isolatedEnv(codexHome);
     // A different same-name file is reported with the 0.1.6 state name for it.
     assert.equal((await manageCodexAgent('install', { codexHome, env })).state, 'modified');
     assert.equal((await manageCodexAgent('status', { codexHome, env })).state, 'modified');
     assert.equal((await manageCodexAgent('remove', { codexHome, env })).state, 'modified');
-    assert.equal(readFileSync(agentPath, 'utf8'), custom);
+    assert.equal(readFileSync(skillPath, 'utf8'), custom);
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }
@@ -143,12 +142,8 @@ test('remove deletes only the exact bundled template', async () => {
 // the wrong thread). These assertions pin the sentence, not only the field.
 
 test('the shipped dispatcher tells the host when to pass continueFromTaskId', () => {
-  const template = readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8');
-  const raw = /developer_instructions = """([\s\S]*?)"""/u.exec(template)?.[1] ?? '';
-  // The instruction block is TOML prose: its line wrapping is not part of the rule,
-  // so the assertions run on unwrapped text.
-  const instructions = raw.replace(/\s+/gu, ' ');
-  assert.ok(instructions.length > 0, 'the shipped agent must carry developer instructions');
+  const instructions = shippedAgentText();
+  assert.ok(instructions.length > 0, 'the shipped skill must carry dispatch instructions');
 
   // The rule, in both halves: follow-ups continue, unrelated tasks do not.
   assert.match(instructions, /continueFromTaskId/u);
@@ -172,26 +167,25 @@ test('the shipped dispatcher rules are what install actually writes', async () =
     const env = isolatedEnv(codexHome);
     const installed = await manageCodexAgent('install', { codexHome, env });
     const written = readFileSync(installed.path, 'utf8');
-    const version = /^version = "(.*)"$/mu.exec(written)?.[1] ?? '';
-    const shipped = readFileSync(join(ROOT, 'codex', 'dsh-taskbridge.toml'), 'utf8');
+    const version = /^<!-- dsh-taskbridge-version: (.*) -->$/mu.exec(written)?.[1] ?? '';
+    const shipped = readFileSync(join(ROOT, 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
     assert.match(written, /continueFromTaskId/u, 'the installed file must carry the continuation rule');
-    // The only difference between the shipped template and the installed copy is
-    // the version line the installer renders, so the rules a host reads are the
-    // rules this repository reviews. The managed copy is written with LF terminators
-    // while this repository stores the template CRLF, so the comparison folds
-    // terminators and nothing else: any real edit still fails it.
-    assert.equal(written, shipped.replace(/\r\n/gu, '\n').replace(/^version = ".*"$/mu, `version = "${version}"`));
+    assert.match(written, /Direct single-chain wait — NO `spawn_agent` \/ `wait_agent` wrapper/u, 'the installed skill must forbid spawn_agent/wait_agent polling');
+    assert.equal(
+      written,
+      shipped.replace(/\r\n/gu, '\n').replace(/^<!-- dsh-taskbridge-version: .* -->$/mu, `<!-- dsh-taskbridge-version: ${version} -->`),
+    );
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
 // ---------------------------------------------------------------------------
-// 1.1.0 companion template: wait-based dispatch, no local implementation
+// 1.1.0+ template: wait-based dispatch, no local implementation
 // ---------------------------------------------------------------------------
 
 test('the shipped companion drives delegate_wait and never polls delegate_result in a loop', () => {
-  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-taskbridge.toml'), 'utf8');
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
   // The wait tool is the loop; the old "poll delegate_result until terminal" rule is gone.
   assert.match(template, /delegate_wait/u);
   assert.doesNotMatch(template, /poll `delegate_result` for that\s+same task until terminal/u);
@@ -206,8 +200,8 @@ test('the shipped companion drives delegate_wait and never polls delegate_result
   assert.match(template, /is not\s+acceptance/iu);
   // Attention defaults to waiting, not to cancelling or failing. Matched against the
   // reflowed text, because this sentence wraps differently as the rules above change.
-  assert.match(template, /KEEP WAITING on the SAME taskId/u);
-  assert.match(template, /unless you\s+find a concrete error or a real drift from the goal/u);
+  assert.match(shippedAgentText(), /KEEP WAITING on the SAME taskId/u);
+  assert.match(shippedAgentText(), /unless you find a concrete error or a real drift from the goal/u);
   // Result evidence is read ONCE, not repeatedly.
   assert.match(template, /`delegate_result` ONCE/u);
 });
@@ -215,34 +209,34 @@ test('the shipped companion drives delegate_wait and never polls delegate_result
 test('the shipped companion distinguishes an interrupted WAIT from an interrupted RUN, and names the control channel', () => {
   // 1.2.0: the real acceptance defect was a host told that a healthy run had ended,
   // and an operator who could not stop a task while the host blocked the connection.
-  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-taskbridge.toml'), 'utf8');
+  const template = shippedAgentText();
   // The live case keeps waiting on the SAME task and forbids the other three reactions.
   assert.match(template, /`interrupted`: the wait itself was cut off/u);
   assert.match(template, /It does NOT mean the execution stopped/u);
-  assert.match(template, /never resubmit, never implement locally,\s+never cancel for\s+this reason/iu);
+  assert.match(template, /never resubmit, never implement locally, never cancel for this reason/iu);
   // ...and an UNKNOWN record is not a blanket "keep waiting": check one fact first.
-  assert.match(template, /do NOT assume it is still running and do NOT assume it\s+stopped/u);
+  assert.match(template, /do NOT assume it is still running and do NOT assume it stopped/u);
   assert.match(template, /FIRST check one fact with `delegate_result`/u);
-  assert.match(template, /Do not\s+re-wait indefinitely on a task you cannot classify/u);
+  assert.match(template, /Do not re-wait indefinitely on a task you cannot classify/u);
   // The terminal case is identified by the plugin's own fields, not by the word.
   assert.match(template, /`terminal: true`/u);
   assert.match(template, /`state: "interrupted"`/u);
-  assert.match(template, /do not\s+keep calling `delegate_wait` on it/u);
+  assert.match(template, /do not keep calling `delegate_wait` on it/u);
   // The control channel: derived from this plugin's own MCP configuration, two verbs only.
   assert.match(template, /WHEN THE HOST CANNOT SEND A SECOND CALL/u);
   assert.match(template, /`dsh-taskbridge-control`/u);
   assert.match(template, /status <taskId>/u);
   assert.match(template, /cancel <taskId>/u);
-  assert.match(template, /NEXT TO this plugin's MCP\s+script/u);
-  assert.match(template, /never call an\s+unrelated script/u);
+  assert.match(template, /NEXT TO this plugin's MCP script/u);
+  assert.match(template, /never call an unrelated script/u);
   assert.match(template, /Neither can submit a task, change a setting/u);
   // ...and only for an explicit operator request, with silence otherwise.
   assert.match(template, /explicit operator request to inspect or stop that task/u);
-  assert.match(template, /Otherwise stay silent and keep\s+waiting/u);
+  assert.match(template, /Otherwise stay silent and keep waiting/u);
 });
 
 test('the shipped companion forbids local implementation while a worker runs', () => {
-  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-taskbridge.toml'), 'utf8');
+  const template = shippedAgentText();
   assert.match(template, /DO NOT IMPLEMENT LOCALLY WHILE A DELEGATED WORKER RUNS/u);
   assert.match(template, /single-writer/u);
   // The one exception is an explicit user-authorized takeover, and nothing weaker.
@@ -253,7 +247,7 @@ test('the shipped companion forbids local implementation while a worker runs', (
 });
 
 test('the shipped companion keeps its activation and safety rules unchanged', () => {
-  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-taskbridge.toml'), 'utf8');
+  const template = shippedAgentText();
   for (const anchor of [
     'ACTIVATION (check this before anything else)',
     'delegate_preflight',
@@ -267,39 +261,37 @@ test('the shipped companion keeps its activation and safety rules unchanged', ()
 });
 
 test('the shipped companion states the normal wait contract: omit waitSeconds, stay silent', () => {
-  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'dsh-taskbridge.toml'), 'utf8');
+  const template = shippedAgentText();
   // The normal call shape, and the parameter being optional rather than something to tune.
   assert.match(template, /delegate_wait\(\{ taskId \}\)/u);
-  assert.match(template, /NO `waitSeconds` argument/u);
+  assert.match(template, /Omit `waitSeconds` \(default 3600 seconds/u);
   // The contradiction must be gone: the old rule said "raise it to stay silent longer,
   // never above 3600", which describes a knob that does not exist above its default.
-  assert.doesNotMatch(template, /raise `waitSeconds` only when you\s+deliberately want to stay silent longer/u);
-  assert.match(template, /do not try to "stay longer" by\s+raising it/u);
-  assert.match(template, /cannot\s+wait longer than that/u);
+  assert.doesNotMatch(template, /raise `waitSeconds` only when you deliberately want to stay silent longer/u);
   // A short explicit wait stays legal, but only for a requested one-off diagnostic.
-  assert.match(template, /one-off diagnostic the\s+operator explicitly asked for/u);
+  assert.match(template, /A shorter wait is only for an explicitly requested one-off diagnostic/u);
   // `attention` is the delivery progress-check interval — not an ordinary wait ending, and not a
   // function of how long the task has been running.
-  assert.match(template, /It is NOT reported because the\s+task has been running a long time/u);
-  assert.match(template, /nothing new has been\s+delivered back to the host/u);
+  assert.match(template, /It is NOT reported because the task has been running a long time/u);
+  assert.match(template, /nothing new has been delivered back to the host/u);
   assert.match(template, /operator-configured progress-check interval/u);
-  assert.match(template, /do NOT reset the delivery\s+clock/u);
-  assert.doesNotMatch(template, /OR the wait ended because the run\s+is still going/u);
+  assert.match(template, /do NOT reset the delivery clock/u);
+  assert.doesNotMatch(template, /OR the wait ended because the run is still going/u);
   // `wait-limit` is non-actionable; a client-side timeout proves nothing about the run.
   assert.match(template, /`actionable: false` and `terminal: false`/u);
   assert.match(template, /CLIENT-SIDE tool timeout/u);
-  assert.match(template, /does not prove the\s+execution stopped/u);
+  assert.match(template, /does not prove the execution stopped/u);
   // The phrase spans a line break in the template, so the reflowed text is what is
   // matched: the requirement (never duplicate/restart/cancel on a client timeout) is
   // unchanged, only its line wrapping stops being part of the assertion.
-  assert.match(shippedAgentText(), /never submit a duplicate, restart or cancel a task because a client timeout/u);
+  assert.match(template, /never submit a duplicate, restart or cancel a task because a client timeout/u);
   // The internal cadence belongs to the program, not to the model's polling.
-  assert.match(template, /belongs to the\s+tool, not to you/u);
+  assert.match(template, /belongs to the tool, not to you/u);
   // Silence while waiting, with only the stated exceptions.
   assert.match(template, /While you are waiting, stay silent/u);
   assert.match(template, /do NOT narrate snapshots that have not changed/u);
   assert.match(template, /INDEPENDENT of the delegated task/u);
-  assert.match(template, /an inspection the operator explicitly asked\s+for/u);
+  assert.match(template, /an inspection the operator explicitly asked for/u);
 });
 
 test('the shipped companion prefers waitAfterDecision and forbids inheriting the previous allow', () => {

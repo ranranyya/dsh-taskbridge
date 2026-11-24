@@ -13,6 +13,7 @@ import {
   ANTIGRAVITY_PLUGIN_NAME,
   readAntigravityStatus,
   refreshManagedAntigravityPlugin,
+  renderAntigravityManifest,
   resolveAntigravityHome,
   runAntigravityAction,
   useDirectoryClassifier,
@@ -214,6 +215,47 @@ test('startup refresh upgrades an unmodified older Antigravity plugin version in
   }
 });
 
+test('startup refresh recognizes exact preview3 rules without ownership records and preserves an edited skill', async () => {
+  const rules = [
+    ['skills/dsh-taskbridge/SKILL.md', 'SKILL.md'],
+    ['agents/dsh-taskbridge.md', 'dsh-taskbridge.md'],
+  ];
+  for (const customizeSkill of [false, true]) {
+    const fx = tempEnv();
+    try {
+      const plugin = join(fx.agyHome, 'plugins', ANTIGRAVITY_PLUGIN_NAME);
+      const options = { antigravityHome: fx.agyHome, env: fx.env, version: '1.9.0' };
+      const custom = new Map();
+      for (const [key, fixture] of rules) {
+        const path = join(plugin, key);
+        mkdirSync(dirname(path), { recursive: true });
+        const preview = readFileSync(join(ROOT, 'tests/fixtures/antigravity-preview3', fixture), 'utf8');
+        if (customizeSkill && fixture === 'SKILL.md') custom.set(key, `${preview}\n# Operator note\n`);
+        writeFileSync(path, custom.get(key) ?? preview);
+      }
+      writeFileSync(join(plugin, 'plugin.json'), renderAntigravityManifest('1.9.0-preview3'));
+      assert.equal(existsSync(join(fx.dshHome, 'data')), false);
+
+      const previous = await readAntigravityStatus(options);
+      for (const [key] of rules) {
+        assert.equal(previous.plugin.files[key].state, custom.has(key) ? 'modified' : 'outdated');
+      }
+
+      const refreshed = await refreshManagedAntigravityPlugin(options);
+      assert.deepEqual(refreshed.changed, ['plugin']);
+      assert.deepEqual(refreshed.refused.map((item) => item.code), customizeSkill ? ['PLUGIN_USER_MODIFIED'] : []);
+      for (const [key] of rules) {
+        assert.equal(refreshed.status.plugin.files[key].state, custom.has(key) ? 'modified' : 'installed');
+        assert.equal(readFileSync(join(plugin, key), 'utf8'),
+          custom.get(key) ?? readFileSync(join(ROOT, 'antigravity', key), 'utf8'));
+      }
+      assert.equal(JSON.parse(readFileSync(join(plugin, 'plugin.json'), 'utf8')).version, '1.9.0');
+    } finally {
+      fx.cleanup();
+    }
+  }
+});
+
 test('user-plane /api/dsh-delegate/antigravity serves GET status and POST actions without changing the switch', async () => {
   const fx = tempEnv();
   try {
@@ -320,7 +362,8 @@ test('client store and built bundle expose Antigravity integration tab and actio
 test('worker-prompt automatically protects uncommitted changes for shared or dirty checkouts, prefers native file tools, and cleans temp logs', () => {
   const shared = buildWorkerPrompt({ taskId: 't1', prompt: 'Fix bug', workspacePath: '/repo', isolation: 'shared' });
   assert.match(shared, /Preserve existing uncommitted changes and unrelated files/u);
-  assert.match(shared, /remove those untracked temporary log files before finishing/u);
+  assert.match(shared, /Do NOT create `\.cache\/` or temporary log files inside the workspace/u);
+  assert.match(shared, /remove those untracked temporary files before finishing/u);
   assert.match(shared, /Always prefer native file\/search\/edit tools/u);
   assert.match(shared, /Do not install packages or make external network requests/u);
   const dirty = buildWorkerPrompt({ taskId: 't2', prompt: 'Fix bug', workspacePath: '/repo', isolation: 'worktree', baseline: { dirtyBaseline: true } });
@@ -346,7 +389,7 @@ test('createAntigravitySeam forwards homeDirectory and ANTIGRAVITY error codes m
   }
 });
 
-test('published 1.7.1 Codex companion fixture upgrades cleanly to 1.8.0 in both LF and CRLF forms', async () => {
+test('published 1.7.1 Codex companion fixture migrates cleanly to 1.9.0 native skill in both LF and CRLF forms and retires old toml', async () => {
   const prior = readFileSync(join(ROOT, 'tests', 'fixtures', 'agent-1.7.1.toml'), 'utf8');
   const lf = prior.replace(/\r\n/gu, '\n');
   assert.equal(isKnownPriorTemplate(prior), true);
@@ -358,11 +401,12 @@ test('published 1.7.1 Codex companion fixture upgrades cleanly to 1.8.0 in both 
     const res = await refreshKnownAgentTemplate({
       codexHome: home,
       env: { DSH_HOME: join(home, '.dsh') },
-      version: '1.8.0',
+      version: '1.9.0',
     });
-    assert.deepEqual(res.changed, ['agent']);
+    assert.deepEqual(res.changed, ['agent', 'legacyAgent']);
     assert.deepEqual(res.refused, []);
-    assert.match(readFileSync(join(home, 'agents', 'dsh-taskbridge.toml'), 'utf8'), /^version = "1\.8\.0"$/mu);
+    assert.equal(existsSync(join(home, 'agents', 'dsh-taskbridge.toml')), false, 'legacy untouched subagent must be retired');
+    assert.match(readFileSync(join(home, 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8'), /<!-- dsh-taskbridge-version: 1\.9\.0 -->/u);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -380,4 +424,7 @@ test('antigravity subagent omits call_mcp_tool from tools frontmatter (auto-inje
   assert.match(skill, /Model:\s*"flash"/u);
   assert.match(skill, /PREFLIGHT_NO_COMMITS/u);
   assert.match(skill, /answerReceipt\.applied === true/u);
+  assert.match(skill, /不要读取 `delegate_status`/u);
+  assert.match(skill, /无需重复调用 `delegate_result`/u);
+  assert.match(agent, /不要用 `read_file` 通读目标仓库的业务源码或测试文件/u);
 });

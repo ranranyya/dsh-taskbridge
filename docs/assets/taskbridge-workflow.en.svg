@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="804" viewBox="0 0 820 804" role="img" aria-labelledby="title description" xml:lang="en">
+  <title id="title">DSH TaskBridge architecture</title>
+  <desc id="description">DSH TaskBridge four-layer architecture. Users and developers access the shared dispatch core, MCP protocol, and DSH execution engine through host adapters.</desc>
+  <style>
+    text { font-family: 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', sans-serif; fill: #142643; }
+    .title { font-size: 31px; font-weight: 700; }
+    .subtitle { font-size: 16px; fill: #465b75; }
+    .user { font-size: 19px; font-weight: 700; text-anchor: middle; }
+    .heading { font-size: 21px; font-weight: 700; }
+    .path { font: 14px Consolas, Menlo, 'DejaVu Sans Mono', monospace; fill: #355a8e; }
+    .detail { font-size: 15px; fill: #314762; }
+    .future { font-size: 14px; fill: #465b75; text-anchor: end; }
+    .level { font-size: 15px; font-weight: 700; text-anchor: middle; }
+    .card { fill: #fff; stroke: #bccce1; stroke-width: 1.2; }
+    .layer-1 { fill: #f5f9ff; stroke: #9bb8e6; }
+    .layer-4 { stroke: #a2c9c2; }
+    .connector { fill: none; stroke: #526d92; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+    .caption { fill: #eef3fa; }
+    .service { font-size: 14px; fill: #38516e; text-anchor: middle; }
+  </style>
+  <rect width="820" height="804" rx="16" fill="#f6f8fc"/>
+  <text class="title" x="36" y="49">DSH TaskBridge architecture</text>
+  <text class="subtitle" x="36" y="76">Each arrow shows what a layer provides to the layer above</text>
+  <rect class="card" x="242" y="96" width="336" height="43" rx="10"/>
+  <text class="user" x="410" y="124">Users and developers</text>
+  <path class="connector" d="M410 194V145m-5 6 5-6 5 6"/>
+  <rect class="caption" x="139" y="154.5" width="542" height="25" rx="12.5"/>
+  <text class="service" x="410" y="171.5">Low-overhead dispatch, approvals, and review in each host</text>
+  <path class="connector" d="M410 367V318m-5 6 5-6 5 6"/>
+  <rect class="caption" x="139" y="327.5" width="542" height="25" rx="12.5"/>
+  <text class="service" x="410" y="344.5">Shared dispatch rules and state machine</text>
+  <path class="connector" d="M410 521V472m-5 6 5-6 5 6"/>
+  <rect class="caption" x="139" y="481.5" width="542" height="25" rx="12.5"/>
+  <text class="service" x="410" y="498.5">11 delegate_* MCP tools and a blocking event stream</text>
+  <path class="connector" d="M410 675V626m-5 6 5-6 5 6"/>
+  <rect class="caption" x="139" y="635.5" width="542" height="25" rx="12.5"/>
+  <text class="service" x="410" y="652.5">Scoped execution, worktree isolation, and pause/resume</text>
+  <g>
+    <rect class="card layer-1" x="36" y="194" width="748" height="118" rx="12"/>
+    <rect x="54" y="208" width="38" height="26" rx="7" fill="#e1ebff"/>
+    <text class="level" x="73" y="226">L1</text>
+    <text class="heading" x="107" y="226">Host adapters</text>
+    <text class="future" x="762" y="224">Extensible to new hosts</text>
+    <text class="path" x="107" y="249">integrations/adapters/</text>
+    <text class="detail" x="107" y="273">Codex native skill dispatches in the current session and waits on one delegate_wait chain</text>
+    <text class="detail" x="107" y="295">Antigravity uses a lightweight Flash subagent to wait in the background by default</text>
+  </g>
+  <g>
+    <rect class="card layer-2" x="36" y="367" width="748" height="99" rx="12"/>
+    <rect x="54" y="381" width="38" height="26" rx="7" fill="#e1ebff"/>
+    <text class="level" x="73" y="399">L2</text>
+    <text class="heading" x="107" y="399">Shared cross-platform dispatch core</text>
+    <text class="path" x="107" y="422">integrations/core/  ·  01–04</text>
+    <text class="detail" x="107" y="446">Activation rules · Work packets · Direction and scope · Pragmatic review</text>
+  </g>
+  <g>
+    <rect class="card layer-3" x="36" y="521" width="748" height="99" rx="12"/>
+    <rect x="54" y="535" width="38" height="26" rx="7" fill="#e1ebff"/>
+    <text class="level" x="73" y="553">L3</text>
+    <text class="heading" x="107" y="553">MCP protocol and state-machine contract</text>
+    <text class="path" x="107" y="576">bin/dsh-delegate-mcp.js  ·  src/mcp/server.js</text>
+    <text class="detail" x="107" y="600">Repository preflight · Wait events · Approvals and questions · Saved reviews</text>
+  </g>
+  <g>
+    <rect class="card layer-4" x="36" y="675" width="748" height="99" rx="12"/>
+    <rect x="54" y="689" width="38" height="26" rx="7" fill="#d9f3ed"/>
+    <text class="level" x="73" y="707">L4</text>
+    <text class="heading" x="107" y="707">DSH execution and isolation engine</text>
+    <text class="path" x="107" y="730">src/jobs/  ·  src/runtime/worker-prompt.js</text>
+    <text class="detail" x="107" y="754">Model routing · Git worktrees and shared mode · Changes and test evidence</text>
+  </g>
+</svg>
