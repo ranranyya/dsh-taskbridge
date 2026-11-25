@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "DSH TaskBridge",
-    "description": "Let Codex and Antigravity plan and review while DSH executes code inside a clean black-box MCP bridge: centralized API/model/effort routing, Git worktree isolation & cross-subtask reuse, one-click setup, quiet waiting, scoped approvals and linked cleanup (cutting strong-model non-cached tokens by 24.5%–32.1% at parity capability). Claude Code / Claude Desktop support is planned for 2.0.",
+    "description": "Cross-host task delegation bridge for DeepSeek Harness (DSH): let your upper host focus on architecture planning and delivery review while offloading heavy coding and test loops to DSH to save flagship model quota. Centralizes API, model, and reasoning-effort routing with Git worktree isolation, cross-subtask reuse, one-click host setup, silent waiting, scoped approvals, and linked cleanup (supports Codex and Antigravity; Claude Code / Claude Desktop planned for 2.0).",
     "detail": "docs/INTRODUCTION.md"
   }
 }

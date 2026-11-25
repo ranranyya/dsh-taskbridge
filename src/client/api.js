@@ -647,7 +647,7 @@ export const GRANT_KIND_LABELS = Object.freeze({
  * standing permission, and the panel must not read like an approval workflow.
  */
 export const PERMISSION_STATE_LABELS = Object.freeze({
-  pending: '等待本机指挥官决定（仅这一次调用）',
+  pending: '等待宿主端决定（仅这一次调用）',
   decided: '已决定',
   expired: '已超时（未决定即为拒绝）',
   cancelled: '已撤回',
@@ -1434,8 +1434,8 @@ export function permissionSummary(task) {
       waiting: true,
       label: '等待本次调用授权决定',
       note: access === null || access === undefined
-        ? `工作进程暂停在 ${tool} 这一次调用上，等待本机指挥官决定。任务仍在运行，未失败，也未完成。`
-        : `工作进程暂停在 ${tool} 这一次调用上，请求把该次调用的沙箱权限提升到 ${access}，等待本机指挥官决定。`
+        ? `工作进程暂停在 ${tool} 这一次调用上，等待宿主端决定。任务仍在运行，未失败，也未完成。`
+        : `工作进程暂停在 ${tool} 这一次调用上，请求把该次调用的沙箱权限提升到 ${access}，等待宿主端决定。`
           + '无论是否允许，会话的常规权限（workspace-write）保持不变。',
       detail: `请求编号 ${pending?.requestId ?? '—'} · 调用 ${pending?.callId ?? '—'}`,
     };
@@ -1806,7 +1806,7 @@ export function taskOutcome(task) {
   } else if (state === 'awaiting-host-review') {
     label = '等待宿主审查';
     tone = 'warn';
-    note = '执行已完成，等待宿主（Codex）审查；插件不会自行验收。';
+    note = '执行已完成，等待宿主端审查；插件不会自行验收。';
     // Stated once, as the headline above; a second identical phase badge is noise.
     phaseLabel = null;
   } else if (state === 'failed') {

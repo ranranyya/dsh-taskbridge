@@ -1,6 +1,6 @@
 # Runtime compatibility
 
-Build 1.9.0 retains the loading policy introduced in 1.4.2: **no DSH version whitelist**: it omits `engines.dsh`, declares
+Build 1.9.1 retains the loading policy introduced in 1.4.2: **no DSH version whitelist**: it omits `engines.dsh`, declares
 host-provided `@deepseek-ai/dsh-*` peers as `*`, and publishes no DSH engine range
 in the custom plugin index. The plugin uses runtime capability checks rather than
 rejecting a host solely by its version number. Node.js `>=24` is still required.
@@ -53,7 +53,7 @@ acceptance run.
 - Development dependencies remain pinned for reproducible tests; they do not
   restrict the host-provided peer versions used by an installed plugin.
 - Older plugin packages keep their own metadata and can still be refused by a
-  newer host. Upgrade to `dsh-taskbridge@1.9.0` (or `1.4.2+`) to use this loading policy.
+  newer host. Upgrade to `dsh-taskbridge@1.9.1` (or `1.4.2+`) to use this loading policy.
 
 ## 2. What DSH 0.2.2 changes
 
@@ -183,10 +183,10 @@ What remains genuinely unverified:
 
 ## 5. Upgrading from an older plugin build
 
-1. Download `dsh-taskbridge-1.9.0.tgz` from the GitHub Release (or install `dsh-taskbridge` from npm), or build the package locally (`npm pack`).
+1. Download `dsh-taskbridge-1.9.1.tgz` from the GitHub Release (or install `dsh-taskbridge` from npm), or build the package locally (`npm pack`).
 2. Install it the way your surface requires: the Desktop **Plugins manager** for a
    Desktop profile (npm/CLI operations on that profile are refused), or
-   `dsh plugin --profile <name> add ./dsh-taskbridge-1.9.0.tgz` for a CLI profile you
+   `dsh plugin --profile <name> add ./dsh-taskbridge-1.9.1.tgz` for a CLI profile you
    start yourself.
 3. The settings, the switch value and the task history are preserved
    (`$DSH_HOME/data/dsh-delegate`); nothing is migrated destructively.

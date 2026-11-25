@@ -2222,7 +2222,7 @@ function TaskDetail({ store, task }) {
                 {`${entry.requestId} · ${entry.toolName ?? '—'} · `
                   + `${PERMISSION_STATE_LABELS[entry.state] ?? entry.state ?? '—'} · `
                   + `${PERMISSION_OUTCOME_LABELS[entry.outcome] ?? entry.outcome ?? '—'}`
-                  + `${entry.decidedBy === 'commander' ? ` · ${PERMISSION_DECISION_LABELS[entry.outcome === 'allowed-once' ? 'allow-once' : 'reject'] ?? '本机指挥官'}` : ''}`}
+                  + `${entry.decidedBy === 'commander' ? ` · ${PERMISSION_DECISION_LABELS[entry.outcome === 'allowed-once' ? 'allow-once' : 'reject'] ?? '宿主端'}` : ''}`}
               </li>
             ))}
           </ul>
@@ -2230,7 +2230,7 @@ function TaskDetail({ store, task }) {
       )}
       <p className="dshdg-hint">
         逐次授权只覆盖当前调用。后续调用如需扩大权限，须重新核对参数并审批。它不能创建或扩大任何跨任务或长期有效的授权（“长期有效”指跨会话持久的授权），不能修改设置、凭据、本机调用开关、提供方、模型或隔离方式；
-        工作进程的常规沙箱权限始终保持 workspace-write。此界面不提供手工批准按钮，决定由本机 MCP 指挥官通过
+        工作进程的常规沙箱权限始终保持 workspace-write。此界面不提供手工批准按钮，决定由宿主端通过
         delegate_permission_decide 作出。
       </p>
 
@@ -3316,7 +3316,7 @@ function TasksPanel({ store, snapshot }) {
   return (
     <div className="dshdg-panel">
       <div className="dshdg-row">
-        <p className="dshdg-muted">这里只记录执行事实。执行完成不等于被接受：“等待宿主审查”要由宿主（例如 Codex 或 Antigravity）单独给出结论。</p>
+        <p className="dshdg-muted">这里只记录执行事实。执行完成不等于被接受：“等待宿主审查”要由宿主端单独给出结论。</p>
         <span className="dshdg-spacer" />
         <span className="dshdg-hint" data-dshdg-refresh-hint="">
           {changing !== true

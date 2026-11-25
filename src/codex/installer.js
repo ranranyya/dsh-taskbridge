@@ -575,6 +575,9 @@ export const KNOWN_SKILL_TEMPLATES = [
   { version: '1.9.0-preview2', sha256: '6a2684b21762157edf3b32ddccea81d6327b117454cdb74e0c7260803f46d4be' },
   { version: '1.9.0-preview3', sha256: 'c3b3d6ad273f55ec822cde3f6635f875103c339d65821601d3baaddac85af4d7' },
   { version: '1.9.0-preview3', sha256: '1237d095f32a0c4ac1d5dde8f05f11b6edf17d863ff1bb67ab63a17f6ac2fe3b' },
+  // Published 1.9.0 native Codex skill, in LF and CRLF.
+  { version: '1.9.0', sha256: '203e686fe12ee4827ea9c5bab404997f641a8f45d45daa37efc776b7e9620d71' },
+  { version: '1.9.0', sha256: '9a0eaf95266ad13e175d0223f954f19e0c41573d817cd6099112416156cc395f' },
 ];
 
 /** The version provenance comment line inside a shipped Markdown Codex skill file. */
