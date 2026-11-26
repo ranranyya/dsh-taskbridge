@@ -91,6 +91,7 @@ import { MAX_PLAN_DEPTH } from './plan-store.js';
 import { buildWorkerPrompt } from '../runtime/worker-prompt.js';
 import { captureBaseline, captureDiff } from '../workspace/audit.js';
 import { LOCK_CODES, LOCK_MODES, WorkspaceError, resolveWorkspacePath } from '../workspace/locks.js';
+import { SOURCE_SYNC_REASONS, syncWorktreeToSource } from '../workspace/sync-source.js';
 import {
   REVIEW_NOTE_MAX_CHARS,
   normalizeReviewNote,
@@ -3374,6 +3375,16 @@ export class JobEngine {
       throw new JobError(JOB_CODES.reviewInvalid, 'taskId is required', { field: 'taskId' });
     }
     const { decision, note: rawNote } = reviewInput(request);
+    if (request?.applyToSource !== undefined && typeof request.applyToSource !== 'boolean') {
+      throw new JobError(JOB_CODES.reviewInvalid, 'applyToSource must be a boolean', { field: 'applyToSource' });
+    }
+    const applyToSource = request?.applyToSource === true;
+    if (applyToSource && decision !== HOST_REVIEW_STATES.accepted) {
+      throw new JobError(JOB_CODES.reviewInvalid, 'applyToSource requires decision: "accepted"', {
+        field: 'applyToSource',
+        decision,
+      });
+    }
 
     const task = this.tasks.get(taskId);
     if (task === undefined || task.connectionId !== connectionId) {
@@ -3402,7 +3413,69 @@ export class JobEngine {
     const note = redactText(rawNote);
     const summary = reviewSummary(request?.completionSummary);
     const entry = this.beginReviewWrite(task, decision, note, summary);
-    return await this.awaitReviewWrite(task, entry, reviewWaitMs(request));
+    const result = await this.awaitReviewWrite(task, entry, reviewWaitMs(request));
+    return await this.maybeApplyAcceptedReviewToSource(task, result, applyToSource);
+  }
+
+  /**
+   * Synchronize an accepted isolated worktree back to `sourcePath` when requested.
+   *
+   * Runs strictly AFTER the review decision is durably persisted so a local source
+   * conflict or closed switch never loses or rolls back the recorded acceptance.
+   * @param {object} record - live task record or durable history row.
+   * @param {object} reviewResult - result returned by `awaitReviewWrite` / `awaitHistoryReviewWrite`.
+   * @param {boolean} applyToSource - whether the caller asked to sync back.
+   * @returns {Promise<object>} reviewResult, with `sourceSync` attached only when requested.
+   */
+  async maybeApplyAcceptedReviewToSource(record, reviewResult, applyToSource) {
+    if (applyToSource !== true) return reviewResult;
+    const persistence = reviewResult?.reviewPersistence ?? null;
+    if (persistence?.state !== REVIEW_PERSISTENCE_STATES.saved || persistence?.durable !== true) {
+      return {
+        ...reviewResult,
+        sourceSync: {
+          applied: false,
+          reason: SOURCE_SYNC_REASONS.reviewNotDurable,
+          changedFiles: [],
+          conflictingPaths: [],
+        },
+      };
+    }
+    if (this.aborted || (this.authorizationMode === 'switch' && this.delegationEnabled !== true)) {
+      return {
+        ...reviewResult,
+        sourceSync: {
+          applied: false,
+          reason: SOURCE_SYNC_REASONS.delegationDisabled,
+          changedFiles: [],
+          conflictingPaths: [],
+        },
+      };
+    }
+    const isolation = record?.effective?.worker?.isolation ?? record?.isolation ?? null;
+    const sourcePath = record?.sourcePath ?? null;
+    const executionPath = record?.executionPath ?? record?.executionWorkspacePath ?? record?.workspacePath ?? null;
+    if (isolation === 'shared' || (typeof sourcePath === 'string' && typeof executionPath === 'string' && samePath(sourcePath, executionPath))) {
+      return {
+        ...reviewResult,
+        sourceSync: {
+          applied: true,
+          reason: SOURCE_SYNC_REASONS.sharedInPlace,
+          changedFiles: [],
+          conflictingPaths: [],
+        },
+      };
+    }
+    const baseHead = record?.baseline?.head ?? null;
+    const sourceSync = await syncWorktreeToSource({
+      sourcePath,
+      executionPath,
+      baseHead,
+      locks: this.deps?.locks ?? null,
+      taskId: record?.taskId,
+      gitExec: this.deps?.syncGitExec,
+    });
+    return { ...reviewResult, sourceSync };
   }
 
   /**
@@ -5231,10 +5304,20 @@ export class JobEngine {
    * @returns {Promise<object>} `{ task, hostAcceptance, reviewPersistence }`.
    * @throws {JobError} on any refusal.
    */
-  async recordHistoricalReview({ taskId, connectionId }, decision, note, waitMs, completionSummary = undefined) {
+  async recordHistoricalReview({ taskId, connectionId }, decision, note, waitMs, completionSummary = undefined, options = undefined) {
     const input = reviewInput({ decision, note });
     decision = input.decision;
     note = redactText(input.note);
+    if (options?.applyToSource !== undefined && typeof options.applyToSource !== 'boolean') {
+      throw new JobError(JOB_CODES.reviewInvalid, 'applyToSource must be a boolean', { field: 'applyToSource' });
+    }
+    const applyToSource = options?.applyToSource === true;
+    if (applyToSource && decision !== HOST_REVIEW_STATES.accepted) {
+      throw new JobError(JOB_CODES.reviewInvalid, 'applyToSource requires decision: "accepted"', {
+        field: 'applyToSource',
+        decision,
+      });
+    }
     const summary = reviewSummary(completionSummary);
     const row = await this.storedTaskRow(taskId, connectionId);
     // The SAME answer an unknown task gets: the live path refuses an unknown id with this
@@ -5250,7 +5333,8 @@ export class JobEngine {
       });
     }
     const entry = this.beginHistoryReviewWrite(row, decision, note, summary);
-    return await this.awaitHistoryReviewWrite(row, entry, waitMs);
+    const result = await this.awaitHistoryReviewWrite(row, entry, waitMs);
+    return await this.maybeApplyAcceptedReviewToSource(row, result, applyToSource);
   }
 
   /**

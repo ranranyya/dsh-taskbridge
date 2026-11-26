@@ -621,6 +621,8 @@ const KNOWN_PRIOR_ANTIGRAVITY_FILES = Object.freeze({
     'b27118375a6f87fc35ea623c131912ef1545adc84f7c0c5a94790d12b73d4d4d',
     // Published 1.9.0 / 1.9.1 SKILL.md (LF)
     '0a3f0e10cb627de8a8b5c02d92352226d233291294599ea8b824bb250b9ea2ab',
+    // Published 1.9.2 SKILL.md (LF)
+    'fcafaf1fcd90844e08d70676051c85187b00cecfd557637860292c3596e795b3',
   ]),
   'agents/dsh-taskbridge.md': Object.freeze([
     // Published 1.8.0 agents/dsh-taskbridge.md (LF)

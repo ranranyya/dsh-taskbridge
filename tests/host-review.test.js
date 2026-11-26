@@ -628,8 +628,9 @@ test('the MCP catalog advertises delegate_review with a closed schema, and its r
   assert.ok(review !== undefined, 'delegate_review must be advertised');
   assert.deepEqual(
     Object.keys(review.inputSchema.properties).sort(),
-    ['completionSummary', 'decision', 'note', 'receiptOnly', 'taskId'],
+    ['applyToSource', 'completionSummary', 'decision', 'note', 'receiptOnly', 'taskId'],
   );
+  assert.equal(review.inputSchema.properties.applyToSource.type, 'boolean');
   assert.equal(review.inputSchema.properties.receiptOnly.type, 'boolean');
   assert.deepEqual(review.inputSchema.required, ['taskId', 'decision', 'note']);
   assert.equal(review.inputSchema.additionalProperties, false);
@@ -671,6 +672,8 @@ test('the MCP catalog advertises delegate_review with a closed schema, and its r
   for (const args of [
     { taskId: 't1', decision: 'accepted', note: 'ok', extra: 1 },
     { taskId: 't1', decision: 'accepted', note: 'ok', receiptOnly: 'true' },
+    { taskId: 't1', decision: 'accepted', note: 'ok', applyToSource: 'true' },
+    { taskId: 't1', decision: 'changes-requested', note: 'fix', applyToSource: true },
     { taskId: 't1', decision: 'accepted', note: 'q'.repeat(8_001) },
     { taskId: 't1', decision: 'approved', note: 'ok' },
     { taskId: 't1', decision: 'accepted', note: 'ok', completionSummary: 'z'.repeat(2_001) },
@@ -719,6 +722,34 @@ test('receipt-only host review sends the same write and returns the current pers
   persistence = { state: 'timed-out', decision: 'accepted', accepted: false, durable: false, retryable: false };
   assert.deepEqual(await review({ receiptOnly: true }), {
     ok: true, taskId: 't1', reviewPersistence: persistence,
+  });
+
+  // When `applyToSource: true` returns `sourceSync`, receiptOnly preserves it alongside reviewPersistence.
+  const sourceSync = { applied: true, reason: 'synced', changedFiles: ['src/a.js'], conflictingPaths: [] };
+  const serverWithSync = createMcpServer({
+    async callExecution(route, payload) {
+      assert.equal(route, 'review');
+      assert.equal(payload.applyToSource, true);
+      return {
+        ok: true,
+        task: { taskId: 't1' },
+        hostAcceptance,
+        reviewPersistence: { state: 'saved', decision: 'accepted', accepted: true, durable: true },
+        sourceSync,
+      };
+    },
+  });
+  await serverWithSync.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  const syncRes = await serverWithSync.handle({
+    jsonrpc: '2.0', id: 2, method: 'tools/call',
+    params: { name: 'delegate_review', arguments: { ...args, receiptOnly: true, applyToSource: true } },
+  });
+  assert.equal(syncRes.result.isError, undefined);
+  assert.deepEqual(JSON.parse(syncRes.result.content[0].text), {
+    ok: true,
+    taskId: 't1',
+    reviewPersistence: { state: 'saved', decision: 'accepted', accepted: true, durable: true },
+    sourceSync,
   });
 });
 

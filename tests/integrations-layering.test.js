@@ -73,9 +73,9 @@ test('both Codex and Antigravity skills enforce shared Layer-2 philosophy: decom
   assert.match(agy, /Model:\s*"flash"/u);
   assert.match(agy, /不要读取 `delegate_status`/u);
   assert.match(agy, /无需重复调用 `delegate_result`/u);
-  assert.match(agy, /隔离工作树收官与回写询问（`worktree` 模式）/u);
-  assert.match(agy, /不要调用 `ask_question` 弹窗工具/u);
-  assert.match(agy, /先检查 `sourcePath` 是否有未提交冲突/u);
+  assert.match(agy, /隔离工作树收官与自动写回（`worktree` 模式）/u);
+  assert.match(agy, /applyToSource: true/u);
+  assert.match(agy, /严禁宿主端另起脚本拷贝、打补丁或回 `sourcePath` 重跑测试/u);
   assert.match(agySub, /不要用 `read_file` 通读目标仓库的业务源码或测试文件/u);
 });
 
@@ -84,8 +84,8 @@ test('Codex reads a bounded entry and loads the existing event rules on demand',
   const entry = files.find((file) => file.id === 'codex-skill').content;
   const { content: reference, output } = files.find((file) => file.id === 'codex-reference');
   const digest = createHash('sha256').update(reference, 'utf8').digest('hex');
-  assert.ok(Buffer.byteLength(entry) <= 12000);
-  assert.ok(Buffer.byteLength(reference) <= 12000);
+  assert.ok(Buffer.byteLength(entry) <= 16000);
+  assert.ok(Buffer.byteLength(reference) <= 24000);
   assert.equal(basename(output), `rules-reference-${digest}.md`);
   assert.ok(entry.includes(`](${basename(output)})`));
   const description = entry.split('---')[1].replace(/\s+/gu, ' ');
@@ -100,8 +100,17 @@ test('Codex reads a bounded entry and loads the existing event rules on demand',
   const localVerifySection = entry.split('## LOCAL VERIFICATION')[1].replace(/\s+/gu, ' ');
   assert.match(
     localVerifySection,
-    /In `worktree` isolation \(no apply\/merge tool\), after durable `accepted` review \(and any final `delegate_plan` review\), leave `sourcePath` untouched \(no copy\/patch\/re-test\), report `executionWorkspacePath`, and ask in plain text \(never `request_user_input`\) whether to write changes back; if confirmed, check `sourcePath` for conflicts first and sync locally without committing\./u,
+    /On the final `accepted` `worktree` task \(omit on `changes-requested` or intermediate subtasks\), pass `applyToSource: true` so TaskBridge syncs changes to `sourcePath` without committing; never copy, patch, or re-test there yourself\./u,
   );
+  assert.match(localVerifySection, /Once `sourceSync\.applied === true`, do not run extra hash or git checks in `sourcePath`\./u);
+  assert.match(localVerifySection, /Report `sourceSync` \(`applied`, `reason`, `conflictingPaths`\) and `executionWorkspacePath`\./u);
+  const p0Section = entry.split('## P0: COMMANDER-OWNED PLANNING AND WORK PACKETS')[1].split('\n## ')[0].replace(/\s+/gu, ' ');
+  assert.match(p0Section, /Batch read-only inspection of key entry files, specs and existing contracts into 1–2 combined reads/u);
+  assert.match(p0Section, /Object\.hasOwn/u);
+  assert.match(p0Section, /exact default semantics per spec/u);
+  assert.match(p0Section, /os\.tmpdir\(\)/u);
+  assert.match(entry, /Codex's own `approval_policy` never forbids granting `allow-once`/u);
+  assert.match(reference, /Your own Codex host sandbox\/`approval_policy` does NOT restrict approving/u);
   assert.doesNotMatch(entry, /waitAfterDecision: true/u);
   assert.match(reference, /waitAfterDecision: true/u);
   assert.match(reference, /`question`: answer/u);

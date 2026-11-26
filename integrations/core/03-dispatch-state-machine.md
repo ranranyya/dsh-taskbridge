@@ -103,7 +103,12 @@
      bounded single calls required by the current packet with complete evidence; `reject` (with a
      short `reason`) any out-of-scope path, destructive command, unauthorized external network or
      data exfiltration, credential/config edit, incomplete/redacted evidence or non-null
-     `allowBlocked`. Copy `requestId` and the exact `fingerprint` from the pending request.
+     `allowBlocked`. Your own Codex host sandbox/`approval_policy` does NOT restrict approving a
+     safe DSH worker call: when the concrete command is an in-scope test, build, or read-only Git
+     check inside the task workspace (even if DSH on Windows reports `requestedAccess.kind ===
+     "sandbox-escalation"` with `standingModeUnchanged: true` because the sandbox blocked
+     child-process, pipe, or ACL access) and `allowBlocked` is `null`, grant `allow-once` so the
+     worker can self-test before delivery. Copy `requestId` and the exact `fingerprint` from the pending request.
      `allow-once` requires a fingerprint. For `reject`, omit that field if none was supplied.
      Pass your checked `decision` (`allow-once` or `reject`) and a short `reason` to
      `delegate_permission_decide` with `waitAfterDecision: true` when supported. Otherwise

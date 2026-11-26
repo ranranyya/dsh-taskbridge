@@ -819,8 +819,11 @@ export const TOOLS = Object.freeze([
       + 'recorded conclusion, not a place for secrets. A longer note is refused before anything is written; it is '
       + 'never silently shortened. '
       + 'This cannot approve a permission request, change the switch, a provider, a model, the isolation or a '
-      + 'credential, merge or apply the diff, or create another task. Execution completion is never accepted '
-      + 'automatically: until this is called the task stays unreviewed. '
+      + 'credential, commit/push, or create another task. When `decision` is `"accepted"` on a `worktree`-isolated '
+      + 'task, setting optional `applyToSource: true` runs a zero-destruction conflict precheck after durable '
+      + 'acceptance and syncs the verified worktree changes back to `sourcePath` without committing (returning a '
+      + 'structured `sourceSync` receipt); omitting it leaves `sourcePath` untouched. Execution completion is never '
+      + 'accepted automatically: until this is called the task stays unreviewed. '
       + 'Only a task awaiting host review (execution finished) can be reviewed; a running, failed, cancelled or '
       + 'interrupted task, or another connection\u2019s task, is refused. '
       + 'The first decision is final for this task: repeating the SAME decision with the SAME note is an '
@@ -873,9 +876,17 @@ export const TOOLS = Object.freeze([
             + 'note WITH the same summary is an idempotent no-op, and a different summary \u2014 or adding one to an '
             + 'already recorded review \u2014 is refused like any other different conclusion.',
         },
+        applyToSource: {
+          type: 'boolean',
+          description: 'OPTIONAL (default false; only valid with decision: "accepted"). When true on a worktree-isolated '
+            + 'task, safely applies the verified worktree changes back to sourcePath after durable acceptance without '
+            + 'staging or committing, returning a structured `sourceSync` receipt (zero bytes modified on any conflict, '
+            + 'HEAD change, or unsafe/sensitive path). Omit on intermediate multi-stage subtasks so sourcePath stays '
+            + 'clean until the final packet passes.',
+        },
         receiptOnly: {
           type: 'boolean',
-          description: 'Set true to return the task ID and reviewPersistence only. Read full details with delegate_result.',
+          description: 'Set true to return the task ID, reviewPersistence, and optional sourceSync only. Read full details with delegate_result.',
         },
       },
       required: ['taskId', 'decision', 'note'],
@@ -1317,6 +1328,11 @@ function validateArgs(tool, args) {
     }
     if (out.reviewNoteOffset !== undefined && out.completionSummaryOffset !== undefined) {
       throw new McpError('MCP_ARGUMENTS_INVALID', 'delegate_result cannot combine reviewNoteOffset and completionSummaryOffset');
+    }
+  }
+  if (tool.name === 'delegate_review') {
+    if (out.applyToSource === true && out.decision !== 'accepted') {
+      throw new McpError('MCP_ARGUMENTS_INVALID', 'delegate_review.applyToSource requires decision: "accepted"');
     }
   }
   if (tool.name === 'delegate_plan') {
@@ -2943,12 +2959,14 @@ export function createMcpServer(options) {
             ok: true,
             taskId: result.task?.taskId ?? review.taskId,
             reviewPersistence: result.reviewPersistence ?? result.task?.reviewPersistence ?? null,
+            ...(result.sourceSync !== undefined ? { sourceSync: result.sourceSync } : {}),
           };
         } else if (result?.ok === true && result.reviewPersistence !== undefined) {
           result = {
             ok: true,
             reviewPersistence: result.reviewPersistence,
             ...(result.hostAcceptance !== undefined ? { hostAcceptance: result.hostAcceptance } : {}),
+            ...(result.sourceSync !== undefined ? { sourceSync: result.sourceSync } : {}),
             ...result,
           };
         }
@@ -3636,12 +3654,14 @@ export function createMcpServer(options) {
               + 'PROGRAM, not the host model: the host\'s own turns, token usage and cost are reported as '
               + '`not-integrated` because this process cannot observe them. '
               + 'When a task reaches `ready`/`awaiting-host-review`, finish YOUR review and record it with '
-              + 'delegate_review ({ taskId, decision: "accepted" | "changes-requested", note, completionSummary? }): '
+              + 'delegate_review ({ taskId, decision: "accepted" | "changes-requested", note, completionSummary?, applyToSource? }): '
               + 'that call is the '
               + 'only thing that records host acceptance, and until it is made the task stays unreviewed. '
               + 'Completion is never acceptance on its own, and a review cannot approve permissions, change '
-              + 'settings or models, merge the diff or create work. The first decision is final for that task; '
-              + 'to request a correction, send a follow-up with `continueFromTaskId`.',
+              + 'settings or models, commit/push or create work; optional `applyToSource: true` (only with '
+              + '`accepted` on `worktree` isolation) safely syncs verified worktree changes back to `sourcePath` '
+              + 'after durable persistence with zero-destruction conflict checks. The first decision is final for '
+              + 'that task; to request a correction, send a follow-up with `continueFromTaskId`.',
           });
         }
         case 'notifications/initialized':

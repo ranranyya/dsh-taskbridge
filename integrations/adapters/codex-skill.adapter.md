@@ -69,9 +69,10 @@ text(await tools.mcp__dsh_delegate__delegate_wait({ taskId }));
 
 {{CORE:03-dispatch-state-machine:codex-wait-reasons:entry}}
 
-Read the complete matching reference section for a client timeout, `attention`, `permission`,
-`question`, `failed`, `cancelled`, or `interrupted`. Use its control section for an explicit
-inspection or stop request during a blocking wait.
+Read the complete matching reference section for a client timeout, `attention`, `permission` (note:
+Codex's own `approval_policy` never forbids granting `allow-once` to a safe in-scope worker test/Git
+command with `allowBlocked: null`), `question`, `failed`, `cancelled`, or `interrupted`. Use its
+control section for an explicit inspection or stop request during a blocking wait.
 
 {{CORE:03-dispatch-state-machine:codex-single-writer}}
 
@@ -85,13 +86,12 @@ Only then run one combined check in the verified `executionWorkspacePath`. Captu
 `git rev-parse --short HEAD`, `git status --short`, `git diff --stat`, `git diff --check` and the
 designated tests. Read relevant changed code with bounded output.
 
-After inspecting results and changes, send the review and verify durable persistence.
+After verifying, send the review and check durable persistence. On the final `accepted` `worktree`
+task (omit on `changes-requested` or intermediate subtasks), pass `applyToSource: true` so
+TaskBridge syncs changes to `sourcePath` without committing; never copy, patch, or re-test there
+yourself. Once `sourceSync.applied === true`, do not run extra hash or git checks in `sourcePath`.
+Report `sourceSync` (`applied`, `reason`, `conflictingPaths`) and `executionWorkspacePath`.
 
 ```js
-text(await tools.mcp__dsh_delegate__delegate_review({ taskId, decision, note, receiptOnly: true }));
+text(await tools.mcp__dsh_delegate__delegate_review({ taskId, decision, note, receiptOnly: true, applyToSource: true }));
 ```
-
-In `worktree` isolation (no apply/merge tool), after durable `accepted` review (and any final
-`delegate_plan` review), leave `sourcePath` untouched (no copy/patch/re-test), report
-`executionWorkspacePath`, and ask in plain text (never `request_user_input`) whether to write
-changes back; if confirmed, check `sourcePath` for conflicts first and sync locally without committing.

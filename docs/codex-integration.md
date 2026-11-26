@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.9.2 (retaining the 1.9.0 native skill migration from legacy subagent `agents/dsh-taskbridge.toml` to `skills/dsh-taskbridge/SKILL.md`, with safe automatic retirement of untouched 0.1.6–1.8.x legacy subagents and automatic refresh of untouched 1.9.0 / 1.9.1 skills; Antigravity integration is documented in `docs/antigravity-integration.md`, and Claude Code / Claude Desktop integration is planned for 2.0).
+Status: implemented in 1.9.3 (retaining the 1.9.0 native skill migration from legacy subagent `agents/dsh-taskbridge.toml` to `skills/dsh-taskbridge/SKILL.md`, with safe automatic retirement of untouched 0.1.6–1.8.x legacy subagents and automatic refresh of untouched 1.9.0–1.9.2 skills; Antigravity integration is documented in `docs/antigravity-integration.md`, and Claude Code / Claude Desktop integration is planned for 2.0).
 
 The 1.7.0 release also makes future managed upgrades self-recognising: the two exact
 companions this machine really held (`1.6.1` in both terminator spellings and the local
@@ -591,7 +591,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.9.2",
+  "packageVersion": "1.9.3",
   "boundary": {
     "blocked": false, "link": null, "unknown": false,
     "home": "directory", "skills": "directory", "skillDir": "directory", "agents": "directory"
@@ -685,7 +685,7 @@ remain those selected in the plugin settings.
 ## 5. Skill ownership & historical legacy TOML identities
 
 From `1.9.0`, the active shipped file is the Markdown skill `$CODEX_HOME/skills/dsh-taskbridge/SKILL.md`
-(with `<!-- dsh-taskbridge-version: 1.9.2 -->` and its content-addressed `rules-reference-<sha256>.md`).
+(with `<!-- dsh-taskbridge-version: 1.9.3 -->` and its content-addressed `rules-reference-<sha256>.md`).
 Earlier `0.1.6`–`1.8.x` releases shipped a custom-agent TOML file:
 
 ```toml

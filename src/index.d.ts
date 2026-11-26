@@ -590,6 +590,22 @@ export interface DelegateReviewRequest {
   note: string;
   /** Optional completion summary (<= 2000 code points, redacted, part of review identity). */
   completionSummary?: string;
+  /** Optional (only valid with `accepted`): safely sync an isolated worktree back to `sourcePath` without committing. */
+  applyToSource?: boolean;
+  /** Optional: return only `taskId`, `reviewPersistence`, and optional `sourceSync`. */
+  receiptOnly?: boolean;
+}
+
+/** Bounded receipt describing optional post-acceptance worktree-to-source synchronization. */
+export interface DelegateSourceSyncResult {
+  applied: boolean;
+  reason: string;
+  changedFiles: string[];
+  changedFilesTotal?: number;
+  changedFilesTruncated?: boolean;
+  conflictingPaths: string[];
+  conflictingPathsTotal?: number;
+  error?: string;
 }
 
 /** Answer of one recorded delivery review. */
@@ -608,6 +624,8 @@ export interface DelegateReviewResult {
   /** Null until persistence is confirmed; a timed-out write may still finish. */
   hostAcceptance: DelegateHostAcceptance | null;
   reviewPersistence: DelegateReviewPersistence;
+  /** Present only when `applyToSource: true` was requested on an `accepted` review. */
+  sourceSync?: DelegateSourceSyncResult;
 }
 
 /** Persistence state is separate from execution and from a proposed conclusion. */

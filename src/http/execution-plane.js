@@ -86,10 +86,10 @@ export function createExecutionHandler(deps) {
     ['POST /tasks/question', answerQuestion],
     // The commander's DELIVERY REVIEW of one finished task. It is the only write that
     // records `hostAcceptance`, and it is narrow on purpose: it decides no permission,
-    // changes no switch/provider/model/isolation/credential, merges no file and creates
-    // no task. Because it only records a conclusion about a result that already exists, it
-    // is NOT gated by the delegation switch — like `/tasks/get` and `/tasks/cancel`, it
-    // stays answerable with the switch off.
+    // changes no switch/provider/model/isolation/credential and creates no task. Pure
+    // review recording stays answerable with the switch off; optional `applyToSource: true`
+    // (only valid with `decision: "accepted"`) additionally syncs an isolated worktree back
+    // to `sourcePath` without committing, gated by the switch and zero-destruction conflict checks.
     ['POST /tasks/review', recordHostReview],
     ['POST /plans', managePlans],
     // Read-only workspace inspection for a dispatcher: the facts and the isolation
@@ -480,7 +480,7 @@ async function answerQuestion({ req, res, connection, deps }) {
   });
   sendJson(res, 200, { ok: true, ...result });
 }
-const REVIEW_FIELDS = Object.freeze(['taskId', 'decision', 'note', 'completionSummary']);
+const REVIEW_FIELDS = Object.freeze(['taskId', 'decision', 'note', 'completionSummary', 'applyToSource']);
 
 /**
  * Longest review note the route will even read, in Unicode code points.
@@ -541,8 +541,18 @@ async function recordHostReview({ req, res, connection, deps }) {
       unit: summary.refusal.unit,
     });
   }
+  if (body.applyToSource !== undefined && typeof body.applyToSource !== 'boolean') {
+    throw new HttpError(400, 'REVIEW_APPLY_INVALID', 'applyToSource must be a boolean', { field: 'applyToSource' });
+  }
+  if (body.applyToSource === true && body.decision !== 'accepted') {
+    throw new HttpError(400, 'REVIEW_APPLY_INVALID', 'applyToSource requires decision: "accepted"', {
+      field: 'applyToSource',
+      decision: body.decision,
+    });
+  }
   // The canonical value is sent only when there is one, so `undefined` means "stated none".
   const summaryField = summary.value === null ? {} : { completionSummary: summary.value };
+  const applyField = body.applyToSource === undefined ? {} : { applyToSource: body.applyToSource };
   let result;
   try {
     result = await deps.engine.recordHostReview({
@@ -552,6 +562,7 @@ async function recordHostReview({ req, res, connection, deps }) {
       decision: body.decision,
       note,
       ...summaryField,
+      ...applyField,
     });
   } catch (error) {
     // A finished task read back from durable history (after a restart) is reviewed through
@@ -560,7 +571,7 @@ async function recordHostReview({ req, res, connection, deps }) {
     result = await deps.engine.recordHistoricalReview({
       taskId: body.taskId,
       connectionId: connection.connectionId,
-    }, body.decision, redactText(note), null, summary.value ?? undefined);
+    }, body.decision, redactText(note), null, summary.value ?? undefined, body.applyToSource === undefined ? undefined : { applyToSource: body.applyToSource });
   }
   sendJson(res, 200, { ok: true, ...result });
 }

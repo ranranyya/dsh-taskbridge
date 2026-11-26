@@ -191,8 +191,11 @@ export function renderAllIntegrations(root = DEFAULT_ROOT) {
       output = `${CODEX_SKILL_DIR}/${codexReferenceFile}`;
     }
     const bytes = Buffer.byteLength(finalContent);
-    if ((target.id === 'codex-skill' || target.id === 'codex-reference') && bytes > 12000) {
-      throw new Error(`${output} is ${bytes} bytes, over the 12,000-byte Codex read budget`);
+    if (target.id === 'codex-skill' && bytes > 16000) {
+      throw new Error(`${output} is ${bytes} bytes, over the 16,000-byte Codex entry read budget`);
+    }
+    if (target.id === 'codex-reference' && bytes > 24000) {
+      throw new Error(`${output} is ${bytes} bytes, over the 24,000-byte Codex reference read budget`);
     }
     results.push({
       id: target.id,

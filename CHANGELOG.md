@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.3 — 隔离工作树验收后零破坏自动写回、Codex 契约与单次审批打磨及双端基准省流新高（2026-11-26）
+
+- **隔离工作树（`worktree`）验收后零破坏自动写回（`applyToSource` / `sourceSync`）**：新增 `src/workspace/sync-source.js`，并在 `delegate_review` / `POST /tasks/review` 支持可选 `applyToSource: true`（仅限 `decision: "accepted"`）。严格在 `reviewPersistence.state === "saved"`（`durable: true`）落盘确认后按序锁定双端工作区，校验基线 `HEAD` 未变、拦截敏感路径与符号链接（含 Git `120000` / `160000`）、保护 `sourcePath` 非重叠未提交草稿并对冲突执行零字节改动中止（保留已保存的验收结论），通过后应用已追踪文件补丁，逐文件原子写入未追踪新文件，并返回结构化 `sourceSync` 回执（幂等支持 `already-synced`，绝不自动 `git add` / `commit` / `push`）；双端技能同步改为在单任务或任务链终局 `accepted` 时传 `applyToSource: true`，彻底消除宿主端手写同步脚本与源目录重复跑测回合。
+- **Codex 派工契约提厚、收尾零冗余与 Windows 单次审批澄清**：`P0` 引导合并派工前只读探查（1–2 次读取）并在首轮 `prompt` 明确导出签名、封闭返回字段集、十进制有理数缩放防漂移、`Object.hasOwn`、按规范区分 `??` 与 `=== undefined`、真实子进程 CLI 退出码测试及 `os.tmpdir()` 临时目录；明确 `sourceSync.applied === true` 后禁止追加源目录复检命令；在 `permission` 规则中澄清宿主自身 `approval_policy` 不限制对安全范围内 Worker 测试/构建/只读 Git 命令（含 Windows 下 `sandbox-escalation` 且 `standingModeUnchanged: true`、`allowBlocked: null`）授予 `allow-once`；Codex 入口与附页构建预算调整为 `16,000 / 24,000` 字节。
+- **双端 7 题黑盒基准省流创新高与无感升级支持**：Antigravity 端 `7/7`（`700/700`）零返工满分通过，`T1–T5` 主控均步降至 **`10.00` 步**（低于基线 `11.00` 步），强模型有效 Token 净省 **`39.43%`**（输出省 **`64.53%`**）、含缓存总 Token 首次实现正向净省 **`33.61%`**（`T5` 有效省 **`52.10%`**、总 Token 省 **`44.63%`**）；Codex 端连续两轮 `7/7`（`700/700`）满分通过并 100% 自动写回源目录阅卷，验收后冗余命令清零为 **`0`**，`T1–T5` 主控有效 Token 净省 **`26.47%–28.10%`**（输出省 **`28.83%–37.40%`**），7 题含缓存总 Token 压降至 **`600.6 万–646.3 万`**（较 `1.9.1` 满分场降 **`43.3%–47.3%`**、较 `1.9.2` 含写回场再降 **`13.9%–20.0%`**，`T5` 有效省 **`47.61%–51.42%`**）；同步刷新 `README.md`、`docs/INTRODUCTION.zh.md`、`docs/INTRODUCTION.md`、`locale/*.json` 与 `package.json`，并在双端安装器补登 `1.9.2` 及 `1.9.3-test1` / `test2` 精确哈希。详见 [1.9.3 更新说明](docs/releases/1.9.3.zh.md)。
+
 ## 1.9.2 — Codex Code Mode 低耗直调、全链路长等待收口与隔离工作树回写确认（2026-11-26）
 
 - **Codex Code Mode 低耗直调与零截断治理**：在 `codex/skills/dsh-taskbridge/SKILL.md` 的 frontmatter `description` 与 `## CODE MODE CALLS` 中明确直调 `tools.mcp__dsh_delegate__*`，禁止整组打印 `ALL_TOOLS`（消除全局 MCP `instructions` 重复拼接引发的首轮 10k Token 输出截断与后续纯查工具回合），仅按需对单一精确工具名切片打印 `exec tool declaration:`；同步在主入口与按需附页内联 `delegate_plan`（单节点与 `nodes` 批量建树）、`allowShared + autoPreflight`、`continueFromTaskId`、`delegate_permission_decide`（精确拷贝 `fingerprint`）与 `delegate_question_answer` 标准调用模板。

@@ -6,17 +6,26 @@
 <!-- @block: codex -->
 ## P0: COMMANDER-OWNED PLANNING AND WORK PACKETS (DECOMPOSITION & DIRECTION)
 1. Codex owns decomposition, direction, scope boundaries and acceptance — NOT line-by-line coding
-   details. Inspect key entry files and specs before dispatching. Submit a cohesive task that DSH
-   can complete and verify in one shot as a single packet without `delegate_plan`; split large or
-   multi-stage goals into bounded, independently verifiable packets only when a single packet risks
-   overloading the worker across subsystems or when independent modules can run in parallel.
-2. Before dispatch, tell the operator which packet is next and why. Put a focused brief in
-   `delegate_submit.prompt` covering: (a) target outcome and repo spec/doc paths to follow;
-   (b) architectural direction, exported signatures, default return-shape contracts, key invariants
-   and precision/overflow pitfalls (concise 3–5 line mathematical/serialization invariants are
+   details. Batch read-only inspection of key entry files, specs and existing contracts into 1–2
+   combined reads before dispatching. Submit a cohesive task that DSH can complete and verify in
+   one shot as a single packet without `delegate_plan`; split large or multi-stage goals into
+   bounded, independently verifiable packets only when a single packet risks overloading the
+   worker across subsystems or when independent modules can run in parallel.
+2. Before dispatch, tell the operator which packet is next and why. Invest upfront in a thorough
+   contract brief in `delegate_submit.prompt` so the worker passes on the first try without rework:
+   (a) target outcome and repo spec/doc paths to follow; (b) architectural direction, exact
+   exported signatures, closed return-object keys (no unrequested fields or input mutation), and
+   concrete spec/runtime invariants where workers commonly slip — exact decimal string/rational
+   scaling (never `BigInt(float * scale)` or intermediate float rounding), own-property map
+   lookups (`Object.hasOwn`), exact default semantics per spec (`??` vs `=== undefined` rather than
+   `||` swallowing valid `''`/`0`/`false`), full domain/enum
+   validation (e.g. supported currency/status sets, UTC full-year dates), and error-reporting vs
+   throwing on malformed records (concise 3–5 line mathematical/serialization invariants are
    encouraged whenever ambiguity could cause drift); (c) allowed edit scope and out-of-scope red
-   lines; (d) concrete acceptance tests/checks. **Do NOT dictate line-by-line implementation code,
-   internal variable names, or full pseudocode in `prompt`** — let DSH read the repo and own
+   lines; (d) concrete acceptance tests/checks, requiring real child-process CLI entrypoint/exit-code
+   tests and `os.tmpdir()` scratch directories (never checkout-local temp dirs or mocked `main()`
+   even if the worker sandbox restricts subprocesses). **Do NOT dictate line-by-line implementation
+   code, internal variable names, or full pseudocode in `prompt`** — let DSH read the repo and own
    implementation and test coding within those guardrails.
 3. For a multi-stage goal, define cross-packet interface contracts upfront, record the breakdown
    with `delegate_plan` (`action: "create"`) before dispatching subtasks, and link each subtask via

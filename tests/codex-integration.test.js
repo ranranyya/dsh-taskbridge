@@ -110,7 +110,7 @@ for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} m
     assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
   }
 });
-const DELIVERABLE_VERSION = '1.9.2';
+const DELIVERABLE_VERSION = '1.9.3';
 
 test('the 1.5.0 template allow-list keeps the PUBLISHED bytes, not the edited working-tree text', () => {
   const released = Object.freeze([
@@ -153,7 +153,7 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
     assert.deepEqual(refreshed.changed, ['agent', 'legacyAgent']);
     assert.deepEqual(refreshed.refused, []);
     assert.equal(refreshed.status.agent.state, 'installed');
-    assert.match(readFileSync(fixture.skillPath, 'utf8'), /^<!-- dsh-taskbridge-version: 1\.9\.2 -->$/mu);
+    assert.match(readFileSync(fixture.skillPath, 'utf8'), /^<!-- dsh-taskbridge-version: 1\.9\.3 -->$/mu);
     assert.equal(existsSync(fixture.legacyAgentPath), false, 'untouched legacy agent must be retired');
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
   } finally {
@@ -4153,8 +4153,16 @@ test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () =
     && entry.sha256 === 'a6459641eab745f7494976559f6da6e6b4d3431e41183cf0100ff86092797433'), true);
   assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.1'
     && entry.sha256 === '90e40ae2a09cfcfd66b5f7264f086b79d923214805cf1073dd4eba0f86db7499'), true);
+  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.2'
+    && entry.sha256 === '5ffe75f582a48ea393611811cc74f3f313074ed9390a4681b1fcb6e023a60376'), true);
+  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.2'
+    && entry.sha256 === 'd7ce4f758d9db785dd395315ee635ac4931cf23085e3ec92ca22673ffedd0a79'), true);
+  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.3-test1'
+    && entry.sha256 === '68f669dd70517cfba2f517950c2ce7a873c2b751a5be4c6eb825adc43e441039'), true);
+  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.3-test2'
+    && entry.sha256 === '64ef15bd4c1cfc19e19cc2ba81bd5cd4e2cb1c98a586c7a6f6a1d72ad78818a6'), true);
   // The public version matches this formal release; historical identity registration is separate.
-  assert.equal(DELIVERABLE_VERSION, '1.9.2');
+  assert.equal(DELIVERABLE_VERSION, '1.9.3');
 });
 
 test('an untouched 1.5.1-test.1 install (LF and CRLF) migrates to native skill, idempotently', async () => {
