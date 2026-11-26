@@ -2,9 +2,10 @@
 
 **Keep architecture planning and final code review in your upper host. Delegate heavy coding and test loops to DeepSeek Harness (DSH) inside a clean black-box MCP bridge.**
 
-> **Version `1.9.1` · Native one-click integration for Codex and Antigravity. Claude Code / Claude Desktop support is planned for 2.0.**
+> **Version `1.9.2` · Native one-click integration for Codex and Antigravity. Claude Code / Claude Desktop support is planned for 2.0.**  
+> `1.9.2` streamlines Codex Code Mode direct tool calls (eliminating bulk `ALL_TOOLS` truncation), enforces long `yield_time_ms: 1200000` across every wait/resume path, and adds plain-text write-back confirmation after `worktree` acceptance; see [1.9.2 Release Notes (ZH)](releases/1.9.2.zh.md).
 
-[简体中文](INTRODUCTION.zh.md) · [Why TaskBridge](#why-taskbridge) · [1.9.0 Benchmark Results & Takeaways](#190-benchmark-results--takeaways) · [Key Capabilities](#key-capabilities) · [Quick Start](#quick-start) · [How It Works](#how-it-works) · [FAQ](#faq) · [Changelog](../CHANGELOG.md)
+[简体中文](INTRODUCTION.zh.md) · [Why TaskBridge](#why-taskbridge) · [Benchmark Results & Token Savings](#benchmark-results--token-savings) · [Key Capabilities](#key-capabilities) · [Quick Start](#quick-start) · [How It Works](#how-it-works) · [FAQ](#faq) · [Changelog](../CHANGELOG.md)
 
 **DSH TaskBridge** is a cross-host task delegation plugin for **DeepSeek Harness (DSH)**.
 Stay inside your preferred upper host to inspect repositories, design interfaces, decompose multi-stage work, and review delivered diffs — while offloading verbose code generation and iterative test-fixing loops to cost-effective or custom models configured in DSH over 11 bounded `delegate_*` MCP tools.
@@ -18,7 +19,7 @@ To the host, execution is a **controlled black-box workshop**: API credentials, 
 Frontier reasoning models excel at system design and code review, yet burning their quota on boilerplate implementation and repetitive test debugging gets expensive fast — while manually copying prompts and diffs across windows quickly loses context. TaskBridge connects both sides through a four-layer architecture:
 
 - **L1 Host-native zero-busy-wait adapters:**
-  - **Codex (`1.9.0` Native Skill):** Installs a compact entry `skills/dsh-taskbridge/SKILL.md` plus an on-demand reference appendix so the active Codex session drives a single direct `delegate_submit({ autoPreflight: true, wait: true })` + `delegate_wait` chain (`tool_timeout_sec = 3660`), completely eliminating legacy `spawn_agent` + short-timeout `wait_agent` polling loops while safely retiring untouched legacy `.toml` subagents.
+  - **Codex (`1.9.0+` Native Skill):** Installs a compact entry `skills/dsh-taskbridge/SKILL.md` plus an on-demand reference appendix so the active Codex session calls `tools.mcp__dsh_delegate__*` directly in Code Mode (avoiding bulk `ALL_TOOLS` dumps) and drives a single `delegate_submit({ autoPreflight: true, wait: true })` + `delegate_wait` chain (`yield_time_ms: 1200000` with `tool_timeout_sec = 3660`), completely eliminating legacy `spawn_agent` + short-timeout `wait_agent` polling loops while safely retiring untouched legacy `.toml` subagents.
   - **Antigravity (Self-contained plugin bundle):** Offloads preflight, silent wait loops, and routine approvals to a lightweight `flash` background subagent so the flagship host model stays asleep until a compact structured delivery receipt is ready for review.
 - **L2 Shared architect-style dispatch core:** Unified single-source rules across hosts — **decompose large multi-subsystem goals (`delegate_plan`) + steer architecture, exported contracts, and scope redlines (never dictating line-by-line code or pseudocode in prompts) + enforce pragmatic review (consolidate real spec/bug/test defects into one rework round; never invent out-of-spec fuzz probes)**.
 - **L3 Bounded compact MCP protocol:** Single-line JSON payloads, one-call `autoPreflight` + `wait` submission, and diff-free local review receipts (`includeDiff: false` / `receiptOnly: true`).
@@ -26,37 +27,41 @@ Frontier reasoning models excel at system design and code review, yet burning th
 
 ---
 
-## 1.9.0 Benchmark Results & Takeaways
+## Benchmark Results & Token Savings
 
-We evaluated the **`1.9.0-test6` candidate build** across a 7-task deterministic black-box benchmark suite (`T0A` non-dispatch chat boundary, `T0B` 3 invalid/uncommitted Git directory blocks, `T1` core quota-ledger implementation, `T2` tiered overage billing & audit report, `T3` discount engine & export CLI, `T4` dirty-checkout uncommitted draft preservation, and `T5` an enterprise 3-domain billing platform refactor with **235 unit tests + 6 read-only SHA-256 fixture checks**), pairing each host against its own no-plugin strong-model baseline under identical fixtures and black-box grading scripts. DSH ran `deepseek-v4.1-flash` as the worker.
+We evaluated **Antigravity (`1.9.1`)** and **Codex (`1.9.0` → `1.9.2`)** across a 7-task deterministic black-box benchmark suite (`T0A` non-dispatch chat boundary, `T0B` 3 invalid/uncommitted Git directory blocks, `T1` core quota-ledger implementation, `T2` tiered overage billing & audit report, `T3` discount engine & export CLI, `T4` dirty-checkout uncommitted draft preservation, and `T5` an enterprise 3-domain billing platform refactor with **235+ unit tests + 6 read-only SHA-256 fixture checks**), pairing each host against its own no-plugin strong-model baseline under identical fixtures and grading scripts. DSH ran `deepseek-v4.1-flash` as the worker.
 
 ### 1. Cross-Host Summary
 
-| Host & Commander | Mode | Full Suite Passed | `T1–T5` Paired Passed | `T1–T5` Avg. Commander Turns | `T1–T5` Strong-Model Effective Tokens (Uncached In + Out) | Effective Token Savings | `T1–T5` Strong-Model Total Tokens (incl. Cache) | Auxiliary / DSH Worker Tokens |
+| Host & Commander | Mode | Full Suite Passed | `T1–T5` Paired Passed | `T1–T5` Avg. Commander Turns | `T1–T5` Strong-Model Effective Tokens (Uncached In + Out) | Quota & Token Reduction | `T1–T5` Strong-Model Total Tokens (incl. Cache) | Auxiliary / DSH Worker Tokens |
 | --- | --- | :---: | :---: | ---: | ---: | ---: | ---: | ---: |
-| **Antigravity**<br>`gemini-4-neon-xhigh` | No-plugin baseline | — | 5/5 (Avg. 100) | 11.00 | 618,861 | Baseline | 3,276,639 | 0 |
-| **Antigravity**<br>`gemini-4-neon-xhigh` | **`1.9.0-test6` Plugin**<br>(`flash` subagent + DSH) | **7/7 (Avg. 100)** | **5/5 (Avg. 100)** | **11.80**<br>*(7-task avg: 9.57)* | **420,450**<br>*(7-task total: 484,480)* | **Saved 32.06%** | 3,724,763<br>*(+13.68%)* | Flash aux: 2,298,138<br>+ DSH worker |
-| **Codex CLI**<br>`gpt-6.2-sol (xhigh)` | No-plugin baseline | — | 4/5 (Avg. 96) | 11.20 | 608,065 | Baseline | 1,966,145 | 0 |
-| **Codex CLI**<br>`gpt-6.2-sol (xhigh)` | **`1.9.0-test6` Plugin**<br>(Native Skill + DSH) | **6/7 Passed** | **4/5 (Avg. 96)**<br>*100% per-task score parity* | **28.60**<br>*(7-task avg: 21.29)* | **459,102**<br>*(7-task total: 503,180)* | **Saved 24.50%** | 9,060,958<br>*(4.61×, >94% cache read)* | DSH worker: 745,409 |
+| **Antigravity**<br>`gemini-4-neon-high` | No-plugin baseline | — | 5/5 (Avg. 100) | 11.00 | 618,861<br>*(Out: 191,677)* | Baseline | 3,276,639 | 0 |
+| **Antigravity**<br>`gemini-4-neon-high` | **`1.9.1` Release**<br>(`flash` subagent + DSH) | **7/7 (Avg. 100)** | **5/5 (Avg. 100)** | **12.00**<br>*(7-task avg: 9.71)* | **438,153**<br>*(7-task: 499,363; Out: 80,705)* | **Saved 29.20%**<br>*(Output **-57.90%**)* | **3,362,021**<br>*(+2.61%; 7-task: 3.54M)* | Flash aux: 2,134,229<br>+ DSH worker |
+| **Codex CLI**<br>`gpt-6.2-sol (xhigh)` | No-plugin baseline | — | 4/5 (Avg. 96) | 11.20 | 608,065<br>*(Out: 66,816)* | Baseline | 1,966,145 | 0 |
+| **Codex CLI**<br>`gpt-6.2-sol (xhigh)` | **`1.9.0` / `1.9.1` Native**<br>(`openai` channel, >94% cache) | 6/7 → **7/7 (Avg. 100)** | 4/5 → **5/5 (Avg. 100)** | 28.60 / 34.60<br>*(7-task: 149 / 179 turns)* | **459,102 / 555,747**<br>*(Out: 59,626 / 50,993)* | **Saved 24.50% / 8.60%**<br>*(Output -10.8% to -23.7%)* | 9,060,958 / 11,256,291<br>*(7-task: 9.20M / 11.39M)* | DSH worker |
+| **Codex CLI**<br>`gpt-6.2-sol (xhigh)` | **`1.9.2` Code Mode Slimmed**<br>(`test3` isolated / `test4` synced) | **4× consecutive 7/7 (100)** | **5/5 (Avg. 100)**<br>*Exceeds 4/5 baseline* | **21.60–24.00**<br>*(7-task: **113–126 turns**, **-30% to -37%** vs 1.9.1)* | Out: **47,085–59,683**<br>*(`custom` channel eff: 1.20M–1.48M\*)* | **Output -10.7% to -29.5%**<br>*(Total tokens **-34% to -44%** vs 1.9.1)* | **6,274,024–7,350,171**<br>*(7-task: **6.41M–7.51M**)* | DSH worker |
 
-> **Verification notes:** (1) On `T0A` (ordinary non-code Q&A), Codex answered in 1 turn with zero tool calls and Antigravity used zero auxiliary turns — proving zero false dispatch; `T0B` cleanly blocked all three invalid repository layouts without touching fixtures. (2) On `T2`, both the Codex baseline and `1.9.0-test6` scored 80/100 due to an omitted-policy `overageUnits` grader check and passed 100% when `charge-overage-tier` was passed explicitly. (3) Compared with the pre-upgrade `test5` polling run on Codex (`2,367,661` effective tokens / `18.63M` total tokens across 7 tasks), `1.9.0-test6` cut Codex effective tokens by **78.7%**.
+> **Verification & channel notes:**
+> 1. **Zero false dispatch & zero truncation:** Both hosts answered `T0A` directly with zero dispatch calls and blocked all three invalid repository layouts on `T0B`. `1.9.2` drove bulk `ALL_TOOLS` dumps, 10k output truncations, pure tool-lookup turns, and MCP argument errors on Codex down to **`0`**.
+> 2. **Cross-release reduction:** Compared with the pre-1.9.0 polling run (`258` turns / `18.63M` total tokens across 7 tasks), `1.9.2` cut Codex turns by **51.2%–56.2%** and total tokens by **59.7%–65.6%**. Compared with the first `7/7` full-pass Codex run in `1.9.1` (`179` turns / `11.39M` total tokens / 41 mid-wait wakeups), `1.9.2` cut turns by another **29.6%–36.9%** and total tokens by **34.1%–43.7%** (`T5` dropped from `78 turns / 6.99M` to **`34–43 turns / 2.77M–3.81M`**, up to **`-60.4%`**).
+> 3. **\*Proxy cache-rate note:** The four `1.9.2` runs used a custom proxy provider (`model_provider: "custom"`, `79.6%–83.7%` cache hit rate) whereas `1.9.0` / `1.9.1` ran on the native `openai` channel (`93.8%–95.4%` cache hit rate), inflating apparent uncached input on `custom`. Across channel-invariant volume metrics (**commander turns, code-output tokens, and total tokens**), `1.9.2` sets the all-time best mark among full-pass runs.
 
-### 2. Per-Task Strong-Model Effective Token (`Uncached Input + Output`) Breakdown (`T1–T5`)
+### 2. Per-Task Savings & `1.9.2` Reduction Breakdown (`T1–T5`)
 
-| Task & Scope | Antigravity Baseline → `1.9.0-test6` | Antigravity Effective Savings | Codex Baseline → `1.9.0-test6` | Codex Effective Savings |
-| --- | ---: | ---: | ---: | ---: |
-| **`T4`** · Small dirty-repo fix preserving uncommitted drafts (7 tests) | 44,731 → 56,269 | -25.79% *(fixed dispatch overhead)* | 81,590 → 86,816 | -6.40% *(fixed dispatch overhead)* |
-| **`T1`** · Core quota-ledger implementation (20 tests) | 73,559 → 46,177 | **+37.22%** *(total tokens -9.8%)* | 52,768 → 52,446 | **+0.61%** *(break-even)* |
-| **`T2`** · Tiered overage billing & audit report (39 tests) | 92,737 → 53,542 | **+42.26%** *(total tokens -19.2%)* | 100,570 → 87,502 | **+13.00%** |
-| **`T3`** · Discount engine, ledger integration & CLI (51 tests) | 85,481 → 64,440 | **+24.61%** *(total tokens -15.9%)* | 82,885 → 67,827 | **+18.17%** |
-| **`T5`** · Enterprise 3-domain billing platform (235 tests + 6 SHA-256 contracts) | 322,353 → 200,022 | **+37.95%** | 290,252 → 164,511 | **+43.32%** *(output tokens -47.9%)* |
+| Task & Scope | Antigravity Baseline → `1.9.1` Effective | Antigravity Savings | Codex `openai` Effective (Baseline → `1.9.0`) | Codex `1.9.2` Full-Pass Reduction (`1.9.1` → `1.9.2`) |
+| --- | ---: | ---: | ---: | --- |
+| **`T4`** · Small dirty-repo fix preserving uncommitted drafts (7 tests) | 44,731 → 52,433 | -17.22% *(fixed overhead; output -42.6%)* | 81,590 → 86,816 *(-6.40%)* | `23` → **`16–23` turns**; total `1.00M` → **`0.69M–1.01M`** |
+| **`T1`** · Core quota-ledger implementation (20 tests) | 73,559 → 46,354 | **+36.98%** *(total tokens **-23.2%**)* | 52,768 → 52,446 *(+0.61%)* | `34` → **`14–17` turns**; total `1.46M` → **`0.57M–0.72M`** *(**-50.7% to -61.2%**)* |
+| **`T2`** · Tiered overage billing & audit report (39 tests) | 92,737 → 86,586 | **+6.63%** *(output **-49.3%**)* | 100,570 → 52,455 *(`1.9.1` **+47.84%**)* | Full `100/100` (vs. `80` baseline); output held to `8.4k–11.2k` |
+| **`T3`** · Discount engine, ledger integration & CLI (51 tests) | 85,481 → 65,151 | **+23.78%** *(total tokens **-29.0%**)* | 82,885 → 67,220 *(**+18.90%**)* | `22` → **`15` turns**; total `1.11M` → **`0.71M–0.75M`** *(**-32.4% to -36.5%**)* |
+| **`T5`** · Enterprise 3-domain billing platform (235+ tests + 6 SHA-256 contracts) | 322,353 → 187,629 | **+41.80%** *(output **-60.8%**)* | 290,252 → 164,511 *(**+43.32%**)* | `78` → **`34–43` turns**; total `6.99M` → **`2.77M–3.81M`** *(**-45.5% to -60.4%**; output **-44.2% to -69.5%** vs baseline)* |
 
 ### 3. Key Benchmark Conclusions
 
-1. **Lightweight worker + strong host review achieves full per-task score parity with frontier baselines:** Even with a lightweight `deepseek-v4.1-flash` worker, clear upfront contract briefs combined with independent host test/diff verification (including 1–3 targeted `continueFromTaskId` rework rounds on Codex) delivered **100/100** on the 235-test 3-domain `T5` architecture task — matching no-plugin frontier baselines point-for-point on both hosts.
-2. **Savings scale with task complexity (38%–43% effective token reduction on heavy tasks):** Multi-file features and cross-module refactors (`T2`, `T3`, `T5`) are the sweet spot, saving **13.0%–43.3%** of expensive uncached input and code-output tokens on the strong model. Trivial single-point edits (`T4`) incur fixed preflight/review overhead (`+6.4%` to `+25.8%`) and are simpler to edit directly in the host.
-3. **Host architectures shape prefix-cache behavior differently:** Antigravity's `flash` subagent absorbs 67.5% of intermediate turns on `T5`, keeping paired `T1–T5` flagship turns nearly flat (`11.80` vs. `11.00` baseline; `9.57` across all 7 tasks) and even reducing total cached+uncached tokens on `T1`/`T2`/`T3`. Codex runs a single direct MCP chain in the main session: multi-round approvals and rework (`33–54` turns on `T2`/`T5`) replay main-session prefix cache (`4.61×` total tokens, over 94% low-cost `cacheRead`), while high-cost uncached input + output still drops by **24.5%**.
-4. **Trades background wall-clock time for flagship quota:** Paired `T1–T5` end-to-end duration averaged `1.76×` baseline on Antigravity (`656s` vs. `372s`; `481s` across all 7 tasks) and `3.11×` cumulative CLI time on Codex (`~1.9×` after excluding ~9-minute initial queueing under 7-way full concurrency) — ideal for background or parallel worktree delegation.
+1. **Lightweight worker + strong host review achieves `7/7` (700/700) full pass on both hosts:** Even with a lightweight `deepseek-v4.1-flash` worker, clear upfront contract briefs combined with independent host verification delivered **7/7 (700/700)** across Antigravity (`1.9.1`) and four consecutive Codex `1.9.2` runs — surpassing the `4/5` no-plugin Codex baseline on `T2`.
+2. **Savings scale with task complexity (`41.8%–43.3%` effective savings and `44%–69%` output reduction on `T5`):** Multi-file features and cross-module refactors (`T1`, `T2`, `T3`, `T5`) offload heavy code output and test loops to DSH, cutting Antigravity `T1–T5` flagship output by **57.9%** and Codex `T5` output by **44.2%–69.5%**. Trivial single-point edits (`T4`) incur fixed dispatch overhead and are faster to edit directly in the host.
+3. **Host architectures complement each other, and `1.9.2` sharply compresses Codex single-chain replay:** Antigravity's `flash` subagent keeps paired `T1–T5` flagship total tokens nearly flat (`3.36M` vs. `3.28M` baseline, saving `23%–29%` total tokens on `T1`/`T3`). On Codex, `1.9.2` eliminates `ALL_TOOLS` dumps, locks in `1200s` outer yields, and merges local review checks, cutting 7-task turns down to **`113–126`** and total tokens to **`6.41M–7.51M`** (**34%–44% lower** than `1.9.1`).
+4. **Trades background wall-clock time for flagship quota:** Under 7-way concurrency, Codex `1.9.2` completes the entire 7-task suite (including `T5`) uninterrupted in ~**46 minutes**, making it ideal for background or parallel worktree delegation.
 
 ---
 
@@ -108,7 +113,7 @@ Turn on **Allow local MCP calls to DSH delegation** at the top of the settings p
 - **Independent worktree (`worktree`, default):** Branches an isolated Git worktree from `HEAD` under DSH's `TaskBridge` sidebar node; multi-stage subtasks can chain onto the same isolated worktree with clean sessions via `reuseWorktreeFromTaskId`.
 - **Shared workspace (`shared`):** Runs in place inside a dirty checkout only after explicit preflight confirmation; reuses the project's native workspace and is strictly protected from linked cleanup deletion.
 
-> **Git repository requirement:** Both modes require an initialized Git repository root with at least one commit. Recording `accepted` via `delegate_review` stores your verdict only — it never auto-merges, commits, or pushes.
+> **Git repository requirement:** Both modes require an initialized Git repository root with at least one commit. Recording `accepted` via `delegate_review` stores your verdict only — it never auto-merges, commits, or pushes; in `worktree` mode, the host reports the isolated worktree path after acceptance and asks whether to sync changes back to your source checkout.
 
 ### Quiet Waiting & Monitoring
 
@@ -137,7 +142,7 @@ Edit tiny one-file tweaks directly in the host. Delegate multi-file features, te
 
 ## Documentation & Feedback
 
-- [1.9.1 Release Notes (ZH)](releases/1.9.1.zh.md) · [1.9.0 Release Notes (ZH)](releases/1.9.0.zh.md) · [Codex integration](codex-integration.md) · [Antigravity integration](antigravity-integration.md) · [Claude roadmap](claude-code.md)
+- [1.9.2 Release Notes (ZH)](releases/1.9.2.zh.md) · [1.9.1 Release Notes (ZH)](releases/1.9.1.zh.md) · [1.9.0 Release Notes (ZH)](releases/1.9.0.zh.md) · [Codex integration](codex-integration.md) · [Antigravity integration](antigravity-integration.md) · [Claude roadmap](claude-code.md)
 - [Silent waiting](silent-wait.md) · [Workspace isolation](workspace-contract.md) · [Conversation placement](conversation-placement.md)
 - [Runtime compatibility](runtime-compatibility.md) · [Plugin market](plugin-market.md) · [Legacy migration](taskbridge-upgrade.md)
 

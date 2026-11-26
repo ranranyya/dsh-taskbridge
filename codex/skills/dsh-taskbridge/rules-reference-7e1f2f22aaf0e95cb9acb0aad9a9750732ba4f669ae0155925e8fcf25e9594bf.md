@@ -1,6 +1,6 @@
 # DSH TaskBridge — Codex rule reference
 
-Read the section for the current decision.
+Read the complete section for the current decision.
 
 ## Multi-stage planning
 
@@ -15,13 +15,46 @@ Read the section for the current decision.
   subtasks pass); on `changes-requested`, freeze dependent downstream packets until fixed via
   `continueFromTaskId`. A single cohesive task needs no plan tree.
 
+  Code Mode examples. For a single node, pass `title` at the top level. For a batch,
+  use `nodes` in place of top-level `title` and `goalDescription`. Each node has a title;
+  choose at most one of `parentKey` (within the batch) and `parentNodeId` (existing parent).
+
+  ```js
+  text(await tools.mcp__dsh_delegate__delegate_plan({ action: 'create', workspacePath, title }));
+  ```
+
+  ```js
+  text(await tools.mcp__dsh_delegate__delegate_plan({
+    action: 'create', workspacePath, nodes: [
+      { key: 'root', title: goalTitle },
+      { parentKey: 'root', title: packetTitle },
+    ],
+  }));
+  ```
+
+  Once the required children are accepted, record the plan review.
+
+  ```js
+  text(await tools.mcp__dsh_delegate__delegate_plan({ action: 'review', nodeId, decision, note }));
+  ```
+
 ## Dispatch details
 
 - `isolation: "block"` with `decisionRequired: true` (`PREFLIGHT_DIRTY_NEEDS_DECISION`):
   Do NOT downgrade to shared isolation silently. Inspect the reported changed paths; when
   in-place execution is safe, state the reason, call `delegate_preflight` again with
-  `allowShared: true`. For a `shared` decision, pass only `overrides = { isolation = "shared" }`.
+  `allowShared: true`. After that separate preflight confirms `shared`, submit with
+  `overrides: { isolation: "shared" }` and omit `allowShared`. On `delegate_submit`,
+  `allowShared` requires `autoPreflight: true`. After deciding to allow shared execution,
+  you can also combine the authorized preflight and submit by passing both flags as `true`.
   If risk or ownership is unclear, ask one focused question.
+
+  ```js
+  // @exec: {"yield_time_ms": 1200000}
+  text(await tools.mcp__dsh_delegate__delegate_submit({
+    workspacePath, title, prompt, autoPreflight: true, allowShared: true, wait: true,
+  }));
+  ```
 - `agentTeams`: pass `true` or `false` ONLY when the user explicitly stated a choice for this
   dispatch; otherwise omit it (new tasks follow the TaskBridge default; continuations inherit
   the chain's choice, and if that task recorded no choice at all, the plugin writes nothing so
@@ -36,7 +69,16 @@ Read the section for the current decision.
   unrelated task. For a new dependent subtask that starts a fresh DSH Session on an earlier
   finished isolated worktree, pass `reuseWorktreeFromTaskId` instead (never combine with
   `continueFromTaskId`). If a continuation or worktree reuse is refused, report it and do not
-  retry as a new task.
+  retry as a new task. In Code Mode, keep `// @exec: {"yield_time_ms": 1200000}` (not 60000 ms)
+  whenever a continuation or subtask submission waits (`wait: true` or `delegate_wait`).
+  Continue with the original source and omit `autoPreflight` on either reuse path.
+
+  ```js
+  // @exec: {"yield_time_ms": 1200000}
+  text(await tools.mcp__dsh_delegate__delegate_submit({
+    workspacePath, title, prompt, continueFromTaskId, wait: true,
+  }));
+  ```
 
 ## Wait events
 
@@ -69,9 +111,12 @@ Read the section for the current decision.
      bounded single calls required by the current packet with complete evidence; `reject` (with a
      short `reason`) any out-of-scope path, destructive command, unauthorized external network or
      data exfiltration, credential/config edit, incomplete/redacted evidence or non-null
-     `allowBlocked`. Quote the exact `fingerprint` and call `delegate_permission_decide`
-     (`allow-once` or `reject`, short `reason`, and `waitAfterDecision: true` when supported; if
-     not supported, decide first and then call `delegate_wait` on the SAME task). Omit `scope`
+     `allowBlocked`. Copy `requestId` and the exact `fingerprint` from the pending request.
+     `allow-once` requires a fingerprint. For `reject`, omit that field if none was supplied.
+     Pass your checked `decision` (`allow-once` or `reject`) and a short `reason` to
+     `delegate_permission_decide` with `waitAfterDecision: true` when supported. Otherwise
+     decide first and then call `delegate_wait` on the SAME task. In Code Mode,
+     keep `// @exec: {"yield_time_ms": 1200000}` on the waiting call, not 60000 ms. Omit `scope`
      and review each new request independently, including repeated commands. In `decisionReceipt`,
      `applied: true` is claimed ONLY when the harness confirmed the SAME task, request and operation.
      An applied receipt can include `waitError`, which means the DECISION SUCCEEDED and only the FOLLOWING WAIT
@@ -81,12 +126,29 @@ Read the section for the current decision.
      `error.details.decisionReceipt`): read the task
      with `delegate_result` before sending anything again and never resend automatically.
      Each allow covers one call only (`scope: "once"`), and the request you just decided is never re-asked.
+
+     ```js
+     // @exec: {"yield_time_ms": 1200000}
+     text(await tools.mcp__dsh_delegate__delegate_permission_decide({
+       taskId, requestId, decision, reason, waitAfterDecision: true,
+       ...(fingerprint ? { fingerprint } : {}),
+     }));
+     ```
    - `question`: answer every asked question via `delegate_question_answer({ taskId, requestId,
-     answers, waitAfterAnswer: true })`. `grantsAccess` is always false; never answer omitted or
-     redacted questions (`questionAnswerable: false`). Read `answerReceipt`: if `applied: true`
-     and `waitError` is also returned, the answer WAS applied — never resend it, resume with
-     `delegate_wait`; if `applied: null` with `confirmation: "unknown"`, read the task with
-     `delegate_result` before sending anything again.
+     answers, waitAfterAnswer: true })` (in Code Mode, keep `// @exec: {"yield_time_ms": 1200000}`
+     on `waitAfterAnswer: true` and any `delegate_wait` resume, not 60000 ms). `grantsAccess` is
+     always false; never answer omitted or redacted questions (`questionAnswerable: false`). Read
+     `answerReceipt`: if `applied: true` and `waitError` is also returned, the answer WAS applied —
+     never resend it, resume with `delegate_wait`; if `applied: null` with
+     `confirmation: "unknown"`, read the task with `delegate_result` before sending anything again.
+     Use one answer per question ID with offered labels in `selected` and/or allowed `custom` text.
+
+     ```js
+     // @exec: {"yield_time_ms": 1200000}
+     text(await tools.mcp__dsh_delegate__delegate_question_answer({
+       taskId, requestId, answers: [{ id, selected: [label] }], waitAfterAnswer: true,
+     }));
+     ```
    - `failed` / `cancelled`: call `delegate_result` ONCE and report. For a transient DSH outage
      or transport failure, make up to 3 sequential retries on the failing stage: for an unconfirmed
      submission, first check read-only facts to verify whether a task was created or is live

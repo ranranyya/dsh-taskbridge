@@ -110,7 +110,7 @@ for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} m
     assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
   }
 });
-const DELIVERABLE_VERSION = '1.9.1';
+const DELIVERABLE_VERSION = '1.9.2';
 
 test('the 1.5.0 template allow-list keeps the PUBLISHED bytes, not the edited working-tree text', () => {
   const released = Object.freeze([
@@ -153,7 +153,7 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
     assert.deepEqual(refreshed.changed, ['agent', 'legacyAgent']);
     assert.deepEqual(refreshed.refused, []);
     assert.equal(refreshed.status.agent.state, 'installed');
-    assert.match(readFileSync(fixture.skillPath, 'utf8'), /^<!-- dsh-taskbridge-version: 1\.9\.1 -->$/mu);
+    assert.match(readFileSync(fixture.skillPath, 'utf8'), /^<!-- dsh-taskbridge-version: 1\.9\.2 -->$/mu);
     assert.equal(existsSync(fixture.legacyAgentPath), false, 'untouched legacy agent must be retired');
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
   } finally {
@@ -3848,7 +3848,7 @@ test('the skill no longer points at a repository checkout and covers the exact d
   assert.match(template, /fall back to another execution route/u, 'a fallback must be explicitly forbidden');
   // Only shared isolation may be overridden for a dirty workspace; routing stays
   // entirely under the DSH Delegate plugin settings.
-  assert.match(template, /For a `shared` decision, pass only `overrides = \{ isolation = "shared" \}`/u);
+  assert.match(template, /`overrides: \{ isolation: "shared" \}` and omit `allowShared`/u);
   assert.match(template, /Never override the configured provider, model or reasoning effort/u);
   assert.match(template, /There is NO default total execution timeout/u);
   assert.match(template, /never send `overrides\.timeoutSeconds` unless the operator explicitly asked for a cap/u);
@@ -3887,7 +3887,8 @@ test('the skill inspects the workspace before dispatching and makes an explicit 
   // 3. A dirty repository is never silently downgraded.
   assert.match(template, /Do NOT downgrade to shared isolation silently/u);
   assert.match(template, /`allowShared: true`/u);
-  assert.match(template, /For a `shared` decision, pass only `overrides = \{ isolation = "shared" \}`/u);
+  assert.match(template, /`overrides: \{ isolation: "shared" \}` and omit `allowShared`/u);
+  assert.match(template, /`allowShared` requires `autoPreflight: true`/u);
   assert.match(template, /Never override the configured provider, model or reasoning effort/u);
   assert.match(template, /stop and report the reason code/u);
 
@@ -4143,13 +4144,17 @@ test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () =
   // The published 1.5.0 identities are NOT removed by adding the test build.
   assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0'
     && entry.sha256 === '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b'), true);
-  // The published 1.9.0 native skill digests (LF and CRLF) are registered for seamless upgrade.
+  // The published 1.9.0 and 1.9.1 native skill digests (LF and CRLF) are registered for seamless upgrade.
   assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.0'
     && entry.sha256 === '203e686fe12ee4827ea9c5bab404997f641a8f45d45daa37efc776b7e9620d71'), true);
   assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.0'
     && entry.sha256 === '9a0eaf95266ad13e175d0223f954f19e0c41573d817cd6099112416156cc395f'), true);
+  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.1'
+    && entry.sha256 === 'a6459641eab745f7494976559f6da6e6b4d3431e41183cf0100ff86092797433'), true);
+  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.1'
+    && entry.sha256 === '90e40ae2a09cfcfd66b5f7264f086b79d923214805cf1073dd4eba0f86db7499'), true);
   // The public version matches this formal release; historical identity registration is separate.
-  assert.equal(DELIVERABLE_VERSION, '1.9.1');
+  assert.equal(DELIVERABLE_VERSION, '1.9.2');
 });
 
 test('an untouched 1.5.1-test.1 install (LF and CRLF) migrates to native skill, idempotently', async () => {

@@ -28,6 +28,29 @@
    ready packet after `accepted` (and call `delegate_plan` `action: "review"` after required
    subtasks pass); on `changes-requested`, freeze dependent downstream packets until fixed via
    `continueFromTaskId`. A single cohesive task needs no plan tree.
+
+   Code Mode examples. For a single node, pass `title` at the top level. For a batch,
+   use `nodes` in place of top-level `title` and `goalDescription`. Each node has a title;
+   choose at most one of `parentKey` (within the batch) and `parentNodeId` (existing parent).
+
+   ```js
+   text(await tools.mcp__dsh_delegate__delegate_plan({ action: 'create', workspacePath, title }));
+   ```
+
+   ```js
+   text(await tools.mcp__dsh_delegate__delegate_plan({
+     action: 'create', workspacePath, nodes: [
+       { key: 'root', title: goalTitle },
+       { parentKey: 'root', title: packetTitle },
+     ],
+   }));
+   ```
+
+   Once the required children are accepted, record the plan review.
+
+   ```js
+   text(await tools.mcp__dsh_delegate__delegate_plan({ action: 'review', nodeId, decision, note }));
+   ```
 4. Parallel packets require independent work, non-conflicting ownership and permission under the
    request and repository AGENTS.md. Never expand scope or let a verification-only packet modify
    code or rules.

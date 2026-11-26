@@ -22,8 +22,18 @@
    - `isolation: "block"` with `decisionRequired: true` (`PREFLIGHT_DIRTY_NEEDS_DECISION`):
      Do NOT downgrade to shared isolation silently. Inspect the reported changed paths; when
      in-place execution is safe, state the reason, call `delegate_preflight` again with
-     `allowShared: true`. For a `shared` decision, pass only `overrides = { isolation = "shared" }`.
+     `allowShared: true`. After that separate preflight confirms `shared`, submit with
+     `overrides: { isolation: "shared" }` and omit `allowShared`. On `delegate_submit`,
+     `allowShared` requires `autoPreflight: true`. After deciding to allow shared execution,
+     you can also combine the authorized preflight and submit by passing both flags as `true`.
      If risk or ownership is unclear, ask one focused question.
+
+     ```js
+     // @exec: {"yield_time_ms": 1200000}
+     text(await tools.mcp__dsh_delegate__delegate_submit({
+       workspacePath, title, prompt, autoPreflight: true, allowShared: true, wait: true,
+     }));
+     ```
    - Both `worktree` and `shared` isolation require an initialized Git repository root with at
      least one commit. Any other `isolation: "block"` (`PREFLIGHT_NOT_A_REPOSITORY`,
      `PREFLIGHT_NOT_A_REPOSITORY_ROOT`, `PREFLIGHT_NO_COMMITS`): stop and report the reason code
@@ -46,7 +56,16 @@
      unrelated task. For a new dependent subtask that starts a fresh DSH Session on an earlier
      finished isolated worktree, pass `reuseWorktreeFromTaskId` instead (never combine with
      `continueFromTaskId`). If a continuation or worktree reuse is refused, report it and do not
-     retry as a new task.
+     retry as a new task. In Code Mode, keep `// @exec: {"yield_time_ms": 1200000}` (not 60000 ms)
+     whenever a continuation or subtask submission waits (`wait: true` or `delegate_wait`).
+     Continue with the original source and omit `autoPreflight` on either reuse path.
+
+     ```js
+     // @exec: {"yield_time_ms": 1200000}
+     text(await tools.mcp__dsh_delegate__delegate_submit({
+       workspacePath, title, prompt, continueFromTaskId, wait: true,
+     }));
+     ```
 3. **RECEIPT CHECK**. From `delegate_submit` (or `submitReceipt` when `wait: true`) and the first
    actionable wait/result receipt, verify source path, `executionWorkspacePath`, isolation, DSH
    workspace/session identity, and `agentTeams` / `agentTeamsOrigin` / `team.applied` /
@@ -84,9 +103,12 @@
      bounded single calls required by the current packet with complete evidence; `reject` (with a
      short `reason`) any out-of-scope path, destructive command, unauthorized external network or
      data exfiltration, credential/config edit, incomplete/redacted evidence or non-null
-     `allowBlocked`. Quote the exact `fingerprint` and call `delegate_permission_decide`
-     (`allow-once` or `reject`, short `reason`, and `waitAfterDecision: true` when supported; if
-     not supported, decide first and then call `delegate_wait` on the SAME task). Omit `scope`
+     `allowBlocked`. Copy `requestId` and the exact `fingerprint` from the pending request.
+     `allow-once` requires a fingerprint. For `reject`, omit that field if none was supplied.
+     Pass your checked `decision` (`allow-once` or `reject`) and a short `reason` to
+     `delegate_permission_decide` with `waitAfterDecision: true` when supported. Otherwise
+     decide first and then call `delegate_wait` on the SAME task. In Code Mode,
+     keep `// @exec: {"yield_time_ms": 1200000}` on the waiting call, not 60000 ms. Omit `scope`
      and review each new request independently, including repeated commands. In `decisionReceipt`,
      `applied: true` is claimed ONLY when the harness confirmed the SAME task, request and operation.
      An applied receipt can include `waitError`, which means the DECISION SUCCEEDED and only the FOLLOWING WAIT
@@ -96,12 +118,29 @@
      `error.details.decisionReceipt`): read the task
      with `delegate_result` before sending anything again and never resend automatically.
      Each allow covers one call only (`scope: "once"`), and the request you just decided is never re-asked.
+
+     ```js
+     // @exec: {"yield_time_ms": 1200000}
+     text(await tools.mcp__dsh_delegate__delegate_permission_decide({
+       taskId, requestId, decision, reason, waitAfterDecision: true,
+       ...(fingerprint ? { fingerprint } : {}),
+     }));
+     ```
    - `question`: answer every asked question via `delegate_question_answer({ taskId, requestId,
-     answers, waitAfterAnswer: true })`. `grantsAccess` is always false; never answer omitted or
-     redacted questions (`questionAnswerable: false`). Read `answerReceipt`: if `applied: true`
-     and `waitError` is also returned, the answer WAS applied — never resend it, resume with
-     `delegate_wait`; if `applied: null` with `confirmation: "unknown"`, read the task with
-     `delegate_result` before sending anything again.
+     answers, waitAfterAnswer: true })` (in Code Mode, keep `// @exec: {"yield_time_ms": 1200000}`
+     on `waitAfterAnswer: true` and any `delegate_wait` resume, not 60000 ms). `grantsAccess` is
+     always false; never answer omitted or redacted questions (`questionAnswerable: false`). Read
+     `answerReceipt`: if `applied: true` and `waitError` is also returned, the answer WAS applied —
+     never resend it, resume with `delegate_wait`; if `applied: null` with
+     `confirmation: "unknown"`, read the task with `delegate_result` before sending anything again.
+     Use one answer per question ID with offered labels in `selected` and/or allowed `custom` text.
+
+     ```js
+     // @exec: {"yield_time_ms": 1200000}
+     text(await tools.mcp__dsh_delegate__delegate_question_answer({
+       taskId, requestId, answers: [{ id, selected: [label] }], waitAfterAnswer: true,
+     }));
+     ```
    - `ready`: execution finished — this is not acceptance. Call `delegate_result` ONCE (pass
      `includeDiff: false` when reviewing locally in `executionWorkspacePath` to avoid duplicating
      patches in context; paginate omitted notes/summaries only if needed). Review in Codex, then

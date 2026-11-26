@@ -332,7 +332,8 @@ test('the template requires a durable review write and one consolidated correcti
 test('the template keeps approval anchored on the concrete operation and forbids local edits', () => {
   const text = templateText().replace(/\s+/gu, ' ');
   assert.match(text, /inspect the complete concrete operation, paths and bounds/u);
-  assert.match(text, /Quote the exact `fingerprint`/u);
+  assert.match(text, /Copy `requestId` and the exact `fingerprint` from the pending request/u);
+  assert.match(text, /`allow-once` requires a fingerprint/u);
   assert.match(text, /Each allow covers one call only/u);
   assert.match(text, /Never commit, stash, branch, reset or edit locally while a delegated task is running/u);
 });

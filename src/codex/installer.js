@@ -578,6 +578,14 @@ export const KNOWN_SKILL_TEMPLATES = [
   // Published 1.9.0 native Codex skill, in LF and CRLF.
   { version: '1.9.0', sha256: '203e686fe12ee4827ea9c5bab404997f641a8f45d45daa37efc776b7e9620d71' },
   { version: '1.9.0', sha256: '9a0eaf95266ad13e175d0223f954f19e0c41573d817cd6099112416156cc395f' },
+  // Exact contents of the 1.9.1 release (LF and CRLF) and archived 1.9.2-test1 .. test4 Codex packages.
+  { version: '1.9.1', sha256: 'a6459641eab745f7494976559f6da6e6b4d3431e41183cf0100ff86092797433' },
+  { version: '1.9.1', sha256: '90e40ae2a09cfcfd66b5f7264f086b79d923214805cf1073dd4eba0f86db7499' },
+  { version: '1.9.2-test1', sha256: 'a2cd721be797ae7548924e437d1ff6fc5dde7e0ebd26237573cb31b4a5fe488b' },
+  { version: '1.9.2-test2', sha256: 'd0bc51f2105a08eb61c194847f5ffa957e2a6caf7882aa85ed18f57b7664864b' },
+  { version: '1.9.2-test3', sha256: '6b117f95c8ac875401ecbc09182be47235746a567d36cd2f6a421b00831ebe1c' },
+  { version: '1.9.2-test4', sha256: 'f4b844a2fa8c167ee78ff2000d2cac656ab261973c4446c70135c4f52fd98fce' },
+  { version: '1.9.2-test4', sha256: '73b0d2bdd29c9397106b68c3389c25a30127e1e079df5390a4dff9b62f747a7a' },
 ];
 
 /** The version provenance comment line inside a shipped Markdown Codex skill file. */

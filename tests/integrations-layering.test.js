@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 import { INTEGRATION_TARGETS, renderAllIntegrations } from '../scripts/build-integrations.mjs';
 import { readCodexStatus, useDirectoryClassifier } from '../src/codex/installer.js';
+import { createMcpServer } from '../src/mcp/server.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -72,6 +73,9 @@ test('both Codex and Antigravity skills enforce shared Layer-2 philosophy: decom
   assert.match(agy, /Model:\s*"flash"/u);
   assert.match(agy, /不要读取 `delegate_status`/u);
   assert.match(agy, /无需重复调用 `delegate_result`/u);
+  assert.match(agy, /隔离工作树收官与回写询问（`worktree` 模式）/u);
+  assert.match(agy, /不要调用 `ask_question` 弹窗工具/u);
+  assert.match(agy, /先检查 `sourcePath` 是否有未提交冲突/u);
   assert.match(agySub, /不要用 `read_file` 通读目标仓库的业务源码或测试文件/u);
 });
 
@@ -84,12 +88,112 @@ test('Codex reads a bounded entry and loads the existing event rules on demand',
   assert.ok(Buffer.byteLength(reference) <= 12000);
   assert.equal(basename(output), `rules-reference-${digest}.md`);
   assert.ok(entry.includes(`](${basename(output)})`));
+  const description = entry.split('---')[1].replace(/\s+/gu, ' ');
+  assert.match(description, /Activate on explicit DSH \/ TaskBridge delegation or \$dsh-taskbridge\. When active in Code Mode, call tools\.mcp__dsh_delegate__\*/u);
+  assert.match(description, /Avoid bulk ALL_TOOLS output/u);
+  const waitSection = entry.split('## WAIT & EVENTS')[1].split('\n## ')[0].replace(/\s+/gu, ' ');
+  assert.match(waitSection, /In Code Mode, set a long outer yield before the first call that waits/u);
+  assert.ok(waitSection.includes('`// @exec: {"yield_time_ms": 1200000}`'));
+  assert.match(waitSection, /`functions\.wait` on the same `cell_id` with the same long `yield_time_ms`/u);
   assert.match(entry, /`ready`: execution finished/u);
   assert.match(entry, /`reviewPersistence\.durable === true`/u);
+  const localVerifySection = entry.split('## LOCAL VERIFICATION')[1].replace(/\s+/gu, ' ');
+  assert.match(
+    localVerifySection,
+    /In `worktree` isolation \(no apply\/merge tool\), after durable `accepted` review \(and any final `delegate_plan` review\), leave `sourcePath` untouched \(no copy\/patch\/re-test\), report `executionWorkspacePath`, and ask in plain text \(never `request_user_input`\) whether to write changes back; if confirmed, check `sourcePath` for conflicts first and sync locally without committing\./u,
+  );
   assert.doesNotMatch(entry, /waitAfterDecision: true/u);
   assert.match(reference, /waitAfterDecision: true/u);
   assert.match(reference, /`question`: answer/u);
   assert.match(reference, /`interrupted`: the wait itself was cut off/u);
+  const flatRef = reference.replace(/\s+/gu, ' ');
+  assert.match(
+    flatRef,
+    /Task threads:[\s\S]*?keep `\/\/ @exec: \{"yield_time_ms": 1200000\}` \(not 60000 ms\) whenever a continuation or subtask submission waits/u,
+  );
+  assert.match(
+    flatRef,
+    /`permission`:[\s\S]*?`waitAfterDecision: true`[\s\S]*?keep `\/\/ @exec: \{"yield_time_ms": 1200000\}` on the waiting call, not 60000 ms/u,
+  );
+  assert.match(
+    flatRef,
+    /`question`:[\s\S]*?waitAfterAnswer: true[\s\S]*?keep `\/\/ @exec: \{"yield_time_ms": 1200000\}` on `waitAfterAnswer: true` and any `delegate_wait` resume, not 60000 ms/u,
+  );
+});
+
+test('shipped Codex Code Mode examples pass the MCP argument validator as separate calls', async () => {
+  const files = renderAllIntegrations(ROOT).filter(({ id }) => id === 'codex-skill' || id === 'codex-reference');
+  const answers = {
+    status: { ok: true },
+    submit: { ok: true, task: { taskId: 'task-1' } },
+    observe: { ok: true, reason: 'ready', task: { taskId: 'task-1', state: 'awaiting-host-review' } },
+    review: { ok: true, reviewPersistence: { state: 'saved', durable: true } },
+    plan: { ok: true },
+  };
+  const server = createMcpServer({
+    async callExecution(route, args) {
+      if (route === 'preflight') return { ok: true, isolation: args.allowShared ? 'shared' : 'worktree' };
+      if (route === 'question') return { ok: true, answer: args };
+      if (route === 'permission') {
+        const allow = args.decision === 'allow-once';
+        return {
+          ok: true,
+          permission: {
+            ...args, state: 'decided', outcome: allow ? 'allowed-once' : 'rejected',
+            verified: { fingerprintQuoted: true, argumentsComplete: true, callReread: true, turnOpen: true },
+            grant: { kind: 'allowed-once', appliesTo: 'this-call-only', callId: 'call-1', reusable: false },
+            callId: 'call-1',
+          },
+        };
+      }
+      return answers[route];
+    },
+  });
+  await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+
+  const values = {
+    workspacePath: resolve(ROOT, 'fixture'), title: 'Work packet', prompt: 'Verify the work packet',
+    taskId: 'task-1', continueFromTaskId: 'task-0', nodeId: 'plan-1', decision: 'accepted',
+    note: 'Checks passed', goalTitle: 'Goal', packetTitle: 'Packet', requestId: 'request-1',
+    fingerprint: `sha256:${'a'.repeat(64)}`, reason: 'Bounded operation', id: 'q1', label: 'Yes',
+  };
+  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const names = [];
+  for (const { content } of files) {
+    for (const [, indent, code] of content.matchAll(/^( *)```js\n([\s\S]*?)^\1```$/gmu)) {
+      const script = code.split('\n').map((line) => line.slice(indent.length)).join('\n');
+      const bindings = [...script.matchAll(/tools\.mcp__dsh_delegate__(\w+)\(/gu)];
+      assert.equal(bindings.length, 1, script);
+      const [, name] = bindings[0];
+      names.push(name);
+      if (/\b(?:wait|waitAfterDecision|waitAfterAnswer): true/u.test(script) || name === 'delegate_wait') {
+        assert.equal(script.split('\n')[0], '// @exec: {"yield_time_ms": 1200000}', name);
+      }
+      const run = new AsyncFunction('tools', 'text', ...Object.keys(values), script);
+      const tools = { [`mcp__dsh_delegate__${name}`]: async (args) => (await server.handle({
+        jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args },
+      })).result };
+      const cases = name === 'delegate_permission_decide'
+        ? [{ ...values, decision: 'allow-once' }, { ...values, decision: 'reject', fingerprint: undefined }]
+        : [values];
+      for (const example of cases) {
+        const results = [];
+        await run(tools, (reply) => results.push(reply), ...Object.values(example));
+        assert.equal(results.length, 1, name);
+        const [reply] = results;
+        const data = JSON.parse(reply.content[0].text);
+        assert.notEqual(reply.isError, true, `${name}: ${reply.content[0].text}`);
+        assert.equal(data.ok, true, name);
+        if (name === 'delegate_permission_decide') assert.equal(data.decisionReceipt.applied, true);
+        if (name === 'delegate_question_answer') assert.equal(data.answerReceipt.applied, true);
+      }
+    }
+  }
+  assert.deepEqual(names.sort(), [
+    'delegate_permission_decide', 'delegate_plan', 'delegate_plan', 'delegate_plan',
+    'delegate_preflight', 'delegate_question_answer', 'delegate_review', 'delegate_status',
+    'delegate_submit', 'delegate_submit', 'delegate_submit', 'delegate_wait',
+  ]);
 });
 
 test('C1 regression: readCodexStatus batches Windows directory boundary and ownership checks into <= 3 classifier invocations', async () => {

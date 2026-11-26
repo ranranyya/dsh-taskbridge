@@ -1,6 +1,6 @@
 # DSH TaskBridge — Codex rule reference
 
-Read the section for the current decision.
+Read the complete section for the current decision.
 
 ## Multi-stage planning
 

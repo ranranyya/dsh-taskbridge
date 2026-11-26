@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.9.2 — Codex Code Mode 低耗直调、全链路长等待收口与隔离工作树回写确认（2026-11-26）
+
+- **Codex Code Mode 低耗直调与零截断治理**：在 `codex/skills/dsh-taskbridge/SKILL.md` 的 frontmatter `description` 与 `## CODE MODE CALLS` 中明确直调 `tools.mcp__dsh_delegate__*`，禁止整组打印 `ALL_TOOLS`（消除全局 MCP `instructions` 重复拼接引发的首轮 10k Token 输出截断与后续纯查工具回合），仅按需对单一精确工具名切片打印 `exec tool declaration:`；同步在主入口与按需附页内联 `delegate_plan`（单节点与 `nodes` 批量建树）、`allowShared + autoPreflight`、`continueFromTaskId`、`delegate_permission_decide`（精确拷贝 `fingerprint`）与 `delegate_question_answer` 标准调用模板。
+- **全链路长等待（`yield_time_ms: 1200000`）统一收口**：在首次 `delegate_submit({ wait: true })`、单链 `delegate_wait`、返工/子包复用提交、`waitAfterDecision: true` 与 `waitAfterAnswer: true` 全部等待入口统一固化 `// @exec: {"yield_time_ms": 1200000}`（杜绝回退为 60 秒短等待），规范 `Script running with cell ID` 单链续等与附页完整章节读取。
+- **本地审查合并与隔离工作树（`worktree`）收官回写询问**：Codex 端收紧 `delegate_result({ taskId, includeDiff: false })` 回执校验与 `executionWorkspacePath` 单次组合验证串联；Codex 与 Antigravity 双端统一规定在整条任务链完成 `accepted` 持久化（含最终 `delegate_plan` 总评）后，默认保持 `sourcePath` 原目录不改动并汇报 `executionWorkspacePath`，同时在对话中以纯文本询问用户是否需要将已验收改动写回原工作目录（用户确认后先做冲突检查再本地同步且不自动 `git commit`）。
+- **7 题基准省流复验、产品简介数据刷新与无感升级支持**：Codex 7 题基准连续四轮 `7/7`（`700/700`）满分通过，较 `1.9.1` 满分场（`179` 步 / `1,139.2 万` 总 Token）主控步数压降 **29.6%–36.9%**（`113–126` 步）、含缓存总 Token 压降 **34.1%–43.7%**（`641.4 万–751.1 万`，`T5` 单题总 Token 降 **45.5%–60.4%**、主控输出较无插件基线省 **44.2%–69.5%**）；同步刷新 `README.md`、`docs/INTRODUCTION.zh.md` 与 `docs/INTRODUCTION.md` 中的双端基准与省流实测章节，并在 `src/codex/installer.js` 与 `src/antigravity/installer.js` 中补登已发布 `1.9.1`（LF / CRLF）及 `1.9.2-test1`–`test4` 托管技能的精确 SHA-256 哈希。详见 [1.9.2 更新说明](docs/releases/1.9.2.zh.md)。
+
 ## 1.9.1 — 插件简介与介绍文案统一为「宿主端」表述、前端提示清理（2026-11-25）
 
 - **插件清单与市场索引简介优化**：重写 `package.json`、`locale/zh.json` 与 `locale/en.json` 中的安装预览简介，去除具体基准测试百分比，改为概括表达插件的设计意图与核心功能，并统一以「上层宿主端」为主语（末尾保留已适配宿主及 2.0 路线说明）。
