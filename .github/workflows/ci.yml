@@ -17,6 +17,7 @@ jobs:
   verify:
     name: Verify (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -40,9 +41,6 @@ jobs:
           DSH_TASKBRIDGE_CLIENT_PLATFORM: win32
         run: npm run check:client
       - name: Run test suite
-        env:
-          TEMP: ${{ runner.temp }}
-          TMP: ${{ runner.temp }}
         run: npm test
       - name: Dry-run npm pack
         run: npm run pack:dry

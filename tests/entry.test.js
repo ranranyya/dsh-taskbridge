@@ -582,7 +582,9 @@ test('an empty provider configuration stays inert through apply', async () => {
   }
 });
 
-test('user-plane routes serve 200 immediately while Codex startup refresh is still running', async () => {
+test('user-plane routes serve 200 immediately while Codex startup refresh is still running', {
+  skip: process.platform === 'win32' ? false : 'useDirectoryClassifier is only invoked on Windows',
+}, async () => {
   const { LlmRuntime } = await import('@deepseek-ai/dsh-llm');
   const { mkdtempSync, mkdirSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
