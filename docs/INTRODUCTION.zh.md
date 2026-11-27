@@ -1,16 +1,17 @@
 # DSH TaskBridge
 
-**让上层宿主端专注架构规划与验收把关，把繁重编码与测试调测交给 DeepSeek Harness（DSH）黑盒执行。**
+**让 Codex 与 Antigravity 专注架构规划与验收把关，把重度写代码和跑测试交给 DeepSeek Harness（DSH）在独立 Git worktree 中并行干活。**
 
 > **当前版本 `1.9.3` · 已原生支持 Codex 与 Antigravity 一键集成；Claude Code / Claude Desktop 接入计划于 2.0 上线。**  
 > 本次 `1.9.3` 新增隔离工作树（`worktree`）终局验收后零破坏冲突预检与安全自动写回（`applyToSource: true` / `sourceSync`），打磨 Codex 首轮契约指引与单次测试审批边界，并刷新双端省流新高，详见 [1.9.3 更新说明](releases/1.9.3.zh.md)。
 
-[English](INTRODUCTION.md) · [为什么选择 TaskBridge](#为什么选择-taskbridge) · [双端基准测试与省流实测](#双端基准测试与省流实测) · [核心能力](#核心能力) · [快速上手](#快速上手) · [设置与机制](#设置与机制) · [常见问题](#常见问题) · [更新日志](../CHANGELOG.md)
+[English](INTRODUCTION.md) · [快速上手](#快速上手) · [双端基准测试与省流实测](#双端基准测试与省流实测) · [为什么选择 TaskBridge](#为什么选择-taskbridge) · [核心能力](#核心能力) · [设置与机制](#设置与机制) · [常见问题](#常见问题) · [更新日志](../CHANGELOG.md)
 
-**DSH TaskBridge** 是面向 **DeepSeek Harness（DSH）** 的跨宿主黑盒派工桥接插件。
-你可以在最顺手的上层宿主端里阅读仓库、拆解架构、设定接口契约并独立验收交付；将耗费大量输出与反复调测轮次的具体编码工作，通过 11 个有界标准 `delegate_*` MCP 工具交给 DSH 内已配置的高性价比或专属模型落地。
+在 **Codex** 或 **Antigravity** 中阅读仓库、拆解架构、设定接口契约并独立验收交付，将耗费大量输出与反复跑单测排错的编码任务交给 **DeepSeek Harness（DSH）** 执行：
 
-对宿主端而言，底层执行是一座**受控黑盒车间**——API 密钥、模型路由、思考强度、Git `worktree` 隔离、跨子包工作树复用与 DSH 原生会话管理全部在插件内收口，宿主端只管**定方向、批越权、做验收**。
+- **实测省下大半主力配额，且 `7/7` 全满分不降质**：中大型与重型重构任务让旗舰模型**有效 Token 净省 40%–52%、代码输出直降 55%–68%**（Antigravity `T1–T5` 含缓存总流量净省 **33.61%**）。
+- **独立 Git `worktree` 真并行隔离 + 验收后零破坏写回**：默认隔离并行开发、不污染当前分支或草稿，终局验收通过后经冲突预检一键安全写回原工作区（绝不自动 `git commit`）。
+- **静默长等免轮询 + 敏感操作逐次指纹审批**：单次调用静默长等 20–60 分钟免轮询，DSH 原生侧栏全程实时可见，越界命令按真实参数指纹逐次审批。
 
 ![DSH TaskBridge 四层架构。用户和开发者通过宿主适配层使用共享派工内核、MCP 协议和 DSH 执行引擎。](./assets/taskbridge-workflow.zh.png)
 

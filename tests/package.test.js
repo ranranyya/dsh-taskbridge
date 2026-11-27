@@ -582,7 +582,9 @@ test(`the release is ${DELIVERABLE_VERSION}, newer than ${PREVIOUS_VERSION}`, ()
   assert.match(template, new RegExp(`^<!-- dsh-taskbridge-version: ${escape(DELIVERABLE_VERSION)} -->$`, 'mu'));
 
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  const readmeZh = readFileSync(join(ROOT, 'README.zh-CN.md'), 'utf8');
   assert.match(readme, new RegExp(`dsh-taskbridge-${escape(DELIVERABLE_VERSION)}\\.tgz`, 'u'));
+  assert.match(readmeZh, new RegExp(`dsh-taskbridge-${escape(DELIVERABLE_VERSION)}\\.tgz`, 'u'));
   const contract = readFileSync(join(ROOT, 'docs', 'codex-integration.md'), 'utf8');
   assert.match(contract, new RegExp(`implemented in ${escape(DELIVERABLE_VERSION)}`, 'u'), 'the Codex contract names the release it describes');
   assert.match(contract, new RegExp(`"packageVersion": "${escape(DELIVERABLE_VERSION)}"`, 'u'));
@@ -599,19 +601,22 @@ test(`the release is ${DELIVERABLE_VERSION}, newer than ${PREVIOUS_VERSION}`, ()
   // reads, except for the explicit historical-contract locations that identify the
   // previous builds whose bytes and migration shape are being handled.
   //
-  // `README.md` gets one narrow exemption and no more: its section heading
-  // `Worker 会话权限（0.1.12 起适配 DSH 0.2.2）` states when that behaviour was
-  // introduced, which is a historical fact and must not be relabelled to this release.
-  // Only that exact heading is excluded from the scan; every other older literal in
-  // the README still fails, and the current `.tgz` filename check above stays strict.
-  const README_HISTORICAL_HEADINGS = ['Worker 会话权限（0.1.12 起适配 DSH 0.2.2）'];
-  for (const path of [...HISTORICAL_VERSION_PATHS, 'README.md', 'CHANGELOG.md', ...PACKED.filter((entry) => entry.startsWith('src/') && entry.endsWith('.js'))]) {
+  // Both `README.md` (EN) and `README.zh-CN.md` (ZH) get one narrow exemption and no more:
+  // their historical section heading for 0.1.12 / DSH 0.2.2 worker session permissions
+  // states when that behaviour was introduced, which is a historical fact and must not be
+  // relabelled to this release. Every other older literal still fails.
+  const README_HISTORICAL_HEADINGS = new Map([
+    ['README.md', ['Worker Session Permissions (0.1.12+ for DSH 0.2.2)']],
+    ['README.zh-CN.md', ['Worker 会话权限（0.1.12 起适配 DSH 0.2.2）']],
+  ]);
+  for (const path of [...HISTORICAL_VERSION_PATHS, 'README.md', 'README.zh-CN.md', 'CHANGELOG.md', ...PACKED.filter((entry) => entry.startsWith('src/') && entry.endsWith('.js'))]) {
     let text = readFileSync(join(ROOT, path), 'utf8');
-    if (path === 'README.md') {
-      for (const heading of README_HISTORICAL_HEADINGS) {
+    const headings = README_HISTORICAL_HEADINGS.get(path);
+    if (headings) {
+      for (const heading of headings) {
         // Each excluded heading must really be present, so the exemption cannot rot
         // into a silent blanket allowance.
-        assert.ok(text.includes(heading), `the README historical heading must still be present: ${heading}`);
+        assert.ok(text.includes(heading), `the ${path} historical heading must still be present: ${heading}`);
         text = text.replace(heading, '');
       }
     }
@@ -653,7 +658,9 @@ test('the Codex MCP command resolves a Node.js runtime, never the desktop execut
   }
   assert.match(contract, /runtime\/primary-runtime\/dependencies\/node\/bin/u, 'the bundled Node location is documented');
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
+  const readmeZh = readFileSync(join(ROOT, 'README.zh-CN.md'), 'utf8');
   assert.match(readme, /DeepSeek Harness\.exe/u, 'the README must state which executable is never used');
+  assert.match(readmeZh, /DeepSeek Harness\.exe/u, 'README.zh-CN.md must state which executable is never used');
 });
 
 // ---------------------------------------------------------------------------
@@ -816,6 +823,9 @@ test('the packed size stays bounded and contains no single-file outlier', () => 
   // `applyToSource` on `delegate_review`, zero-destruction conflict precheck), Codex P0/permission
   // refinements, 1.9.2/test1/test2 upgrade digests, refreshed benchmark tables, and 1.9.3 release notes.
   const SOURCE_SYNC_GROWTH_BYTES = 48_000;
+  // Bilingual root README split (`README.md` EN landing page + `README.zh-CN.md` full ZH guide,
+  // which npm force-includes alongside `README.md`). Prose only, no dependency.
+  const BILINGUAL_ROOT_README_GROWTH_BYTES = 48_000;
   const growth = TASK_RECORDS_GROWTH_BYTES + MONITORING_GROWTH_BYTES
     + AGENT_TEAMS_DEFAULT_GROWTH_BYTES + AGENT_TEAMS_CHOICE_FIDELITY_BYTES
     + CONCURRENT_ISOLATION_GROWTH_BYTES + GROUPED_WORKSPACES_GROWTH_BYTES
@@ -824,7 +834,8 @@ test('the packed size stays bounded and contains no single-file outlier', () => 
     + LAYERED_INTEGRATIONS_AND_REVIEW_FIXES_GROWTH_BYTES + WORKFLOW_DIAGRAMS_GROWTH_BYTES
     + WORKTREE_REUSE_AND_ROUNDTRIP_GROWTH_BYTES + BENCHMARK_DOCS_AND_TEST6_HASHES_GROWTH_BYTES
     + REVIEW_HARDENING_GROWTH_BYTES + PATCH_191_TERMINOLOGY_AND_NOTES_BYTES
-    + PATCH_192_CODEX_CODEMODE_AND_NOTES_BYTES + SOURCE_SYNC_GROWTH_BYTES;
+    + PATCH_192_CODEX_CODEMODE_AND_NOTES_BYTES + SOURCE_SYNC_GROWTH_BYTES
+    + BILINGUAL_ROOT_README_GROWTH_BYTES;
   assert.ok(total < 3_120_000 + growth, `unpacked size grew unexpectedly: ${total} bytes`);
   const RELEASE_BUDGET_BYTES = 3_080_000;
   const budget = RELEASE_BUDGET_BYTES + growth;

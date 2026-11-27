@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "DSH TaskBridge",
-    "description": "面向 DeepSeek Harness（DSH）的跨宿主派工桥接插件：让上层宿主端专注架构规划与交付验收，将繁重的编码实现与测试调测交给 DSH 黑盒执行以节省主力模型配额；统一封装 API、执行模型、思考强度与 Git 工作树隔离，支持一键宿主集成、低耗直调与静默长等、按需权限审批、跨包工作树复用、验收后零破坏自动写回与整链清理（已支持 Codex、Antigravity 一键接入，Claude Code / Claude Desktop 计划于 2.0 上线）。",
+    "description": "让 Codex 和 Antigravity 专注架构规划与验收，把重度写代码和跑测试交给 DeepSeek Harness（复用 DSH 模型与思考强度）在独立 Git worktree 里并行干活：不污染主分支、静默长等免轮询、敏感操作逐次审批，验收通过后一键冲突预检安全写回；中大型任务实测可省下 40%–52% 旗舰模型有效 Token（Claude Code / Claude Desktop 计划于 2.0 支持）。",
     "detail": "docs/INTRODUCTION.zh.md"
   }
 }

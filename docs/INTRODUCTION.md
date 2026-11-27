@@ -1,16 +1,17 @@
 # DSH TaskBridge
 
-**Keep architecture planning and final code review in your upper host. Delegate heavy coding and test loops to DeepSeek Harness (DSH) inside a clean black-box MCP bridge.**
+**Let Codex and Antigravity focus on architecture planning and final review — delegate heavy coding and test loops to DeepSeek Harness (DSH) in isolated Git worktrees.**
 
 > **Version `1.9.3` · Native one-click integration for Codex and Antigravity. Claude Code / Claude Desktop support is planned for 2.0.**  
 > `1.9.3` introduces zero-destruction automatic post-acceptance worktree-to-source sync (`applyToSource: true` / `sourceSync`), refines Codex upfront contract briefs and single-call worker test approval boundaries, and sets new benchmark token-saving highs on both hosts; see [1.9.3 Release Notes (ZH)](releases/1.9.3.zh.md).
 
-[简体中文](INTRODUCTION.zh.md) · [Why TaskBridge](#why-taskbridge) · [Benchmark Results & Token Savings](#benchmark-results--token-savings) · [Key Capabilities](#key-capabilities) · [Quick Start](#quick-start) · [How It Works](#how-it-works) · [FAQ](#faq) · [Changelog](../CHANGELOG.md)
+[简体中文](INTRODUCTION.zh.md) · [Quick Start](#quick-start) · [Benchmark Results & Token Savings](#benchmark-results--token-savings) · [Why TaskBridge](#why-taskbridge) · [Key Capabilities](#key-capabilities) · [How It Works](#how-it-works) · [FAQ](#faq) · [Changelog](../CHANGELOG.md)
 
-**DSH TaskBridge** is a cross-host task delegation plugin for **DeepSeek Harness (DSH)**.
-Stay inside your preferred upper host to inspect repositories, design interfaces, decompose multi-stage work, and review delivered diffs — while offloading verbose code generation and iterative test-fixing loops to cost-effective or custom models configured in DSH over 11 bounded `delegate_*` MCP tools.
+Stay inside **Codex** or **Antigravity** to inspect repositories, design interfaces, decompose multi-stage work, and review delivered diffs — while offloading verbose code generation and iterative test-fixing loops to cost-effective models in **DeepSeek Harness (DSH)**:
 
-To the host, execution is a **controlled black-box workshop**: API credentials, provider/model routing, reasoning effort, Git `worktree` isolation, cross-subtask worktree reuse, and native DSH sessions stay encapsulated inside the plugin. The host focuses strictly on **direction, boundary approvals, and pragmatic acceptance**.
+- **Save 40%–52% flagship effective tokens (55%–68% output) with `7/7` full pass** across multi-file features and refactors (`33.61%` net total-token reduction including cache reads on Antigravity `T1–T5`).
+- **Isolated Git `worktree` parallel runs + one-click safe sync back:** Never pollutes your active branch or uncommitted drafts; syncs accepted diffs back after zero-destruction conflict prechecks without auto-committing.
+- **Silent 20–60 min waits & per-call fingerprint approvals:** Zero polling loops, live DSH sidebar sessions, and exact-fingerprint one-shot approval for out-of-sandbox commands.
 
 ![DSH TaskBridge four-layer architecture. Users and developers access the shared dispatch core, MCP protocol, and DSH execution engine through host adapters.](./assets/taskbridge-workflow.en.svg)
 
