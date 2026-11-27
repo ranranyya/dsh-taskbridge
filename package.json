@@ -1,7 +1,7 @@
 {
   "name": "dsh-taskbridge",
-  "version": "1.9.3",
-  "description": "Let Codex and Antigravity focus on planning and review while DeepSeek Harness runs heavy coding and test loops in isolated Git worktrees — save 40%–52% flagship effective tokens with silent long waits, per-call approvals, and safe auto-sync back (Claude Code planned for 2.0).",
+  "version": "1.9.4",
+  "description": "Let Codex and Antigravity focus on planning and review while DeepSeek Harness runs heavy coding and test loops in isolated Git worktrees — save 26%–52% flagship effective tokens with silent long waits, per-call approvals, and safe auto-sync back (Claude Code planned for 2.0).",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -51,10 +51,11 @@
     "bin/dsh-delegate-codex-agent.js",
     "bin/dsh-delegate-control.js",
     "bin/dsh-delegate-control.d.ts",
-    "codex/skills/dsh-taskbridge/SKILL.md",
-    "codex/skills/dsh-taskbridge/rules-reference-*.md",
-    "antigravity/skills/dsh-taskbridge/SKILL.md",
-    "antigravity/agents/dsh-taskbridge.md",
+    "integrations/README.md",
+    "integrations/targets/codex/skills/dsh-taskbridge/SKILL.md",
+    "integrations/targets/codex/skills/dsh-taskbridge/rules-reference-*.md",
+    "integrations/targets/antigravity/skills/dsh-taskbridge/SKILL.md",
+    "integrations/targets/antigravity/agents/dsh-taskbridge.md",
     "cordis.patch.yml",
     "README.md",
     "README.zh-CN.md",
@@ -89,7 +90,8 @@
     "docs/releases/1.9.0.zh.md",
     "docs/releases/1.9.1.zh.md",
     "docs/releases/1.9.2.zh.md",
-    "docs/releases/1.9.3.zh.md"
+    "docs/releases/1.9.3.zh.md",
+    "docs/releases/1.9.4.zh.md"
   ],
   "dsh": {
     "manifestVersion": 1,

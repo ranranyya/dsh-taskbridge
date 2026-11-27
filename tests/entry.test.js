@@ -350,7 +350,7 @@ test('plugin startup migrates exact shipped Codex agents to native skill and lea
   const { cleanup } = await import('./helpers/fakes.js');
   const prior = readFileSync(new URL('./fixtures/codex-agent-0.1.7.toml', import.meta.url), 'utf8')
     .replace(/\r?\n/gu, '\r\n');
-  const current = readFileSync(new URL('../codex/skills/dsh-taskbridge/SKILL.md', import.meta.url), 'utf8');
+  const current = readFileSync(new URL('../integrations/targets/codex/skills/dsh-taskbridge/SKILL.md', import.meta.url), 'utf8');
   const currentRendered = current.replace(/\r\n/gu, '\n');
 
   for (const entry of [
@@ -705,7 +705,7 @@ test('a re-activation after a hot update stamps the Codex agent with the version
   // The forced re-read the entry performs must return the SAME fact here, proving it goes
   // to disk rather than to a stale constant captured at import time. A stale constant is
   // what this test would catch: `PLUGIN_VERSION` used to be evaluated once at module load.
-  const template = readFileSync(new URL('../codex/skills/dsh-taskbridge/SKILL.md', import.meta.url), 'utf8');
+  const template = readFileSync(new URL('../integrations/targets/codex/skills/dsh-taskbridge/SKILL.md', import.meta.url), 'utf8');
   const rendered = await renderAgentFile(template, onDisk);
   assert.match(rendered, new RegExp(`^<!-- dsh-taskbridge-version: ${onDisk.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')} -->$`, 'mu'),
     'the rendered skill carries the manifest version, not a remembered one');

@@ -7,9 +7,9 @@
  *   Layer 1 (`integrations/adapters/*.md`)  — thin host-specific adapters
  *
  * Outputs (LF normalized):
- *   - codex/skills/dsh-taskbridge/SKILL.md + rules-reference-<sha256>.md
- *   - antigravity/skills/dsh-taskbridge/SKILL.md
- *   - antigravity/agents/dsh-taskbridge.md
+ *   - integrations/targets/codex/skills/dsh-taskbridge/SKILL.md + rules-reference-<sha256>.md
+ *   - integrations/targets/antigravity/skills/dsh-taskbridge/SKILL.md
+ *   - integrations/targets/antigravity/agents/dsh-taskbridge.md
  *
  * Usage:
  *   node scripts/build-integrations.mjs          # regenerate outputs
@@ -22,7 +22,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const DEFAULT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const CODEX_SKILL_DIR = 'codex/skills/dsh-taskbridge';
+const CODEX_SKILL_DIR = 'integrations/targets/codex/skills/dsh-taskbridge';
 const GENERATED_REFERENCE = /^rules-reference-([0-9a-f]{64})\.md$/u;
 
 export const INTEGRATION_TARGETS = Object.freeze([
@@ -38,12 +38,12 @@ export const INTEGRATION_TARGETS = Object.freeze([
   Object.freeze({
     id: 'antigravity-skill',
     adapter: 'integrations/adapters/antigravity-skill.adapter.md',
-    output: 'antigravity/skills/dsh-taskbridge/SKILL.md',
+    output: 'integrations/targets/antigravity/skills/dsh-taskbridge/SKILL.md',
   }),
   Object.freeze({
     id: 'antigravity-subagent',
     adapter: 'integrations/adapters/antigravity-subagent.adapter.md',
-    output: 'antigravity/agents/dsh-taskbridge.md',
+    output: 'integrations/targets/antigravity/agents/dsh-taskbridge.md',
   }),
 ]);
 

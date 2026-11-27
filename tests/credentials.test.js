@@ -1,6 +1,6 @@
 // Credential seam + credential-facing user-plane routes.
 //
-// The rules under test all come from one sentence in SPEC.md: never return secrets
+// The rules under test all come from one sentence in docs/SPEC.md: never return secrets
 // in public config, MCP, job history or logs. So the assertions here are mostly
 // *negative* — no value in a response body, no value in a refusal detail, no value
 // in a log line — and the positive assertions are about which seam method got

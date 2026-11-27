@@ -215,7 +215,7 @@ test('startup refresh upgrades an unmodified older Antigravity plugin version in
   }
 });
 
-test('startup refresh recognizes exact preview3 rules without ownership records and preserves an edited skill', async () => {
+test('startup refresh recognizes exact published 1.8.1 rules without ownership records and preserves an edited skill', async () => {
   const rules = [
     ['skills/dsh-taskbridge/SKILL.md', 'SKILL.md'],
     ['agents/dsh-taskbridge.md', 'dsh-taskbridge.md'],
@@ -224,16 +224,16 @@ test('startup refresh recognizes exact preview3 rules without ownership records 
     const fx = tempEnv();
     try {
       const plugin = join(fx.agyHome, 'plugins', ANTIGRAVITY_PLUGIN_NAME);
-      const options = { antigravityHome: fx.agyHome, env: fx.env, version: '1.9.0' };
+      const options = { antigravityHome: fx.agyHome, env: fx.env, version: '1.9.4' };
       const custom = new Map();
       for (const [key, fixture] of rules) {
         const path = join(plugin, key);
         mkdirSync(dirname(path), { recursive: true });
-        const preview = readFileSync(join(ROOT, 'tests/fixtures/antigravity-preview3', fixture), 'utf8');
-        if (customizeSkill && fixture === 'SKILL.md') custom.set(key, `${preview}\n# Operator note\n`);
-        writeFileSync(path, custom.get(key) ?? preview);
+        const published = readFileSync(join(ROOT, 'tests/fixtures/antigravity-1.8.1', fixture), 'utf8');
+        if (customizeSkill && fixture === 'SKILL.md') custom.set(key, `${published}\n# Operator note\n`);
+        writeFileSync(path, custom.get(key) ?? published);
       }
-      writeFileSync(join(plugin, 'plugin.json'), renderAntigravityManifest('1.9.0-preview3'));
+      writeFileSync(join(plugin, 'plugin.json'), renderAntigravityManifest('1.8.1'));
       assert.equal(existsSync(join(fx.dshHome, 'data')), false);
 
       const previous = await readAntigravityStatus(options);
@@ -247,9 +247,9 @@ test('startup refresh recognizes exact preview3 rules without ownership records 
       for (const [key] of rules) {
         assert.equal(refreshed.status.plugin.files[key].state, custom.has(key) ? 'modified' : 'installed');
         assert.equal(readFileSync(join(plugin, key), 'utf8'),
-          custom.get(key) ?? readFileSync(join(ROOT, 'antigravity', key), 'utf8'));
+          custom.get(key) ?? readFileSync(join(ROOT, 'integrations', 'targets', 'antigravity', key), 'utf8'));
       }
-      assert.equal(JSON.parse(readFileSync(join(plugin, 'plugin.json'), 'utf8')).version, '1.9.0');
+      assert.equal(JSON.parse(readFileSync(join(plugin, 'plugin.json'), 'utf8')).version, '1.9.4');
     } finally {
       fx.cleanup();
     }
@@ -413,8 +413,8 @@ test('published 1.7.1 Codex companion fixture migrates cleanly to 1.9.0 native s
 });
 
 test('antigravity subagent omits call_mcp_tool from tools frontmatter (auto-injected via mcp_config.json) and SKILL defaults to flash subagent', () => {
-  const agent = readFileSync(join(ROOT, 'antigravity', 'agents', 'dsh-taskbridge.md'), 'utf8');
-  const skill = readFileSync(join(ROOT, 'antigravity', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
+  const agent = readFileSync(join(ROOT, 'integrations', 'targets', 'antigravity', 'agents', 'dsh-taskbridge.md'), 'utf8');
+  const skill = readFileSync(join(ROOT, 'integrations', 'targets', 'antigravity', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
   // Listing `call_mcp_tool` in Antigravity YAML `tools:` causes executor startup failure:
   // "unknown component: tool \"call_mcp_tool\" not found in registry". Antigravity injects
   // MCP tools automatically from the plugin's `mcp_config.json`.

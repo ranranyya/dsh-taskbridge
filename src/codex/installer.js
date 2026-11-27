@@ -8,7 +8,7 @@
 // This module owns exactly two active targets in a Codex home:
 //
 //   1. `$CODEX_HOME/skills/dsh-taskbridge/SKILL.md` — a *managed copy* of the shipped
-//      template `codex/skills/dsh-taskbridge/SKILL.md` and the reference it links to.
+//      template `integrations/targets/codex/skills/dsh-taskbridge/SKILL.md` and the reference it links to.
 //      Ownership is proved by content,
 //      never by the file name or a version marker alone:
 //        * a file that is the same text as the template this build would write is
@@ -549,50 +549,20 @@ export const KNOWN_AGENT_TEMPLATES = [
   { version: '1.8.2-test2', sha256: '6452e8672fd3628fe6a5650e21bb4bb9925e7ff0d090bae9330427325975d915' },
 ];
 
-/** Exact shipped `skills/dsh-taskbridge/SKILL.md` files of earlier 1.9+ builds (SHA-256). */
+/** Exact shipped `skills/dsh-taskbridge/SKILL.md` files of earlier published 1.9+ releases (SHA-256). */
 export const KNOWN_SKILL_TEMPLATES = [
-  // Local 1.9.0-test1 native Codex skill before layered integrations/ refactor, in LF and CRLF.
-  { version: '1.9.0-test1', sha256: '815ec71d75e8089dd1d726b5bb07cd7ad2e3a3dec444e7dca76b83cce064b565' },
-  { version: '1.9.0-test1', sha256: '9777da3423c1a5c8d6cf50f0f161ab0f6e5b064708670f32abf6e6c4a4fffda0' },
-  // Local test packages with layered integration rules, in LF and CRLF.
-  { version: '1.9.0-test2', sha256: '5ed46037522e854fb31c6bfb3ecefc751e85a4d1a445b2e0830cee40b0738d5b' },
-  { version: '1.9.0-test2', sha256: '71b84788ab13749776f0ffa97d2be77e0b0296d1deff59b556eccdb95f681271' },
-  { version: '1.9.0-test3', sha256: 'd381022187327e9aff453588239b1664f6b9b7fc2f895e11701d4148e1330b82' },
-  { version: '1.9.0-test3', sha256: '5a0b5100b67a35600ead1c3b75d2e03a92e1fee10709e46e8ddd93661b59ddfc' },
-  { version: '1.9.0-test4', sha256: 'f67b394705485d3dd3e7219bde9f05d7720410eeeaa234c5da6dc68f89e3c7ca' },
-  { version: '1.9.0-test4', sha256: '7740c10f5f84f6fa309bdba67c10721dda6754b66f6b56236ca400ba6b9644af' },
-  { version: '1.9.0-test5', sha256: '709e7c18aef5c54e371f6830ac9c837fbfcb5963b26e4019ef5f9e491864df24' },
-  { version: '1.9.0-test5', sha256: '6e30655cb97200c3a3bbf6545ad90da1cc3e464363646e506f3075825cedf55d' },
-  { version: '1.9.0-pre', sha256: 'd8878f88e60a4d46079f7fde93408d21c1e517c76d1bad86a7814d40603d729d' },
-  { version: '1.9.0-pre', sha256: 'e2b8ec097cdedcbbbdf811870d566cb1fb36f6882d579db67a0f33f08c78da98' },
-  { version: '1.9.0-pre', sha256: '64560e14664ab0b932c36a5e2560c35ef5acf7cdbf38acf522e87e8aefbd53b7' },
-  { version: '1.9.0-pre', sha256: 'db1526280a0618a379db8dbe1c71840204a5957907a92b20bd3f43fd00971c0f' },
-  { version: '1.9.0-test6', sha256: 'c2477b9233f4f9b4e36c59f8544f607249b2f96be0aeba0a013525e18c4eab38' },
-  { version: '1.9.0-test6', sha256: '238366a0ebaa543d6b09fd1a94d5507a22d5ba0d19fee32539c429d1ded2182c' },
-  { version: '1.9.0-preview', sha256: 'eefe1134216d3d73901ec8e279e8752b4281dd191343e180fb76c671055c4523' },
-  { version: '1.9.0-preview', sha256: '0f28427153bda6e696fc6203d3ac885067ac22902b716e6ecbce6a2a0e693148' },
-  { version: '1.9.0-preview2', sha256: 'bc1a1be12d5117efe52ed5c10e4d25cac4713b9746c41096cc6f5e75efada40d' },
-  { version: '1.9.0-preview2', sha256: '6a2684b21762157edf3b32ddccea81d6327b117454cdb74e0c7260803f46d4be' },
-  { version: '1.9.0-preview3', sha256: 'c3b3d6ad273f55ec822cde3f6635f875103c339d65821601d3baaddac85af4d7' },
-  { version: '1.9.0-preview3', sha256: '1237d095f32a0c4ac1d5dde8f05f11b6edf17d863ff1bb67ab63a17f6ac2fe3b' },
   // Published 1.9.0 native Codex skill, in LF and CRLF.
   { version: '1.9.0', sha256: '203e686fe12ee4827ea9c5bab404997f641a8f45d45daa37efc776b7e9620d71' },
   { version: '1.9.0', sha256: '9a0eaf95266ad13e175d0223f954f19e0c41573d817cd6099112416156cc395f' },
-  // Exact contents of the 1.9.1 release (LF and CRLF) and archived 1.9.2-test1 .. test4 Codex packages.
+  // Published 1.9.1 native Codex skill, in LF and CRLF.
   { version: '1.9.1', sha256: 'a6459641eab745f7494976559f6da6e6b4d3431e41183cf0100ff86092797433' },
   { version: '1.9.1', sha256: '90e40ae2a09cfcfd66b5f7264f086b79d923214805cf1073dd4eba0f86db7499' },
-  { version: '1.9.2-test1', sha256: 'a2cd721be797ae7548924e437d1ff6fc5dde7e0ebd26237573cb31b4a5fe488b' },
-  { version: '1.9.2-test2', sha256: 'd0bc51f2105a08eb61c194847f5ffa957e2a6caf7882aa85ed18f57b7664864b' },
-  { version: '1.9.2-test3', sha256: '6b117f95c8ac875401ecbc09182be47235746a567d36cd2f6a421b00831ebe1c' },
-  { version: '1.9.2-test4', sha256: 'f4b844a2fa8c167ee78ff2000d2cac656ab261973c4446c70135c4f52fd98fce' },
-  { version: '1.9.2-test4', sha256: '73b0d2bdd29c9397106b68c3389c25a30127e1e079df5390a4dff9b62f747a7a' },
-  // Published 1.9.2 native Codex skill, in LF and CRLF, plus archived 1.9.3-test1 / test2.
+  // Published 1.9.2 native Codex skill, in LF and CRLF.
   { version: '1.9.2', sha256: '5ffe75f582a48ea393611811cc74f3f313074ed9390a4681b1fcb6e023a60376' },
   { version: '1.9.2', sha256: 'd7ce4f758d9db785dd395315ee635ac4931cf23085e3ec92ca22673ffedd0a79' },
-  { version: '1.9.3-test1', sha256: '68f669dd70517cfba2f517950c2ce7a873c2b751a5be4c6eb825adc43e441039' },
-  { version: '1.9.3-test1', sha256: '497be88bad4208a95674a2846f2ff1b4a7cdbd96b429f3f965f06e3ba2757c5c' },
-  { version: '1.9.3-test2', sha256: '64ef15bd4c1cfc19e19cc2ba81bd5cd4e2cb1c98a586c7a6f6a1d72ad78818a6' },
-  { version: '1.9.3-test2', sha256: '6cd18df4641fc419d396b022af90429e7fa3fc40077dd510d31fa5526013df7e' },
+  // Published 1.9.3 native Codex skill, in LF and CRLF.
+  { version: '1.9.3', sha256: '2b195109056f36b38b0797e196f71832b9f45ed211ecc5ec48339ed8a60104ac' },
+  { version: '1.9.3', sha256: '57f7ce378a40a9f0b9f32c8f3dc170fe0de788db46e41441e2ce3fbcdee92d00' },
 ];
 
 /** The version provenance comment line inside a shipped Markdown Codex skill file. */
@@ -716,7 +686,7 @@ const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'
  * declare before its entry point can be adopted by an automatic migration.
  */
 const PACKAGE_NAME = 'dsh-taskbridge';
-const TEMPLATE_PATH = join(PACKAGE_ROOT, 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME);
+const TEMPLATE_PATH = join(PACKAGE_ROOT, 'integrations', 'targets', 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME);
 const SKILL_REFERENCE_LINK = /\]\((rules-reference-([0-9a-f]{64})\.md)\)/u;
 const PACKAGE_MANIFEST_PATH = join(PACKAGE_ROOT, 'package.json');
 

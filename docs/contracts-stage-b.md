@@ -3,7 +3,7 @@
 > Superseded: this document describes the earlier per-connection grant/token
 > design. The current product uses one persisted local-call switch, requires no
 > MCP connection token and hides grant-control routes in switch mode. See
-> `README.md`, `SPEC.md` and `docs/auth-contract.md` for the current contract.
+> `README.md`, `docs/SPEC.md` and `docs/auth-contract.md` for the current contract.
 
 This document is the contract a later Chinese-language native DSH settings UI
 ("Stage B UI") codes against. It records the exact routes, methods, request

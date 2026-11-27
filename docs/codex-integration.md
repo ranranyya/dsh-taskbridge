@@ -1,6 +1,6 @@
 # Codex integration contract
 
-Status: implemented in 1.9.3 (retaining the 1.9.0 native skill migration from legacy subagent `agents/dsh-taskbridge.toml` to `skills/dsh-taskbridge/SKILL.md`, with safe automatic retirement of untouched 0.1.6–1.8.x legacy subagents and automatic refresh of untouched 1.9.0–1.9.2 skills; Antigravity integration is documented in `docs/antigravity-integration.md`, and Claude Code / Claude Desktop integration is planned for 2.0).
+Status: implemented in 1.9.4 (retaining the 1.9.0 native skill migration from legacy subagent `agents/dsh-taskbridge.toml` to `skills/dsh-taskbridge/SKILL.md`, with safe automatic retirement of untouched 0.1.6–1.8.x legacy subagents and automatic refresh of untouched 1.9.0–1.9.3 skills; Antigravity integration is documented in `docs/antigravity-integration.md`, and Claude Code / Claude Desktop integration is planned for 2.0).
 
 The 1.7.0 release also makes future managed upgrades self-recognising: the two exact
 companions this machine really held (`1.6.1` in both terminator spellings and the local
@@ -94,7 +94,7 @@ The goal is fixed at task creation. The completion summary exists only under `ho
 
 | Path | Owner | The plugin may | The plugin may never |
 | --- | --- | --- | --- |
-| `$CODEX_HOME/skills/dsh-taskbridge/SKILL.md` | managed copy of `codex/skills/dsh-taskbridge/SKILL.md` | create it **exclusively** on explicit install (or legacy migration) when absent; refresh a byte-exact known build during plugin startup or explicit install; delete it on `remove` only after re-reading it and finding the same bytes it classified (and unlink untouched legacy `agents/dsh-taskbridge.toml` / `agents/dsh-delegate.toml` after re-proving their bytes) | overwrite or delete a file that is not that exact build — including a skill or legacy agent file whose body was edited, and including a file that changed in the window between the status read and the write/removal |
+| `$CODEX_HOME/skills/dsh-taskbridge/SKILL.md` | managed copy of `integrations/targets/codex/skills/dsh-taskbridge/SKILL.md` | create it **exclusively** on explicit install (or legacy migration) when absent; refresh a byte-exact known build during plugin startup or explicit install; delete it on `remove` only after re-reading it and finding the same bytes it classified (and unlink untouched legacy `agents/dsh-taskbridge.toml` / `agents/dsh-delegate.toml` after re-proving their bytes) | overwrite or delete a file that is not that exact build — including a skill or legacy agent file whose body was edited, and including a file that changed in the window between the status read and the write/removal |
 | `$CODEX_HOME/config.toml`, table `mcp_servers.dsh-delegate` | operator, with one managed entry | add the entry when absent; update `command`/`args`/its own `env.DSH_DELEGATE_DISCOVERY_FILE` when the entry carries **the plugin marker** *and* is the exact shape this plugin writes; on an explicit `install`/`repair` only, adopt a recorded `args[0]` that is a PROVED real installation of this package (manifest `name` + `bin["dsh-delegate-mcp"]` mapping) | touch any other key, table, comment or ordering; adopt, update or delete an unmarked same-name entry, even one whose values coincide; adopt a differing script path from the automatic startup check |
 | `$CODEX_HOME`, `$CODEX_HOME/skills`, `$CODEX_HOME/skills/dsh-taskbridge` and `$CODEX_HOME/agents` | Codex | resolve and pin a normal root symlink/junction to its real directory; inspect all 4 boundary levels in one batched Windows check; create missing `skills/dsh-taskbridge` (`0700`) on explicit install | retarget or delete the root alias; follow a link in `skills/`, `skills/dsh-taskbridge/`, `agents/` or the final file; write through an unusable or unverified target |
 | DSH local-call switch | operator | report it | change it |
@@ -591,7 +591,7 @@ successful diagnosis.
 ```jsonc
 {
   "codexHome": "…",
-  "packageVersion": "1.9.3",
+  "packageVersion": "1.9.4",
   "boundary": {
     "blocked": false, "link": null, "unknown": false,
     "home": "directory", "skills": "directory", "skillDir": "directory", "agents": "directory"
@@ -685,7 +685,7 @@ remain those selected in the plugin settings.
 ## 5. Skill ownership & historical legacy TOML identities
 
 From `1.9.0`, the active shipped file is the Markdown skill `$CODEX_HOME/skills/dsh-taskbridge/SKILL.md`
-(with `<!-- dsh-taskbridge-version: 1.9.3 -->` and its content-addressed `rules-reference-<sha256>.md`).
+(with `<!-- dsh-taskbridge-version: 1.9.4 -->` and its content-addressed `rules-reference-<sha256>.md`).
 Earlier `0.1.6`–`1.8.x` releases shipped a custom-agent TOML file:
 
 ```toml

@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "DSH TaskBridge",
-    "description": "让 Codex 和 Antigravity 专注架构规划与验收，把重度写代码和跑测试交给 DeepSeek Harness（复用 DSH 模型与思考强度）在独立 Git worktree 里并行干活：不污染主分支、静默长等免轮询、敏感操作逐次审批，验收通过后一键冲突预检安全写回；中大型任务实测可省下 40%–52% 旗舰模型有效 Token（Claude Code / Claude Desktop 计划于 2.0 支持）。",
+    "description": "让 Codex 和 Antigravity 专注架构规划与验收，把重度写代码和跑测试交给 DeepSeek Harness（复用 DSH 模型与思考强度）在独立 Git worktree 里并行干活：不污染主分支、静默长等免轮询、敏感操作逐次审批，验收通过后一键冲突预检安全写回；实测可省下 26%–52% 旗舰模型有效 Token（Claude Code / Claude Desktop 计划于 2.0 支持）。",
     "detail": "docs/INTRODUCTION.zh.md"
   }
 }

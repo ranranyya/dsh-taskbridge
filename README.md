@@ -14,6 +14,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/ranranyya/dsh-taskbridge/actions/workflows/ci.yml"><img src="https://github.com/ranranyya/dsh-taskbridge/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://www.npmjs.com/package/dsh-taskbridge"><img src="https://img.shields.io/npm/v/dsh-taskbridge?label=npm&color=CB3837" alt="npm version" /></a>
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D4" alt="Windows | macOS | Linux" />
   <img src="https://img.shields.io/badge/Node.js-%3E%3D24-5FA04E?logo=nodedotjs&logoColor=white" alt="Node.js >= 24" />
@@ -35,11 +36,11 @@
 
 Stay inside **Codex** or **Antigravity** to inspect repositories, design module contracts, and independently verify deliveries — while offloading verbose implementation and iterative test-fixing loops to **DeepSeek Harness (DSH)** on your machine (Claude Code / Claude Desktop support is planned for `2.0`):
 
-- **Save 40%–52% flagship effective tokens (55%–68% output) with `7/7` full pass:** Across our 7-task paired black-box benchmark suite, multi-file features and refactors cut flagship model token burn dramatically without sacrificing delivery quality (`33.61%` net total-token reduction including cache reads on Antigravity `T1–T5`).
+- **Proven quota savings with `7/7` full-suite pass:** Across our 7-task paired black-box benchmark suite, `T1–T5` aggregate flagship effective tokens drop by **`26.5%–39.4%`** (`33.61%` net total-token reduction including cache reads on Antigravity), while the heavy 3-domain refactor `T5` saves **`47.6%–52.1%` effective tokens and `55%–68%` code output**; with `1.9.4`'s `75%–87%` MCP catalog slimming, verified Codex `T0A–T4` runs (`6/6` at `100/100`) even beat the no-plugin baseline on small `T1` (`45,033` effective, **`+14.66%`**) and set an all-time low on `T3` (`60,047` effective, **`+27.55%`**).
 - **True Git `worktree` parallel isolation + one-click safe sync back:** Tasks run in clean isolated Git worktrees by default (with cross-subtask reuse), **never touching your active branch or uncommitted drafts**; accepted diffs sync back to your workspace after zero-destruction conflict prechecks without auto-committing.
 - **Silent long waits & per-call fingerprint approvals:** Wait `20–60 minutes` in a single call with zero polling loops; watch live DSH sessions in the sidebar, and approve any out-of-sandbox command one call at a time against its exact argument fingerprint.
 
-> **Current Release `1.9.3`:** Adds zero-destruction post-acceptance worktree-to-source auto-sync (`applyToSource: true` / `sourceSync`), strengthens Codex upfront contract briefs and single-call worker test approval boundaries, and sets new token-saving highs on both hosts; see [1.9.3 Release Notes (ZH)](docs/releases/1.9.3.zh.md) and [1.9.2 Release Notes (ZH)](docs/releases/1.9.2.zh.md).
+> **Current Release `1.9.4`:** Shrinks the MCP handshake instructions and 11-tool catalog context by **75%–87%** (`45.5K → 11.4K` chars, cutting cold-start Turn 1 input to `~18.1K` tokens), adds Windows + Linux GitHub Actions CI, removes dead zero-call client components, and cleans unpublished test/preview template hashes; see [1.9.4 Release Notes (ZH)](docs/releases/1.9.4.zh.md) and [1.9.3 Release Notes (ZH)](docs/releases/1.9.3.zh.md).
 
 <p align="center">
   <img src="./docs/assets/taskbridge-workflow.en.svg" width="100%" alt="DSH TaskBridge four-layer architecture: host adapters, shared dispatch core, bounded MCP protocol, and DSH execution engine" />
@@ -57,7 +58,7 @@ Open **Plugins → Add plugin** in DSH, enter the package name, and enable it:
 dsh-taskbridge
 ```
 
-> Switch to the official npm registry if a regional mirror lags behind, or install `dsh-taskbridge-1.9.3.tgz` from [GitHub Releases](https://github.com/ranranyya/dsh-taskbridge/releases). Requires Node.js 24+ (automatically resolved from DSH's bundled runtime — never writing the desktop GUI executable `DeepSeek Harness.exe`).
+> Switch to the official npm registry if a regional mirror lags behind, or install `dsh-taskbridge-1.9.4.tgz` from [GitHub Releases](https://github.com/ranranyya/dsh-taskbridge/releases). Requires Node.js 24+ (automatically resolved from DSH's bundled runtime — never writing the desktop GUI executable `DeepSeek Harness.exe`).
 
 ### 2. Pick Your Worker Model
 
@@ -70,13 +71,22 @@ dsh-taskbridge
 - **Codex:** Open **Codex integration** and click **Install / update TaskBridge skill** (writes `skills/dsh-taskbridge/SKILL.md`, its rules reference appendix, and the `config.toml` MCP entry while safely retiring untouched legacy `agents/dsh-taskbridge.toml`). Start a new Codex session and dispatch with `$dsh-taskbridge` or an explicit DSH / TaskBridge instruction.
 - **Antigravity:** Open **Antigravity integration** and click **Install / update Antigravity plugin** (installed cleanly under `~/.gemini/config/plugins/dsh-taskbridge/` without touching global configs). Dispatch with `@[plugin:dsh-taskbridge]` / `@dsh-taskbridge` or an explicit instruction; select **Always Allow** on the first `delegate_*` prompt so silent waiting runs uninterrupted.
 
-### 4. Flip the Switch & Dispatch
+### 4. 60-Second Connectivity Check (Verify Your Setup)
 
-Turn on **Allow local MCP calls to DSH delegation** at the top of the settings page (off by default), then assign a task from your host:
+Turn on **Allow local MCP calls to DSH delegation** at the top of the settings page (off by default). Then open a new host session inside any Git repository with at least one commit and run this read-only check first:
+
+> Use dsh-taskbridge to check the local delegation switch status and run a read-only preflight on this repository without submitting a task.
+
+- **Expected receipt (~5 seconds):** Your host calls `delegate_status` and `delegate_preflight`, reporting `enabled: true`, your configured `provider` / `model` / `effort`, and `isolation: "worktree"` (`reason: "PREFLIGHT_CLEAN_REPOSITORY"`, or `PREFLIGHT_DIRTY_NEEDS_DECISION` if you have uncommitted local edits) — with zero files modified.
+- **Tiny smoke task (~60 seconds):** Ask *"Have DSH via TaskBridge add a unit test for an edge case in `<file>`, run the test suite, and pause for my review before syncing back."*
+  - **Where to watch live:** Open DSH's left sidebar under the **`TaskBridge`** workspace group to watch the isolated session run in real time, or check **Plugins → dsh-taskbridge → Task history** for status, token counts, and review records.
+  - **Completion receipt:** When finished, your host receives `reason: "ready"` (`state: "awaiting-host-review"`), verifies the isolated worktree diff/tests, and calls `delegate_review({ decision: "accepted", applyToSource: true })` to sync verified changes back safely.
+
+### 5. Dispatch Real Multi-File Work
+
+Once verified, hand off substantial implementation or refactoring packages from your host:
 
 > Use TaskBridge to have DSH implement the tiered overage billing module and export CLI in this repository. Inspect the specs first, define the module contracts and boundaries, dispatch the implementation and unit tests to DSH, and review the delivered diff and test suite before accepting.
-
-Watch the worker live under DSH's `TaskBridge` workspace group, or inspect full progress and review history anytime in **Task history**.
 
 ---
 
@@ -199,7 +209,7 @@ Edit tiny single-file tweaks directly in the host. Delegate multi-file features,
 
 ## Documentation & Feedback
 
-- [简体中文完整文档](README.zh-CN.md) · [1.9.3 Release Notes (ZH)](docs/releases/1.9.3.zh.md) · [1.9.2 Release Notes (ZH)](docs/releases/1.9.2.zh.md) · [1.9.1 Release Notes (ZH)](docs/releases/1.9.1.zh.md) · [1.9.0 Release Notes (ZH)](docs/releases/1.9.0.zh.md)
+- [简体中文完整文档](README.zh-CN.md) · [1.9.4 Release Notes (ZH)](docs/releases/1.9.4.zh.md) · [1.9.3 Release Notes (ZH)](docs/releases/1.9.3.zh.md) · [1.9.2 Release Notes (ZH)](docs/releases/1.9.2.zh.md) · [1.9.1 Release Notes (ZH)](docs/releases/1.9.1.zh.md) · [1.9.0 Release Notes (ZH)](docs/releases/1.9.0.zh.md)
 - [Codex integration](docs/codex-integration.md) · [Antigravity integration](docs/antigravity-integration.md) · [Claude roadmap](docs/claude-code.md) · [Silent waiting](docs/silent-wait.md)
 - [Workspace isolation](docs/workspace-contract.md) · [Conversation placement](docs/conversation-placement.md) · [Runtime compatibility](docs/runtime-compatibility.md) · [Plugin market](docs/plugin-market.md) · [Legacy migration](docs/taskbridge-upgrade.md)
 
@@ -226,18 +236,18 @@ Report issues or suggestions on [GitHub Issues](https://github.com/ranranyya/dsh
 
 DSH installs plugins as profile bundles (`$DSH_HOME/profiles/<name>`). Do not mix Desktop and CLI profile management:
 
-1. **DSH Desktop (Recommended):** Manage installation, updates, and removal exclusively inside **Plugins manager → Add plugin** (`dsh-taskbridge`, or select a local tarball built via `npm pack` → `dsh-taskbridge-1.9.3.tgz`). Never run `dsh plugin` or `npm`/`pnpm` directly against Desktop's reserved profile.
+1. **DSH Desktop (Recommended):** Manage installation, updates, and removal exclusively inside **Plugins manager → Add plugin** (`dsh-taskbridge`, or select a local tarball built via `npm pack` → `dsh-taskbridge-1.9.4.tgz`). Never run `dsh plugin` or `npm`/`pnpm` directly against Desktop's reserved profile.
 2. **CLI Web Profile (Non-Desktop only):**
 
 ```bash
 # Install into a CLI profile (e.g., web)
-dsh plugin --profile web add ./dsh-taskbridge-1.9.3.tgz && dsh plugin --profile web why dsh-taskbridge
+dsh plugin --profile web add ./dsh-taskbridge-1.9.4.tgz && dsh plugin --profile web why dsh-taskbridge
 
 # Launch DSH
 dsh --profile web
 ```
 
-> For isolated testing on CLI profiles, use a disposable profile (`dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.9.3.tgz`) with a temporary `DSH_HOME`.
+> For isolated testing on CLI profiles, use a disposable profile (`dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.9.4.tgz`) with a temporary `DSH_HOME`.
 
 ### 3. Settings & Local Switch
 
@@ -283,7 +293,7 @@ Before delivering a prompt, TaskBridge applies native DSH session permissions an
 
 ```bash
 # Upgrade or roll back on a CLI web profile
-dsh plugin --profile web add ./dsh-taskbridge-1.9.3.tgz
+dsh plugin --profile web add ./dsh-taskbridge-1.9.4.tgz
 dsh plugin --profile web remove dsh-taskbridge
 
 # Repository development & verification

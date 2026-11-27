@@ -2,14 +2,14 @@
 
 **Let Codex and Antigravity focus on architecture planning and final review — delegate heavy coding and test loops to DeepSeek Harness (DSH) in isolated Git worktrees.**
 
-> **Version `1.9.3` · Native one-click integration for Codex and Antigravity. Claude Code / Claude Desktop support is planned for 2.0.**  
-> `1.9.3` introduces zero-destruction automatic post-acceptance worktree-to-source sync (`applyToSource: true` / `sourceSync`), refines Codex upfront contract briefs and single-call worker test approval boundaries, and sets new benchmark token-saving highs on both hosts; see [1.9.3 Release Notes (ZH)](releases/1.9.3.zh.md).
+> **Version `1.9.4` · Native one-click integration for Codex and Antigravity. Claude Code / Claude Desktop support is planned for 2.0.**  
+> `1.9.4` shrinks the MCP handshake instructions and 11-tool catalog context by **75%–87%** (`45.5K → 11.4K` chars) with zero schema or runtime breakage (guarded by automated budget tests), removes dead zero-call client components, and cleans unpublished test/preview template hashes; see [1.9.4 Release Notes (ZH)](releases/1.9.4.zh.md).
 
 [简体中文](INTRODUCTION.zh.md) · [Quick Start](#quick-start) · [Benchmark Results & Token Savings](#benchmark-results--token-savings) · [Why TaskBridge](#why-taskbridge) · [Key Capabilities](#key-capabilities) · [How It Works](#how-it-works) · [FAQ](#faq) · [Changelog](../CHANGELOG.md)
 
 Stay inside **Codex** or **Antigravity** to inspect repositories, design interfaces, decompose multi-stage work, and review delivered diffs — while offloading verbose code generation and iterative test-fixing loops to cost-effective models in **DeepSeek Harness (DSH)**:
 
-- **Save 40%–52% flagship effective tokens (55%–68% output) with `7/7` full pass** across multi-file features and refactors (`33.61%` net total-token reduction including cache reads on Antigravity `T1–T5`).
+- **Proven quota savings with `7/7` full-suite pass:** `T1–T5` aggregate flagship effective tokens drop by **`26.5%–39.4%`** (`33.61%` net total-token reduction including cache reads on Antigravity), while the heavy 3-domain refactor `T5` saves **`47.6%–52.1%` effective tokens and `55%–68%` code output**; with `1.9.4`'s `75%–87%` MCP catalog slimming, verified Codex `T0A–T4` runs (`6/6` at `100/100`) even beat the no-plugin baseline on small `T1` (`45,033` effective, **`+14.66%`**) and set an all-time low on `T3` (`60,047` effective, **`+27.55%`**).
 - **Isolated Git `worktree` parallel runs + one-click safe sync back:** Never pollutes your active branch or uncommitted drafts; syncs accepted diffs back after zero-destruction conflict prechecks without auto-committing.
 - **Silent 20–60 min waits & per-call fingerprint approvals:** Zero polling loops, live DSH sidebar sessions, and exact-fingerprint one-shot approval for out-of-sandbox commands.
 
@@ -101,9 +101,13 @@ dsh-taskbridge
 - **Codex:** Open **Codex integration** and click **Install / update TaskBridge skill** (writes `skills/dsh-taskbridge/SKILL.md`, its rules reference appendix, and `config.toml` MCP entry while retiring untouched legacy `agents/dsh-taskbridge.toml`). Start a new Codex session and dispatch with `$dsh-taskbridge` or an explicit DSH / TaskBridge instruction.
 - **Antigravity:** Open **Antigravity integration** and click **Install / update Antigravity plugin** (installed cleanly under `~/.gemini/config/plugins/dsh-taskbridge/`). Dispatch with `@[plugin:dsh-taskbridge]` / `@dsh-taskbridge` or an explicit instruction; select **Always Allow** on the first `delegate_*` prompt so background waiting runs uninterrupted.
 
-### 4. Enable the Switch and Dispatch
+### 4. 60-Second Connectivity Check & Dispatch
 
-Turn on **Allow local MCP calls to DSH delegation** at the top of the settings page (off by default), then assign a task from your host:
+Turn on **Allow local MCP calls to DSH delegation** at the top of the settings page (off by default), then verify connectivity inside any committed Git repository first:
+
+> Use dsh-taskbridge to check the local delegation switch status and run a read-only preflight on this repository without submitting a task.
+
+Once your host returns `enabled: true` and `isolation: "worktree"` (`PREFLIGHT_CLEAN_REPOSITORY`), dispatch multi-file work (and watch live progress under DSH's **`TaskBridge`** sidebar group or **Task history**):
 
 > Use TaskBridge to have DSH implement the tiered overage billing module and export CLI in this repository. Inspect the specs first, define the module contracts and boundaries, dispatch the implementation and unit tests to DSH, and review the delivered diff and test suite before accepting.
 
@@ -143,7 +147,7 @@ Edit tiny one-file tweaks directly in the host. Delegate multi-file features, te
 
 ## Documentation & Feedback
 
-- [1.9.3 Release Notes (ZH)](releases/1.9.3.zh.md) · [1.9.2 Release Notes (ZH)](releases/1.9.2.zh.md) · [1.9.1 Release Notes (ZH)](releases/1.9.1.zh.md) · [1.9.0 Release Notes (ZH)](releases/1.9.0.zh.md) · [Codex integration](codex-integration.md) · [Antigravity integration](antigravity-integration.md) · [Claude roadmap](claude-code.md)
+- [1.9.4 Release Notes (ZH)](releases/1.9.4.zh.md) · [1.9.3 Release Notes (ZH)](releases/1.9.3.zh.md) · [1.9.2 Release Notes (ZH)](releases/1.9.2.zh.md) · [1.9.1 Release Notes (ZH)](releases/1.9.1.zh.md) · [1.9.0 Release Notes (ZH)](releases/1.9.0.zh.md) · [Codex integration](codex-integration.md) · [Antigravity integration](antigravity-integration.md) · [Claude roadmap](claude-code.md)
 - [Silent waiting](silent-wait.md) · [Workspace isolation](workspace-contract.md) · [Conversation placement](conversation-placement.md)
 - [Runtime compatibility](runtime-compatibility.md) · [Plugin market](plugin-market.md) · [Legacy migration](taskbridge-upgrade.md)
 

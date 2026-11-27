@@ -41,7 +41,7 @@ import {
 import { describeCodexOutcome } from '../src/client/api.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const TEMPLATE_PATH = join(ROOT, 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md');
+const TEMPLATE_PATH = join(ROOT, 'integrations', 'targets', 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md');
 const FIXTURES = join(ROOT, 'tests', 'fixtures');
 
 function writeCurrentSkill(path, entry) {
@@ -510,11 +510,11 @@ test('renderAgentFile writes LF for LF, CRLF and mixed input and keeps the body 
   assert.equal(readFileSync(TEMPLATE_PATH, 'utf8'), template);
 });
 
-// Extracted byte-for-byte from the archived test2 package, not from the current template.
-const test2Skill = readFileSync(join(FIXTURES, 'skill-1.9.0-test2.md'), 'utf8');
+// Extracted byte-for-byte from the published 1.9.2 release, not from the current template.
+const published192Skill = readFileSync(join(FIXTURES, 'skill-1.9.2.md'), 'utf8');
 
-for (const [ending, prior] of [['LF', test2Skill], ['CRLF', asCrlf(test2Skill)]]) {
-  test(`an untouched test2 skill (${ending}) upgrades without an ownership record`, async () => {
+for (const [ending, prior] of [['LF', published192Skill], ['CRLF', asCrlf(published192Skill)]]) {
+  test(`an untouched published 1.9.2 skill (${ending}) upgrades without an ownership record`, async () => {
     for (const action of ['install', 'refresh']) {
       const { home, skillPath } = homeWithConfig();
       writeFileSync(skillPath, prior);
@@ -529,7 +529,7 @@ for (const [ending, prior] of [['LF', test2Skill], ['CRLF', asCrlf(test2Skill)]]
     }
   });
 
-  test(`an edited test2 skill (${ending}) survives install, startup refresh and removal`, async () => {
+  test(`an edited published 1.9.2 skill (${ending}) survives install, startup refresh and removal`, async () => {
     const edited = prior.replace('delegate_preflight', 'delegate_preflight_custom');
     assert.notEqual(edited, prior);
     for (const action of ['install', 'refresh', 'remove']) {
@@ -714,7 +714,7 @@ function productLayout() {
     'src/codex/toml.js',
     'src/codex/agent-ownership.js',
     'src/config/store.js',
-    'codex/skills/dsh-taskbridge/SKILL.md',
+    'integrations/targets/codex/skills/dsh-taskbridge/SKILL.md',
     relativePath(ROOT, readCodexRuleFiles().referencePath),
     'package.json',
   ]) {

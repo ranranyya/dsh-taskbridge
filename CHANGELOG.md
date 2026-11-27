@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.9.4 — 零破坏 MCP 工具目录省 Token 瘦身、双端公开 CI、双语落地页与模板哈希清淤（2026-11-27）
+
+- **MCP 握手与工具目录上下文大幅瘦身（零协议破坏）**：在不改动任何 MCP 工具名、参数名、类型、`enum`、`required`、`additionalProperties`、`annotations`、`HTTP` 路由与运行时行为的前提下，压缩 `src/mcp/server.js` 的 `initialize.instructions`（`7,475 → 436` 字符，直降 **94.2%**）与 11 个 `delegate_*` 工具 Schema 描述（`JSON.stringify(TOOLS)` 从 `38,047 → 10,972` 字符，直降 **71.2%**），宿主端每次会话加载的 MCP 目录总字符数由 `45,522` 压降至 `11,408`（净降 **74.9%**；按工具拼接最坏场景由 `120,272` 降至 `15,768`，直降 **86.9%**），并在 `tests/mcp.test.js` 新增上限锁测（`<= 500` / `<= 11,500`）防止后续回退；Codex 真机复验冷启动首轮输入压至 `18,126` tokens，`T0A–T4` 六题满分（`6/6` 均分 `100`）复验中 `T1` 有效 Token 压至 **`45,033`**（较 `1.9.3` 降 **39.5%–49.1%**，首次反超无插件基线 **`+14.66%`**）、`T3` 有效压至 **`60,047`**（较无插件基线净省 **`+27.55%`**，含缓存总 Token `785,551` 创代际新低）。
+- **清理客户端零调用死组件**：删除 `src/client/index.jsx` 中全仓零引用的 4 个历史遗留组件（`ConnectivityLayer`、`LegacyAuthorizationPanel`、`ProviderEditor`、`LegacyProvidersPanel`）及 6 个仅由其使用的导入（净减 `660` 行），并重建 `lib/client.js`。
+- **清理未公开发布测试版模板哈希并补登 `1.9.3` 正式版哈希**：在 `src/codex/installer.js` 的 `KNOWN_SKILL_TEMPLATES` 补登 `1.9.3` 正式版 Codex 技能 LF/CRLF 双哈希，清除 `src/codex/installer.js` 与 `src/antigravity/installer.js` 中未公开发布的 `1.9.x-test*` / `pre` / `preview*` 临时哈希，仅保留正式公开发布版本并同步收紧升级单测。
+- **仓库根目录瘦身、双语落地页升级与 Windows + Linux 公开 CI**：将生成的随包宿主模板统一收敛至 `integrations/targets/{codex,antigravity}/`，归档移除根目录历史交接报告与过期 `pnpm-lock.yaml`，将 `SPEC.md` 与 `icon-256.png` 收纳至 `docs/`；升级根目录英文 `README.md` 与中文 `README.zh-CN.md` 落地页首屏并补充「60 秒连通首检」指引；修复 `tests/continuation-auth.test.js` 干净检出 `.cache` 目录自动创建与 `.gitattributes` 跨平台 LF 行尾归一化，新增 `.github/workflows/ci.yml` 在 Ubuntu 与 Windows 双平台持续验证测试、构建同步与 `npm pack --dry-run`。详见 [1.9.4 更新说明](docs/releases/1.9.4.zh.md)。
+
 ## 1.9.3 — 隔离工作树验收后零破坏自动写回、Codex 契约与单次审批打磨及双端基准省流新高（2026-11-26）
 
 - **隔离工作树（`worktree`）验收后零破坏自动写回（`applyToSource` / `sourceSync`）**：新增 `src/workspace/sync-source.js`，并在 `delegate_review` / `POST /tasks/review` 支持可选 `applyToSource: true`（仅限 `decision: "accepted"`）。严格在 `reviewPersistence.state === "saved"`（`durable: true`）落盘确认后按序锁定双端工作区，校验基线 `HEAD` 未变、拦截敏感路径与符号链接（含 Git `120000` / `160000`）、保护 `sourcePath` 非重叠未提交草稿并对冲突执行零字节改动中止（保留已保存的验收结论），通过后应用已追踪文件补丁，逐文件原子写入未追踪新文件，并返回结构化 `sourceSync` 回执（幂等支持 `already-synced`，绝不自动 `git add` / `commit` / `push`）；双端技能同步改为在单任务或任务链终局 `accepted` 时传 `applyToSource: true`，彻底消除宿主端手写同步脚本与源目录重复跑测回合。

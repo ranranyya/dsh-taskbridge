@@ -2,14 +2,14 @@
 
 **让 Codex 与 Antigravity 专注架构规划与验收把关，把重度写代码和跑测试交给 DeepSeek Harness（DSH）在独立 Git worktree 中并行干活。**
 
-> **当前版本 `1.9.3` · 已原生支持 Codex 与 Antigravity 一键集成；Claude Code / Claude Desktop 接入计划于 2.0 上线。**  
-> 本次 `1.9.3` 新增隔离工作树（`worktree`）终局验收后零破坏冲突预检与安全自动写回（`applyToSource: true` / `sourceSync`），打磨 Codex 首轮契约指引与单次测试审批边界，并刷新双端省流新高，详见 [1.9.3 更新说明](releases/1.9.3.zh.md)。
+> **当前版本 `1.9.4` · 已原生支持 Codex 与 Antigravity 一键集成；Claude Code / Claude Desktop 接入计划于 2.0 上线。**  
+> 本次 `1.9.4` 零破坏将 MCP 握手与工具目录上下文直降 **75%–87%**（`45.5K → 11.4K` 字符，新增上限锁测），同步清理前端零调用死组件与内部未发布测试哈希，详见 [1.9.4 更新说明](releases/1.9.4.zh.md)。
 
 [English](INTRODUCTION.md) · [快速上手](#快速上手) · [双端基准测试与省流实测](#双端基准测试与省流实测) · [为什么选择 TaskBridge](#为什么选择-taskbridge) · [核心能力](#核心能力) · [设置与机制](#设置与机制) · [常见问题](#常见问题) · [更新日志](../CHANGELOG.md)
 
 在 **Codex** 或 **Antigravity** 中阅读仓库、拆解架构、设定接口契约并独立验收交付，将耗费大量输出与反复跑单测排错的编码任务交给 **DeepSeek Harness（DSH）** 执行：
 
-- **实测省下大半主力配额，且 `7/7` 全满分不降质**：中大型与重型重构任务让旗舰模型**有效 Token 净省 40%–52%、代码输出直降 55%–68%**（Antigravity `T1–T5` 含缓存总流量净省 **33.61%**）。
+- **实测省下可观主力配额，且 `7/7` 全满分不降质**：`T1–T5` 合计旗舰模型有效 Token **净省 `26.5%–39.4%`**（Antigravity 含缓存总流量净省 **`33.61%`**），重型三域重构单题 `T5` 有效省流达 **`47.6%–52.1%`、代码输出直降 `55%–68%`**；`1.9.4` 压缩 `75%–87%` MCP 工具目录后，Codex `T0A–T4` 六题满分复验连小型题 `T1` 也首次反超无插件基线（有效 `45,033`，净省 **`+14.66%`**）、`T3` 有效降至 **`60,047`**（净省 **`+27.55%`**）。
 - **独立 Git `worktree` 真并行隔离 + 验收后零破坏写回**：默认隔离并行开发、不污染当前分支或草稿，终局验收通过后经冲突预检一键安全写回原工作区（绝不自动 `git commit`）。
 - **静默长等免轮询 + 敏感操作逐次指纹审批**：单次调用静默长等 20–60 分钟免轮询，DSH 原生侧栏全程实时可见，越界命令按真实参数指纹逐次审批。
 
@@ -101,9 +101,13 @@ dsh-taskbridge
 - **接入 Codex**：打开 **Codex 集成** 页签，点击 **安装 / 更新 TaskBridge 技能**（自动写入 `skills/dsh-taskbridge/SKILL.md`、同目录规则附页与 `config.toml` MCP 配置，并安全清理未修改过的旧版 `agents/dsh-taskbridge.toml`）。重开或新建 Codex 会话后，输入 `$dsh-taskbridge` 或明确交代“交给 DSH / TaskBridge 执行”即可激活单链直等派工。
 - **接入 Antigravity**：打开 **Antigravity 集成** 页签，点击 **安装 / 更新 Antigravity 插件**（独立写入 `~/.gemini/config/plugins/dsh-taskbridge/`，不触碰全局配置）。加载后通过 `@[plugin:dsh-taskbridge]` / `@dsh-taskbridge` 或明确指令派工；首次弹出外部 `delegate_*` 工具确认框时建议勾选 **Always Allow**，保持后台静默等待连贯。
 
-### 4. 打开总开关，派发任务
+### 4. 60 秒连通首检与正式派工
 
-开启配置页顶部的 **允许本机 MCP 调用 DSH 委派**（新安装默认关闭，关闭即拒收新单并中止在途运行），随后在宿主端下达需求即可：
+开启配置页顶部的 **允许本机 MCP 调用 DSH 委派**（新安装默认关闭，关闭即拒收新单并中止在途运行），先在已提交 Git 仓库中发一句只读自检确认接通：
+
+> 请使用 dsh-taskbridge 检查本机委派开关状态，并对当前仓库做一次只读预检，不要提交执行任务。
+
+宿主返回 `enabled: true` 及 `isolation: "worktree"`（`PREFLIGHT_CLEAN_REPOSITORY`）即确认接通；随后派发正式开发需求（执行过程可在 DSH 侧边栏 **`TaskBridge`** 分组或 **任务记录** 页签实时查看）：
 
 > 用 TaskBridge 把当前仓库的分层超额计费模块和导出 CLI 交给 DSH 实现。你先核对现有目录与规范定好接口契约和边界，拆包或单包派给 DSH 完成编码与单测；交付后独立核验 diff 与测试结果并记录验收结论，若有缺陷就续接原任务修完。
 
@@ -146,7 +150,7 @@ dsh-taskbridge
 
 ## 更多文档与反馈
 
-- [1.9.3 更新说明](releases/1.9.3.zh.md) · [1.9.2 更新说明](releases/1.9.2.zh.md) · [1.9.1 更新说明](releases/1.9.1.zh.md) · [1.9.0 更新说明](releases/1.9.0.zh.md) · [Codex 集成契约](codex-integration.md) · [Antigravity 集成契约](antigravity-integration.md) · [Claude 接入规划](claude-code.md)
+- [1.9.4 更新说明](releases/1.9.4.zh.md) · [1.9.3 更新说明](releases/1.9.3.zh.md) · [1.9.2 更新说明](releases/1.9.2.zh.md) · [1.9.1 更新说明](releases/1.9.1.zh.md) · [1.9.0 更新说明](releases/1.9.0.zh.md) · [Codex 集成契约](codex-integration.md) · [Antigravity 集成契约](antigravity-integration.md) · [Claude 接入规划](claude-code.md)
 - [静默等待说明](silent-wait.md) · [工作区与隔离](workspace-contract.md) · [会话放置与续接](conversation-placement.md)
 - [运行时兼容性](runtime-compatibility.md) · [插件发现与更新](plugin-market.md) · [旧名称迁移](taskbridge-upgrade.md)
 

@@ -77,8 +77,8 @@ export const ANTIGRAVITY_ENV_VARS = Object.freeze(['ANTIGRAVITY_CONFIG_DIR', 'GE
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const PACKAGE_MANIFEST_PATH = join(PACKAGE_ROOT, 'package.json');
-const SKILL_TEMPLATE_PATH = join(PACKAGE_ROOT, 'antigravity', 'skills', 'dsh-taskbridge', 'SKILL.md');
-const AGENT_TEMPLATE_PATH = join(PACKAGE_ROOT, 'antigravity', 'agents', 'dsh-taskbridge.md');
+const SKILL_TEMPLATE_PATH = join(PACKAGE_ROOT, 'integrations', 'targets', 'antigravity', 'skills', 'dsh-taskbridge', 'SKILL.md');
+const AGENT_TEMPLATE_PATH = join(PACKAGE_ROOT, 'integrations', 'targets', 'antigravity', 'agents', 'dsh-taskbridge.md');
 const LOGO_TEMPLATE_PATH = join(PACKAGE_ROOT, 'icon.svg');
 
 const PLUGIN_FILE_KEYS = Object.freeze([
@@ -605,20 +605,8 @@ const KNOWN_PRIOR_ANTIGRAVITY_FILES = Object.freeze({
   'skills/dsh-taskbridge/SKILL.md': Object.freeze([
     // Published 1.8.0 SKILL.md (LF)
     '9e83135ece937dbc0b73f5098509daac2fe4b973fe4dcd2ed75186745cf3cfee',
-    // Published 1.8.1 / 1.9.0-test1 SKILL.md (LF)
+    // Published 1.8.1 SKILL.md (LF)
     'cb4b0645dbe0de74dce89c286ab61d91e258f24b85edfe6e6ade9362c9f31c14',
-    // Pre-layered 1.9.0 balanced SKILL.md (LF)
-    '72cf86f41fee5482bb78379949709ec61069997a738060c0bedfb806175e168a',
-    // Layered 1.9.0-test2 .. test4 SKILL.md (LF)
-    '0346fd973a7a81ed90e8406b11c39953da4165192ce1dddbb70b714ffa771e9c',
-    // Layered 1.9.0-test5 SKILL.md (LF)
-    '2d3351c1eccce74715929d9fee47d930d3729876db9807ed32be45caed805b1c',
-    // Layered 1.9.0-test6 SKILL.md (LF)
-    '731c17aa516059a7fc6180b848d2c830b66a1d7117cae8415eb85318ed067093',
-    // Layered 1.9.0-preview SKILL.md (LF)
-    'ce3a02c9b9ba4e45be30f3ba83ec93ee5254da64f643f12bfcc841dd9dbd2e3f',
-    // Layered 1.9.0-preview2 / preview3 SKILL.md (LF)
-    'b27118375a6f87fc35ea623c131912ef1545adc84f7c0c5a94790d12b73d4d4d',
     // Published 1.9.0 / 1.9.1 SKILL.md (LF)
     '0a3f0e10cb627de8a8b5c02d92352226d233291294599ea8b824bb250b9ea2ab',
     // Published 1.9.2 SKILL.md (LF)
@@ -627,16 +615,8 @@ const KNOWN_PRIOR_ANTIGRAVITY_FILES = Object.freeze({
   'agents/dsh-taskbridge.md': Object.freeze([
     // Published 1.8.0 agents/dsh-taskbridge.md (LF)
     'df1418abe2c58c535734ecf6619bd027ca251d2dd6043cec9f41561d8e0a432b',
-    // Published 1.8.1 / 1.9.0-test1 agents/dsh-taskbridge.md (LF)
+    // Published 1.8.1 agents/dsh-taskbridge.md (LF)
     'cadb5f5f4de640c89b924a75f53a09d38ee68df22086b5aa4aa516192970055b',
-    // Pre-layered 1.9.0 slim agents/dsh-taskbridge.md (LF)
-    'c26f3272c4a164ec4fe5977aeb8033b296329120445f197121d8087052b5e175',
-    // Layered 1.9.0-test2 .. test5 agents/dsh-taskbridge.md (LF)
-    'de2c85d753f0eed941c5942d1eba4e2aace921f138cab1b81fe4391f01a02a09',
-    // Layered 1.9.0-test6 agents/dsh-taskbridge.md (LF)
-    'fa31106b0c0433941d3d1a92bab5a100b9d25c8af3a87687c2b04032ff5cea3d',
-    // Layered 1.9.0-preview .. preview3 agents/dsh-taskbridge.md (LF)
-    '52648163cbb532a6d3dbe37b82e0efb27c9a26c207462d6740ec0abfa119ee8a',
   ]),
 });
 

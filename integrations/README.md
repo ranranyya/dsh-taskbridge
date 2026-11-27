@@ -18,10 +18,10 @@
   2. `02-planning-philosophy.md` — 核心指挥哲学：大任务拆小包（`delegate_plan`）+ 指明方向、接口契约与范围红线（防跑偏），**禁止代写具体实现代码或逐行伪代码**。
   3. `03-dispatch-state-machine.md` — 统一派工状态机：`preflight` → `submit`（`agentTeams` / `continueFromTaskId` / 回执核对）→ `wait`（`wait-limit` / `heartbeat` / `permission` / `question` / `attention` / `interrupted` / 3 次瞬时断线重试 / 单写者禁令）。
   4. `04-pragmatic-review.md` — 务实审查标准：独立核查真实改动与测试；仅对违背需求/规范、真 Bug、测试失败/缺失、越界修改或遗留临时文件合并一轮打回；风格偏好与超纲假设记为非阻塞备注直接 `accepted`，并验证 `reviewPersistence.state === "saved"`。
-- `integrations/adapters/`（L1 极薄宿主适配壳）：
-  - `codex-skill.adapter.md` 和 `codex-reference.adapter.md` 从 L2 装配 Codex 首读入口和同目录的 `rules-reference-<sha256>.md`。入口提供常规流程，多阶段规划和低频事件按需读取同源附页。构建为 Codex 首读入口设置 16,000 UTF-8 字节预算、为按需附页设置 24,000 UTF-8 字节预算。
-  - `antigravity-skill.adapter.md` → 组装生成 `antigravity/skills/dsh-taskbridge/SKILL.md`
-  - `antigravity-subagent.adapter.md` → 组装生成 `antigravity/agents/dsh-taskbridge.md`
+- `integrations/adapters/`（L1 极薄宿主适配壳）与 `integrations/targets/`（生成的随包宿主模板产物）：
+  - `codex-skill.adapter.md` 和 `codex-reference.adapter.md` → 组装生成 `integrations/targets/codex/skills/dsh-taskbridge/SKILL.md` 及同目录 `rules-reference-<sha256>.md`。入口提供常规流程，多阶段规划和低频事件按需读取同源附页。构建为 Codex 首读入口设置 16,000 UTF-8 字节预算、为按需附页设置 24,000 UTF-8 字节预算。
+  - `antigravity-skill.adapter.md` → 组装生成 `integrations/targets/antigravity/skills/dsh-taskbridge/SKILL.md`
+  - `antigravity-subagent.adapter.md` → 组装生成 `integrations/targets/antigravity/agents/dsh-taskbridge.md`
 
 ## 维护命令
 

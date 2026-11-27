@@ -16,7 +16,7 @@ import {
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const previous = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.3.toml'), 'utf8');
 const previous154 = readFileSync(join(ROOT, 'tests/fixtures/agent-1.5.4.toml'), 'utf8');
-const current = readFileSync(join(ROOT, 'codex/skills/dsh-taskbridge/SKILL.md'), 'utf8');
+const current = readFileSync(join(ROOT, 'integrations/targets/codex/skills/dsh-taskbridge/SKILL.md'), 'utf8');
 const version = '1.9.0';
 
 useDirectoryClassifier(async (paths) => new Map(paths.map((path) => {

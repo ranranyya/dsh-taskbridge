@@ -1976,3 +1976,18 @@ test('the execution plane forwards continueFromTaskId and refuses an unusable on
     await plane.close();
   }
 });
+
+test('MCP initialize instructions and tool catalog stay within compact token budgets', async () => {
+  const { server } = fixture();
+  const answer = await server.handle({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} });
+  const instructionsLength = answer.result.instructions.length;
+  const catalogLength = JSON.stringify(TOOLS).length;
+  assert.ok(
+    instructionsLength <= 500,
+    `initialize.instructions must stay <= 500 chars (got ${instructionsLength})`,
+  );
+  assert.ok(
+    catalogLength <= 11_500,
+    `JSON.stringify(TOOLS) must stay <= 11500 chars (got ${catalogLength})`,
+  );
+});

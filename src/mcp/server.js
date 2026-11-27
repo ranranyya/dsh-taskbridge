@@ -279,7 +279,7 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_status',
     title: 'Delegation status',
-    description: 'Report whether delegation is enabled in DSH for this local MCP connection.',
+    description: 'Check if DSH delegation is enabled.',
     // A pure read of the plane's own posture: no task, no grant, no write.
     annotations: Object.freeze({
       title: 'Delegation status',
@@ -297,26 +297,8 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_submit',
     title: 'Submit delegated task',
-    description: 'Submit one prompt to run as a delegated task while the DSH delegation switch is enabled. '
-      + 'Returns the task identity and state (or follows the first wait in the same call when `wait: true` is set); '
-      + 'submission is not host approval. '
-      + 'workspacePath is the operator-authorized SOURCE repository or checkout the task runs against; '
-      + 'a source root may legitimately be a Git checkout or a Git worktree (subject to the usual preflight). '
-      + 'A follow-up keeps that same source path as the task it continues. '
-      + 'Omit continueFromTaskId to start a NEW task conversation (always a fresh DSH session, even in a '
-      + 'directory used before). Set it to the task id of the earlier delegated task this submission is a '
-      + 'follow-up to, to continue exactly that task thread (same DSH Workspace and Session): the plugin '
-      + 'reuses that task\u2019s recorded execution checkout and DSH Session internally, taking no execution '
-      + 'location from '
-      + 'the caller. An unknown, unfinished, removed or differently-sourced parent is refused rather than '
-      + 'started as a new conversation. For a new dependent subtask that starts a fresh DSH Session directly on '
-      + 'an earlier finished isolated worktree under the same source repository, pass reuseWorktreeFromTaskId '
-      + 'instead (never combined with continueFromTaskId). '
-      + 'The commander must first plan and scope ONE cohesive, independently verifiable work packet. '
-      + 'Inspect the project and prior delivery, choose the next ready packet, and tell the operator the approach and reuse decision. '
-      + 'Put clear architectural direction, exported contracts, owned scope redlines and acceptance checks in the prompt (without dictating line-by-line code). '
-      + 'Group dependent packets with delegate_plan. A simple task can use one brief. '
-      + 'Rules, planning and final review stay with the commander. Verification-only packets are read-only.',
+    description: 'Submit a task to DSH for an authorized source repository (Git checkout/worktree). '
+      + 'Omit continueFromTaskId for a NEW task conversation; set it for a follow-up.',
     // It creates work, so it is not a read; it is not destructive of anything the
     // operator already has, and repeating it creates ANOTHER task (never idempotent).
     annotations: Object.freeze({
@@ -331,124 +313,69 @@ export const TOOLS = Object.freeze([
       properties: {
         workspacePath: {
           type: 'string',
-          description: 'Absolute path of the operator-authorized SOURCE repository or checkout \u2014 the path '
-            + 'the authorization names, not a location chosen while a task runs. A source root may itself be '
-            + 'a Git checkout or a Git worktree, which is not rejected for that reason; it still goes through '
-            + 'the same preflight as any other path. '
-            + 'For a continueFromTaskId follow-up, pass the SAME source path the parent task was submitted '
-            + 'with: the plugin reuses the parent\u2019s recorded execution checkout and DSH Session internally, so do not '
-            + 'send '
-            + 'an execution.workspacePath or any other internal execution location in its place, because a '
-            + 'different source path names a different repository and the continuation is refused.',
+          description: 'Authorized source repository (Git checkout or Git worktree); substituting an internal execution path is refused.',
         },
         prompt: {
           type: 'string',
-          description: 'Give DSH the objective, verified starting facts, code/spec entry points, architectural direction and exported contracts/invariants, owned scope redlines, and acceptance evidence (do not dictate line-by-line implementation code). '
-            + 'Roadmap context does not authorize future packets. A verification-only packet permits checks and evidence only.',
+          description: 'Scoped task brief, contracts, acceptance checks.',
         },
-        title: { type: 'string', maxLength: 120, description: 'Short work-content title in the operator\'s language, e.g. 修复登录错误. Used to name the new DSH Workspace; omit role instructions and task ids. A follow-up keeps its existing Workspace name.' },
+        title: { type: 'string', maxLength: 120, description: 'Short title for new Workspace.' },
         overrides: {
           type: 'object',
-          description: 'Optional per-task overrides (model/effort/timeout). Validated by the harness.',
+          description: 'Optional model/effort/timeout overrides.',
           additionalProperties: true,
         },
         agentTeams: {
           type: 'boolean',
-          description: 'OPTIONAL. Your Agent Teams decision for THIS task\u2019s own DSH Session: the same switch the '
-            + 'DSH model menu exposes as \u300cUse Agent Teams\u300d/\u300c\u542f\u7528\u667a\u80fd\u4f53\u56e2\u961f\u534f\u4f5c\u300d. '
-            + 'Send `true` or `false` only when the operator chooses a mode for this task. An explicit value wins over the operator\u2019s '
-            + 'TaskBridge default. Leave it absent, including inside overrides, when the operator leaves it unspecified. A new task follows the operator\u2019s '
-            + '\u300c\u65b0\u4efb\u52a1\u9ed8\u8ba4\u5f00\u542f\u667a\u80fd\u4f53\u534f\u4f5c\u300d setting (off on a fresh install and after an '
-            + 'upgrade), and a follow-up (`continueFromTaskId`) keeps the mode the task it continues ran with \u2014 if that '
-            + 'task recorded none, its Session keeps the existing mode. '
-            + 'The plugin applies it to this run only and never opens a global default. Teams never replaces your '
-            + 'approval or your final review, and this flag never selects a model or an effort \u2014 those come from the '
-            + 'task\u2019s frozen configuration. On a DSH without agent-teams support, an explicit `true` or `false` is '
-            + 'REFUSED (the worker is not prompted and the task records why); only the operator\u2019s implicit off default '
-            + 'still runs, reported as not applied. The task record reports `agentTeams` (the choice that was '
-            + 'applied), `agentTeamsOrigin` (`request`, `continuation` or `settings-default`) and `team` (what DSH '
-            + 'confirmed, or why it could not).',
+          description: 'Optional Agent Teams override. Explicit wins over operator default; continueFromTaskId keeps '
+            + 'parent mode (existing if recorded none). Unsupported host: explicit REFUSED, implicit not applied; see agentTeamsOrigin.',
         },
         continueFromTaskId: {
           type: 'string',
-          description: 'Task id of the earlier delegated task this submission continues. '
-            + 'Use it only for a follow-up change or retry that belongs to that same task; '
-            + 'omit it for an unrelated task. It names a task thread, not a directory: keep passing the '
-            + 'parent\u2019s original authorized source repository in workspacePath and do not send the parent\u2019s '
-            + 'execution location, because the plugin reuses the parent\u2019s recorded execution checkout and DSH Session '
-            + 'internally and pins the follow-up to the parent\u2019s recorded isolation; do not select a new '
-            + 'isolation override either. An unknown, still-running, removed or differently-sourced parent is '
-            + 'refused, never replaced by a new conversation.',
+          description: 'Follow-up parent taskId; pass original source path (reuses worktree/session; invalid parent refused).',
         },
         reuseWorktreeFromTaskId: {
           type: 'string',
           minLength: 1,
           maxLength: 256,
-          description: 'OPTIONAL. Task id of an earlier finished (`awaiting-host-review`) isolated worktree task '
-            + 'under the SAME source repository whose managed worktree this NEW independent subtask should reuse. '
-            + 'Starts a FRESH DSH Session (clean worker context) and may bind its own `planNodeId`, while editing '
-            + 'directly on top of the upstream task\u2019s worktree without touching or committing to the user\u2019s source '
-            + 'checkout. Mutually exclusive with `continueFromTaskId` (which reuses both session and worktree for '
-            + 'rectification of the same item).',
+          description: 'Finished worktree taskId for fresh session.',
         },
         autoPreflight: {
           type: 'boolean',
-          description: 'OPTIONAL, default false (MCP-only control flag). For a new task chain (neither '
-            + '`continueFromTaskId` nor `reuseWorktreeFromTaskId`), run `delegate_preflight` automatically before '
-            + 'submitting. If preflight returns `block`, stops without submitting and returns `{ ok: true, '
-            + 'submitted: false, preflight }`; if clean (`worktree`, or `shared` with `allowShared: true`), proceeds '
-            + 'straight to submit inside this same call.',
+          description: 'Run preflight before submit (default false).',
         },
         allowShared: {
           type: 'boolean',
-          description: 'OPTIONAL, default false (only valid with `autoPreflight: true`). Forwarded to automatic '
-            + 'preflight when explicitly authorizing in-place `shared` execution on a dirty Git repository root.',
+          description: 'Allow dirty shared root with autoPreflight.',
         },
         wait: {
           type: 'boolean',
-          description: 'OPTIONAL, default false (MCP-only control flag). After the task is submitted, immediately '
-            + 'follow it via `delegate_wait` inside this same MCP call and return the compact wait answer plus '
-            + '`submitted: true` and `submitReceipt`. If the follow-up wait fails after submission succeeded, this '
-            + 'call still returns `submitted: true`, `taskId`, `submitReceipt` and `waitError` so you never lose the '
-            + 'task id or resubmit a duplicate.',
+          description: 'Wait in-call after submit (default false).',
         },
         waitSeconds: {
           type: 'integer',
           minimum: MIN_WAIT_SECONDS,
           maximum: MAX_WAIT_SECONDS,
-          description: 'OPTIONAL (only valid with `wait: true`). Wait budget in seconds; omit to use the default 3600s.',
+          description: 'Wait seconds with wait:true (default 3600).',
         },
         goalDescription: {
           type: 'string',
           maxLength: MAX_TASK_DESCRIPTION_CHARS,
           // The bound is counted in Unicode code points, not in UTF-16 units.
           codePointLength: true,
-          description: 'OPTIONAL. What THIS round of work is for, in your own words: the goal you planned, '
-            + 'not the packet of instructions (that is `prompt`). At most 2000 Unicode code points, so Chinese, '
-            + 'line breaks and emoji each count once; surrounding whitespace is trimmed and inner line breaks are '
-            + 'kept. A longer value, or one that is not a string (including `null`), is REFUSED before a task '
-            + 'exists \u2014 it is never shortened \u2014 and a blank value is the same as omitting it. It is stored with the '
-            + 'task record and appears in the `goalDescription` field of the task view that `delegate_submit` '
-            + 'returns and of `delegate_result`; it is never derived from the prompt, a parent task or the result, '
-            + 'and it does not change what the worker is told.',
+          description: 'Optional goal (<=2000 cp).',
         },
         planNodeId: {
           type: 'string',
           minLength: 1,
           maxLength: 256,
-          description: 'OPTIONAL. The `nodeId` (`plan-...`) of an existing planning node created with `delegate_plan` '
-            + 'that THIS execution task carries out. Starts a new DSH Session for that planned item; later '
-            + 'rectification rounds of this same item use `continueFromTaskId` and automatically inherit `planNodeId`. '
-            + 'Do NOT pass a sibling subtask\u2019s `planNodeId` together with `continueFromTaskId`.',
+          description: 'Optional plan-... nodeId.',
         },
         parentNodeId: {
           type: 'string',
           minLength: 1,
           maxLength: 256,
-          description: 'OPTIONAL. The `nodeId` (`plan-...`) or `taskId` (`task-...`) of the parent goal or parent task '
-            + 'when submitting a child subtask directly without pre-creating a leaf `planNodeId`. Starts a NEW DSH '
-            + 'Session under that parent; never reuses the parent\u2019s Session (`continueFromTaskId` is for rectification '
-            + 'rounds of the SAME item only).',
+          description: 'Optional parent plan/task id.',
         },
       },
       required: ['workspacePath', 'prompt'],
@@ -458,13 +385,7 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_result',
     title: 'Read task result',
-    description: 'Read one task this connection submitted: state, effective provider/model/effort, '
-      + 'changed-file summary, bounded diff, validation evidence and review outcome. '
-      + 'A finished execution is not host acceptance. '
-      + 'The review note and completion summary are returned in full when they fit; when the whole answer is '
-      + 'too large they are marked `hostAcceptance.noteOmitted: true` (read with `reviewNoteOffset`/'
-      + '`reviewNoteLimit`) or `hostAcceptance.completionSummaryOmitted: true` (read with '
-      + '`completionSummaryOffset`/`completionSummaryLimit`), never silently shortened.',
+    description: 'Read task snapshot, diff, and review. Page omitted notes/summaries via offset/limit.',
     // A read of a stored task: no work is created, changed or cancelled.
     annotations: Object.freeze({
       title: 'Read task result',
@@ -476,39 +397,32 @@ export const TOOLS = Object.freeze([
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
-        taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
+        taskId: { type: 'string', description: 'Task id.' },
         reviewNoteOffset: {
           type: 'integer',
           minimum: 0,
-          description: 'Read the review note from this CODE-POINT offset. Omit it for the normal full result; '
-            + 'supplying it (with or without reviewNoteLimit) returns ONLY the note slice plus its total '
-            + 'length, nextOffset and complete.',
+          description: 'Offset to page review note.',
         },
         reviewNoteLimit: {
           type: 'integer',
           minimum: 1,
           maximum: MAX_REVIEW_NOTE_PAGE_CHARS,
-          description: `Code points of the review note to return per page (1..${MAX_REVIEW_NOTE_PAGE_CHARS}, `
-            + 'default 2000). Only meaningful together with reviewNoteOffset.',
+          description: `Page size (1..${MAX_REVIEW_NOTE_PAGE_CHARS}).`,
         },
         completionSummaryOffset: {
           type: 'integer',
           minimum: 0,
-          description: 'Read hostAcceptance.completionSummary from this CODE-POINT offset when '
-            + 'completionSummaryOmitted is true. Returns ONLY the summary slice plus summaryChars, nextOffset and complete.',
+          description: 'Offset to page completionSummary.',
         },
         completionSummaryLimit: {
           type: 'integer',
           minimum: 1,
           maximum: MAX_COMPLETION_SUMMARY_PAGE_CHARS,
-          description: `Code points of completionSummary per page (1..${MAX_COMPLETION_SUMMARY_PAGE_CHARS}, `
-            + 'default 2000). Only meaningful together with completionSummaryOffset.',
+          description: `Page size (1..${MAX_COMPLETION_SUMMARY_PAGE_CHARS}).`,
         },
         includeDiff: {
           type: 'boolean',
-          description: 'OPTIONAL, default true (MCP-only control flag). Set to false to omit `task.diff.patchText` '
-            + 'while keeping changed file paths, counts, summary, execution receipt and review state — useful when '
-            + 'the commander inspects the diff directly inside `executionWorkspacePath` to avoid duplicate context.',
+          description: 'Include patchText (default true).',
         },
       },
       required: ['taskId'],
@@ -518,57 +432,8 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_wait',
     title: 'Wait for a task to need you',
-    description: 'Follow ONE task this connection submitted and return as soon as it needs the host. '
-      + 'A single call blocks for up to waitSeconds (default 3600) and returns a COMPACT answer: '
-      + '`reason` is `permission` (a per-call request is pending), `question` (the worker asked a native '
-      + 'question that needs `delegate_question_answer`), `attention` (a progress check because nothing new was '
-      + 'returned to the host for the operator-configured delivery interval in DSH settings — 40 minutes by '
-      + 'default; internal worker activity does not reset this clock and it does NOT imply the run is stuck — '
-      + 'or a `repeated-tool-failure` reminder), `ready` (the run ended and is awaiting host review), `failed`, '
-      + '`cancelled` or `interrupted`. '
-      + 'An `attention` answer may instead carry a `failure` block (kind `repeated-tool-failure`, with '
-      + 'a stable `eventId`, toolName/failureCode/consecutive): the worker repeated the SAME operation and failed the same way '
-      + 'several times in a row. It is a question for the host, and it is REDELIVERED until you acknowledge it with '
-      + '`ackFailureEventId` (the eventId you saw), so a lost answer is never a lost reminder; acknowledging stops the '
-      + 'redelivery and does not decide anything about the task. Nothing is cancelled, retimed '
-      + 'or reconfigured automatically. '
-      + '`reason: "wait-limit"` means only that this call\u2019s own budget ran out with nothing changed: it is '
-      + 'reported with `actionable: false` and `terminal: false`. Call delegate_wait again with the same '
-      + 'taskId and omit waitSeconds — do not review, resubmit, restart or cancel the task. '
-      + 'Normal use is delegate_wait({ taskId }) with no second argument: the default already covers a full '
-      + 'hour and the call re-issues its own internal observations, so there is no reason to shorten it or to '
-      + 'poll delegate_result or delegate_status while a task runs. A shorter waitSeconds is accepted for a '
-      + 'one-off diagnostic you were explicitly asked for. '
-      + 'The internal observation cadence (about one bounded request every 25 seconds) belongs to THIS '
-      + 'program; it is not a polling rate for the agent, and nothing about it requires action while nothing '
-      + 'has changed. '
-      + 'Heartbeats are internal to this call and are never returned. '
-      + 'This tool reads; it never submits, cancels or decides anything, and it does not fetch the task\u2019s '
-      + 'diff or full result (use delegate_result for that, after an actionable reason). '
-      + 'On `permission`, the returned `permission` block carries the pending request with its requestId, '
-      + 'its exact fingerprint and the full existing redacted operation, so delegate_permission_decide can '
-      + 'be sent without another read. '
-      + '`interrupted` does NOT mean the execution stopped. This call answers it immediately, once: '
-      + 'when the task is still pending or running the answer is `reason: "interrupted"` with '
-      + '`terminal: false` and the real task state, and YOU wait again on the same taskId. '
-      + '`terminal: true` with `state: "interrupted"` means the task record itself is a restart history '
-      + 'and will not resume. If the reason carried a settled state it is reported as that outcome '
-      + '(`ready`/`failed`/`cancelled`). A missing or unrecognized state is reported as '
-      + '`terminal: false` with nothing asserted: check before deciding. '
-      + 'This call ending, or your own client tool timeout firing, says NOTHING about the execution: the task '
-      + 'may still be running. Keep its taskId, and if you need to know more read one compact fact with '
-      + 'delegate_result rather than assuming either way; never submit a duplicate, restart or cancel it '
-      + 'because a wait or a client timeout ended. '
-      + 'A host may hand a wait back early on its own tool/exec time limit even though this call asked for an '
-      + 'hour. That outer event is not `wait-limit` and is not a result: the MCP observation did not end and the '
-      + 'worker did not stop. Continue the SAME exec cell (do not open a second wait, read delegate_result, poll '
-      + 'delegate_status or submit a duplicate) and ask for the longest yield the host supports — when a yield or '
-      + 'pragmas parameter exists, an ordinary wait should request roughly 1200000 ms (20 minutes), not a minute, '
-      + 'and re-issuing every second is polling rather than waiting. A one-minute return is a caller choice, not a '
-      + 'documented hard limit, so do not present it as the client maximum and do not claim every client offers '
-      + 'the same yield. This plugin cannot create a background waiter or wake the agent: if the available yield '
-      + 'is genuinely short with no automatic continuation, a long wait costs one resumed turn per yield window, '
-      + 'and that limit must be reported honestly rather than worked around.',
+    description: 'Wait via delegate_wait({ taskId }) until actionable or wait-limit (actionable: false — call again). '
+      + 'Internal 25 seconds cadence is not a polling rate; heartbeats are hidden. On client tool timeout, never submit a duplicate.',
     // A LONG read, and that is the point: `readOnlyHint` is what tells a
     // concurrency-aware client this call may be held for an hour without being a
     // mutating operation. A serialising host still ignores it; the independent
@@ -589,26 +454,18 @@ export const TOOLS = Object.freeze([
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
-        taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
+        taskId: { type: 'string', description: 'Task id.' },
         waitSeconds: {
           type: 'integer',
           minimum: MIN_WAIT_SECONDS,
           maximum: MAX_WAIT_SECONDS,
-          description: 'OPTIONAL. Omit it for normal waiting: the default is 3600 seconds (one hour). '
-            + 'Set it only for a shorter, one-off diagnostic you were explicitly asked to make. It cannot '
-            + 'extend a wait beyond 3600. A returned `wait-limit` with `actionable: false` means this '
-            + 'deadline was reached, not that the task stalled or ended.',
+          description: 'OPTIONAL; omit it for 3600s default (cannot extend beyond 3600).',
         },
         ackFailureEventId: {
           type: 'string',
           minLength: 1,
           maxLength: 64,
-          description: 'OPTIONAL. The `failure.eventId` from an earlier delegate_wait answer. A repeated-failure '
-            + 'reminder is redelivered until you acknowledge it: pass its eventId here to say you received it. '
-            + 'Acknowledging does not decide anything about the task and does not stop the run, but it DOES '
-            + 'clear the reminder state, which is why this tool is not announced read-only. A wrong eventId is '
-            + 'refused in the answer (`failureAck.acknowledged: false`) and changes nothing. An empty string is '
-            + 'refused, not ignored.',
+          description: 'Optional failure.eventId to ack redelivery.',
         },
       },
       required: ['taskId'],
@@ -618,7 +475,7 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_cancel',
     title: 'Cancel task',
-    description: 'Ask the harness to stop one task this connection submitted, and return its state afterwards.',
+    description: 'Stop one submitted task.',
     // It stops running work: destructive of the run (never of the workspace), and a
     // second call on an already-cancelled task changes nothing.
     annotations: Object.freeze({
@@ -631,7 +488,7 @@ export const TOOLS = Object.freeze([
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
-        taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
+        taskId: { type: 'string', description: 'Task id.' },
       },
       required: ['taskId'],
       additionalProperties: false,
@@ -640,28 +497,7 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_permission_decide',
     title: 'Decide a paused permission request',
-    description: 'Decide ONE per-call permission request that a delegated task is waiting on. '
-      + 'A delegated worker runs in its own workspace with a standing `workspace-write` sandbox; '
-      + 'when it asks to widen access for a single tool call, that call PAUSES and the request appears '
-      + 'in delegate_result as `permission.pending` (state stays `running`, phase `awaiting-permission`). '
-      + 'Read `permission.pending.arguments`/`argumentKeys` for the exact operation and `permission.pending.reason` '
-      + 'for the asker\u2019s claim — the claim is not the operation. Answer `allow-once` to let THAT ONE call '
-      + 'proceed, or `reject` to keep it denied. Every later escalation requires a separate decision. '
-      + 'This cannot grant an account, a workspace or a standing policy, cannot change settings, credentials, '
-      + 'the switch, the provider/model or the isolation, and cannot grant cross-task or standing permissions. '
-      + '`allow-once` REQUIRES the pending request\u2019s `fingerprint` and is refused when `permission.pending.'
-      + 'completeness` is not `complete` (the operation was shortened by a bound, so an allow cannot be granted '
-      + 'on it). `reject` needs neither and is therefore always available. '
-      + 'OPTIONAL `waitAfterDecision` (default false) decides and then keeps following the SAME task inside this '
-      + 'same call, answering in the compact `delegate_wait` shape plus a `decisionReceipt`. Use it when your '
-      + 'channel supports it: deciding and then waiting is what resumes the task without a second call. The '
-      + 'receipt states what happened to the decision: `applied: true` ONLY when the harness confirmed the same '
-      + 'task, request and operation, and `applied: null` with `confirmation: "unknown"` when nothing was '
-      + 'established (the call failed before an answer, or the answer contradicted or lacked the evidence to '
-      + 'confirm it — then read the task with delegate_result before sending it again). An unconfirmed decision is '
-      + 'refused and never continued. A refused decision never waits, a new request is never inherited, and when '
-      + 'an APPLIED decision\'s follow-up wait fails or is cancelled this call still succeeds with the receipt, '
-      + '`reason: null` and a `waitError` block: the decision is never unsaid.',
+    description: 'Decide paused permission request (allow-once needs fingerprint).',
     // It does not read and it does not write a configuration: it settles ONE paused
     // call. A repeated decision for the same request is refused, so it is not
     // idempotent — the second call is a different outcome by design.
@@ -675,48 +511,29 @@ export const TOOLS = Object.freeze([
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
-        taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
-        requestId: { type: 'string', description: 'The pending request\u2019s `requestId`, copied from delegate_result.' },
+        taskId: { type: 'string', description: 'Task id.' },
+        requestId: { type: 'string', description: 'Pending requestId.' },
         decision: {
           type: 'string',
           enum: ['allow-once', 'reject'],
-          description: 'allow-once permits exactly the paused call; reject keeps it denied.',
+          description: 'allow-once or reject.',
         },
         reason: {
           type: 'string',
-          description: 'Optional bounded note recorded with the decision. It is evidence, never a grant.',
+          description: 'Optional decision note.',
         },
         fingerprint: {
           type: 'string',
-          description: 'The pending request\u2019s `fingerprint`. REQUIRED for `allow-once`: the decision must name '
-            + 'the exact operation it grants, and an allow that omits it is refused. Optional for `reject` (a '
-            + 'refusal is safe without it); when supplied, a request whose operation no longer matches is refused.',
+          description: 'Request fingerprint (required for allow-once).',
         },
         scope: {
           type: 'string',
           enum: ['once', 'task-command'],
-          description: 'OPTIONAL, default `once`. Use `once` to permit only this exact paused call. The preview '
-            + 'value `task-command` is accepted with `allow-once` as a compatibility alias for `once`.',
+          description: 'once (default) or task-command.',
         },
         waitAfterDecision: {
           type: 'boolean',
-          description: 'OPTIONAL, default false: the historical behaviour — decide only, and the answer is the '
-            + 'permission route\'s own reply, unchanged. Set it to true to keep following the SAME task inside this '
-            + 'same call after the decision is applied and confirmed. The answer is then the SAME compact shape '
-            + '`delegate_wait` returns — `reason`/`state`/`actionable`/`terminal`/`task`, and for a new request the '
-            + 'whole redacted `permission` operation with its `completeness` and `fingerprint` — plus '
-            + '`decisionReceipt` (taskId, requestId, decision, fingerprint, `applied`, `confirmation`, `outcome`). '
-            + '`applied: true` is claimed only when the harness confirmed the SAME task, request and operation; a '
-            + 'CONTRADICTED or evidence-free answer is `applied: null` with `confirmation: "unknown"`, which is '
-            + 'refused (MCP_DECISION_UNCONFIRMED) and never continued. The request you just decided is never asked '
-            + 'again and never re-approved: the wait continues past it. A NEW request id, or the same id with a '
-            + 'changed operation, is a new question and is NOT inherited. A decision that is refused never starts a '
-            + 'wait. When the decision IS applied but the following wait fails, is cancelled or is interrupted, '
-            + 'this call still SUCCEEDS with `decisionReceipt.applied: true`, `reason: null`, `actionable: false` '
-            + 'and a `waitError` block: the decision stands, only the waiting ended, the execution was not stopped, '
-            + 'and the decision must not be resent. For the same waiting rules as `delegate_wait`: omit '
-            + 'waitSeconds, expect `wait-limit` to mean "wait again on the same taskId", and never read intermediate '
-            + 'code while it waits.',
+          description: 'Optional, default false; continue waiting in-call (new requests NOT inherited).',
         },
       },
       required: ['taskId', 'requestId', 'decision'],
@@ -726,31 +543,7 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_question_answer',
     title: 'Answer a question a delegated worker asked',
-    description: 'Answer ONE ordinary question that a delegated task is waiting on. '
-      + 'A delegated worker may ask a human a question with the native `ask_user_question` tool — typically '
-      + 'because something is ambiguous, or because it needs a choice it must not make itself. That tool call '
-      + 'PAUSES, the task stays `running` with phase `awaiting-question`, and the question appears in '
-      + '`delegate_wait` as `reason: "question"` with the full `question` block: `requestId`, `taskId`, '
-      + '`sessionId`, `callId` and `questions[]` (`id`, `question`, `header`, `detail`, `options[]` with '
-      + '`label`/`description`, `multiSelect`). Nothing about the worker\u2019s reasoning or transcript is included. '
-      + 'Answer with `answers`: one entry per question, each naming that question\u2019s `id` exactly once, with '
-      + '`selected` (labels that question actually offered) and/or non-empty `custom` text. A single-select '
-      + 'question takes at most one offered label; every asked question must be answered; an unknown id or a label the '
-      + 'question did not offer is refused and the question STAYS PENDING so a correct answer can still be made. '
-      + 'This tool does NOT grant access. Answering a question is not an approval and creates no authorization, '
-      + 'sandbox widening, standing grant or policy change; a worker that needs wider access must still request '
-      + 'it through `delegate_permission_decide`, and a question that presents an approval (`intent` of '
-      + '`approval`) is REFUSED here with `QUESTION_APPROVAL_INTENT` — that channel is the only one that can '
-      + 'grant, and the refused question fails promptly instead of hanging. A `plan-review` question is an '
-      + 'information answer and grants nothing either. '
-      + 'An answer applies ONCE: repeating it is refused as `QUESTION_ALREADY_ANSWERED`, an expired or '
-      + 'cancelled question cannot be answered, and a question is never answerable across tasks or after a '
-      + 'restart. '
-      + 'OPTIONAL `waitAfterAnswer` (default false) answers and then keeps following the SAME task inside this '
-      + 'same call, answering in the compact `delegate_wait` shape plus an `answerReceipt`. When the answer IS '
-      + 'applied but the following wait fails, is cancelled or is interrupted, this call still SUCCEEDS with '
-      + '`answerReceipt.applied: true`, `reason: null` and a `waitError` block: the answer stands and must not be '
-      + 'sent again.',
+    description: 'Answer one paused worker question. This tool does NOT grant access and is not an approval.',
     // It settles ONE paused question. It cannot read a configuration, create work or grant
     // anything, and a second answer to the same question is refused — so it is not
     // idempotent by design.
@@ -764,27 +557,27 @@ export const TOOLS = Object.freeze([
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
-        taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
+        taskId: { type: 'string', description: 'Task id.' },
         requestId: {
           type: 'string',
-          description: 'The pending question\u2019s `requestId`, copied from the `question` block of delegate_wait.',
+          description: 'Pending requestId.',
         },
         answers: {
           type: 'array',
-          description: 'One entry per asked question, each naming that question\u2019s id exactly once.',
+          description: 'Answers by question id.',
           items: {
             type: 'object',
             properties: {
-              id: { type: 'string', description: 'The question id, copied from `questions[].id`.' },
+              id: { type: 'string', description: 'Question id.' },
               selected: {
                 type: 'array',
                 items: { type: 'string' },
-                description: 'Labels this question actually offered. A single-select question takes at most one.',
+                description: 'Offered option labels.',
               },
               custom: {
                 type: 'string',
                 maxLength: QUESTION_BOUNDS.customChars,
-                description: 'Optional free-text answer. Required when the question offers no options.',
+                description: 'Optional free-text answer.',
               },
             },
             required: ['id'],
@@ -793,14 +586,7 @@ export const TOOLS = Object.freeze([
         },
         waitAfterAnswer: {
           type: 'boolean',
-          description: 'OPTIONAL, default false: answer only, and the answer is the question route\u2019s own reply. '
-            + 'Set it to true to keep following the SAME task inside this same call after the answer is applied. '
-            + 'The answer is then the SAME compact shape `delegate_wait` returns plus `answerReceipt` '
-            + '(taskId, requestId, `applied`, `confirmation`, answers). When the answer IS applied but the '
-            + 'following wait fails, is cancelled or is interrupted, this call still SUCCEEDS with '
-            + '`answerReceipt.applied: true`, `reason: null`, `actionable: false` and a `waitError` block: the '
-            + 'answer stands, only the waiting ended, and it must not be resent. A refused answer never starts a '
-            + 'wait.',
+          description: 'Default false; continue waiting in-call.',
         },
       },
       required: ['taskId', 'requestId', 'answers'],
@@ -810,25 +596,7 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_review',
     title: 'Record the host review of a delivered task',
-    description: 'Record YOUR OWN delivery review of one task this connection submitted. A finished run stays '
-      + '\u0060awaiting-host-review\u0060 until you say what you concluded: this tool records that conclusion, and it '
-      + 'is the only thing that does. '
-      + '\u0060decision: "accepted"\u0060 means you reviewed the evidence with \u0060delegate_result\u0060 and it is right; '
-      + '\u0060decision: "changes-requested"\u0060 means it needs correction. Either way \u0060note\u0060 is required and '
-      + 'bounded (at most 8000 Unicode code points, so Chinese, line breaks and emoji all count once) — it is the '
-      + 'recorded conclusion, not a place for secrets. A longer note is refused before anything is written; it is '
-      + 'never silently shortened. '
-      + 'This cannot approve a permission request, change the switch, a provider, a model, the isolation or a '
-      + 'credential, commit/push, or create another task. When `decision` is `"accepted"` on a `worktree`-isolated '
-      + 'task, setting optional `applyToSource: true` runs a zero-destruction conflict precheck after durable '
-      + 'acceptance and syncs the verified worktree changes back to `sourcePath` without committing (returning a '
-      + 'structured `sourceSync` receipt); omitting it leaves `sourcePath` untouched. Execution completion is never '
-      + 'accepted automatically: until this is called the task stays unreviewed. '
-      + 'Only a task awaiting host review (execution finished) can be reviewed; a running, failed, cancelled or '
-      + 'interrupted task, or another connection\u2019s task, is refused. '
-      + 'The first decision is final for this task: repeating the SAME decision with the SAME note is an '
-      + 'idempotent no-op, and a DIFFERENT conclusion is refused \u2014 send a follow-up task with '
-      + '\u0060continueFromTaskId\u0060 instead, so the original conclusion is preserved.',
+    description: 'Record final host review (accepted/changes-requested) with note (<=8000 cp).',
     // It records a conclusion on an existing task. It can neither read a workspace nor
     // start, stop or re-configure anything, and a replayed identical decision changes
     // nothing — but a DIFFERENT second decision is a refusal, so it is not fully
@@ -843,50 +611,32 @@ export const TOOLS = Object.freeze([
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
-        taskId: { type: 'string', description: 'Task identity returned by delegate_submit.' },
+        taskId: { type: 'string', description: 'Task id.' },
         decision: {
           type: 'string',
           enum: ['accepted', 'changes-requested'],
-          description: 'accepted records that you reviewed the result and accept it; changes-requested records '
-            + 'that it needs correction.',
+          description: 'accepted or changes-requested.',
         },
         note: {
           type: 'string',
           maxLength: MAX_REVIEW_NOTE_CHARS,
           // The bound is counted in Unicode code points, not in UTF-16 units.
           codePointLength: true,
-          description: 'Required non-empty bounded conclusion (at most 8000 Unicode code points), stored redacted. '
-            + 'The count is Unicode code points, so Chinese text, line breaks and emoji each count once; a longer '
-            + 'note is refused with its actual length instead of being cut. '
-            + 'It is evidence of your review, never a grant and never a place for credentials.',
+          description: 'Review note (<=8000 cp).',
         },
         completionSummary: {
           type: 'string',
           maxLength: MAX_TASK_DESCRIPTION_CHARS,
           codePointLength: true,
-          description: 'OPTIONAL. What was actually DONE in this round, in your own words, after reviewing the '
-            + 'evidence \u2014 the counterpart of the submission\u2019s `goalDescription`. At most 2000 Unicode code points '
-            + '(Chinese, line breaks and emoji count once); surrounding whitespace is trimmed and inner line breaks '
-            + 'are kept; a longer or non-string value is refused, never shortened; a blank value is the same as '
-            + 'omitting it. It may accompany `accepted` or `changes-requested` \u2014 with the latter it states only the '
-            + 'part that was completed and does NOT mean the task passed. It is recorded inside the same review '
-            + 'write as `decision` and `note`, under `hostAcceptance.completionSummary`, and becomes visible only '
-            + 'once that write is durable. A finished execution, worker output or a run that merely looked '
-            + 'successful never produces one. It is part of the review\u2019s identity: repeating the same decision and '
-            + 'note WITH the same summary is an idempotent no-op, and a different summary \u2014 or adding one to an '
-            + 'already recorded review \u2014 is refused like any other different conclusion.',
+          description: 'Optional summary (<=2000 cp).',
         },
         applyToSource: {
           type: 'boolean',
-          description: 'OPTIONAL (default false; only valid with decision: "accepted"). When true on a worktree-isolated '
-            + 'task, safely applies the verified worktree changes back to sourcePath after durable acceptance without '
-            + 'staging or committing, returning a structured `sourceSync` receipt (zero bytes modified on any conflict, '
-            + 'HEAD change, or unsafe/sensitive path). Omit on intermediate multi-stage subtasks so sourcePath stays '
-            + 'clean until the final packet passes.',
+          description: 'Sync accepted worktree to sourcePath (default false).',
         },
         receiptOnly: {
           type: 'boolean',
-          description: 'Set true to return the task ID, reviewPersistence, and optional sourceSync only. Read full details with delegate_result.',
+          description: 'Receipt only (default false).',
         },
       },
       required: ['taskId', 'decision', 'note'],
@@ -896,15 +646,7 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_plan',
     title: 'Manage multi-level task plan tree',
-    description: 'Create, update, review or read durable planning nodes (`plan-...`) for a multi-stage goal without '
-      + 'fabricating dummy worker executions. Use `action: "create"` to record a root goal and optional multi-level '
-      + 'subtask breakdown (single node via `title`, or atomic batch via `nodes[]` using `key`/`parentKey` or '
-      + '`parentNodeId`). Then dispatch each executable leaf packet with `delegate_submit` passing `planNodeId` (or '
-      + '`parentNodeId` for a direct child subtask); use `continueFromTaskId` ONLY for rectification rounds of that '
-      + 'same node. Use `action: "review"` to record the commander\u2019s conclusion (`accepted` or `changes-requested`, '
-      + '`note`, optional `completionSummary`) on a goal/plan node once its required children are verified. Use '
-      + '`action: "get"` or `action: "list"` to inspect planning nodes, hierarchy, orphans and source-project grouping. '
-      + 'Creates no grant, changes no setting/provider/switch, and starts no worker.',
+    description: 'Create, update, review, get, or list durable plan-... nodes.',
     annotations: Object.freeze({
       title: 'Manage multi-level task plan tree',
       readOnlyHint: false,
@@ -918,69 +660,68 @@ export const TOOLS = Object.freeze([
         action: {
           type: 'string',
           enum: ['create', 'update', 'review', 'get', 'list'],
-          description: 'Operation to perform on the plan store.',
+          description: 'Plan operation.',
         },
         nodeId: {
           type: 'string',
           minLength: 1,
           maxLength: 256,
-          description: 'Target `plan-...` node id (required for `update`, `review` and `get`).',
+          description: 'Target plan-... id.',
         },
         parentNodeId: {
           type: 'string',
           minLength: 1,
           maxLength: 256,
-          description: 'Optional existing parent `plan-...` or `task-...` id when creating child plan node(s).',
+          description: 'Optional parent plan/task id.',
         },
         workspacePath: {
           type: 'string',
           minLength: 1,
           maxLength: 4096,
-          description: 'Absolute path of the operator-authorized SOURCE repository this goal belongs to (used for '
-            + 'verified project grouping and source consistency checks; filter on `list`).',
+          description: 'Source repository path.',
         },
         title: {
           type: 'string',
           minLength: 1,
           maxLength: PLAN_TITLE_MAX_CHARS,
           codePointLength: true,
-          description: 'Readable node title (1..120 Unicode code points; required for single-node `create`).',
+          description: 'Node title (1..120 cp).',
         },
         goalDescription: {
           type: 'string',
           maxLength: MAX_TASK_DESCRIPTION_CHARS,
           codePointLength: true,
-          description: 'Optional planned objective of this node (at most 2000 Unicode code points).',
+          description: 'Optional goal (<=2000 cp).',
         },
         decision: {
           type: 'string',
           enum: ['accepted', 'changes-requested'],
-          description: 'Commander review decision for `action: "review"`.',
+          description: 'Review decision.',
         },
         note: {
           type: 'string',
           maxLength: MAX_REVIEW_NOTE_CHARS,
           codePointLength: true,
-          description: 'Required review conclusion note (at most 8000 Unicode code points) for `action: "review"`.',
+          description: 'Review note (<=8000 cp).',
         },
         completionSummary: {
           type: 'string',
           maxLength: MAX_TASK_DESCRIPTION_CHARS,
           codePointLength: true,
-          description: 'Optional summary of what was actually accomplished (at most 2000 Unicode code points) for `action: "review"`.',
+          description: 'Optional summary (<=2000 cp).',
         },
         nodes: {
           type: 'array',
-          description: `Optional atomic batch of 1..${MAX_PLAN_BATCH} plan nodes for \`action: "create"\`.`,
+          description: `Batch of 1..${MAX_PLAN_BATCH} nodes for create.`,
           items: {
             type: 'object',
             properties: {
-              key: { type: 'string', minLength: 1, maxLength: 64, description: 'Local batch key so children in the same batch can reference `parentKey`.' },
-              parentKey: { type: 'string', minLength: 1, maxLength: 64, description: 'References `key` of a parent item in this same `nodes` batch.' },
-              parentNodeId: { type: 'string', minLength: 1, maxLength: 256, description: 'References an already-stored `plan-...` or `task-...` parent (mutually exclusive with `parentKey`).' },
-              title: { type: 'string', minLength: 1, maxLength: PLAN_TITLE_MAX_CHARS, codePointLength: true, description: 'Node title (1..120 Unicode code points).' },
-              goalDescription: { type: 'string', maxLength: MAX_TASK_DESCRIPTION_CHARS, codePointLength: true, description: 'Optional planned objective (at most 2000 Unicode code points).' },
-              workspacePath: { type: 'string', minLength: 1, maxLength: 4096, description: 'Optional absolute source repository path (must match parent when parent has one).' },
+              key: { type: 'string', minLength: 1, maxLength: 64, description: 'Batch item key.' },
+              parentKey: { type: 'string', minLength: 1, maxLength: 64, description: 'Parent batch key.' },
+              parentNodeId: { type: 'string', minLength: 1, maxLength: 256, description: 'Stored parent plan/task id.' },
+              title: { type: 'string', minLength: 1, maxLength: PLAN_TITLE_MAX_CHARS, codePointLength: true, description: 'Node title.' },
+              goalDescription: { type: 'string', maxLength: MAX_TASK_DESCRIPTION_CHARS, codePointLength: true, description: 'Optional goal.' },
+              workspacePath: { type: 'string', minLength: 1, maxLength: 4096, description: 'Optional source path.' },
             },
             required: ['title'],
             additionalProperties: false,
@@ -994,11 +735,7 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_preflight',
     title: 'Inspect workspace before dispatch',
-    description: 'Read-only preflight of one absolute workspace path: whether it is a git repository with a commit, '
-      + 'whether it is clean, how many files are changed (with a bounded path list), and the isolation to request '
-      + '(worktree / shared / block) with a stable reason code. '
-      + 'It creates no commit, stash, worktree or task and changes no setting; '
-      + 'passing allowShared acknowledges a dirty workspace but does not dispatch anything.',
+    description: 'Read-only git inspection returning worktree/shared/block recommendation.',
     // A read-only measurement of a directory: nothing is created or changed.
     annotations: Object.freeze({
       title: 'Inspect workspace before dispatch',
@@ -1010,11 +747,10 @@ export const TOOLS = Object.freeze([
     inputSchema: Object.freeze({
       type: 'object',
       properties: {
-        workspacePath: { type: 'string', description: 'Absolute path of the workspace to inspect.' },
+        workspacePath: { type: 'string', description: 'Absolute path to inspect.' },
         allowShared: {
           type: 'boolean',
-          description: 'Set only after deciding explicitly that a dirty workspace may run in place (shared isolation). '
-            + 'Omit it to be told that a decision is required instead.',
+          description: 'Allow dirty shared root.',
         },
       },
       required: ['workspacePath'],
@@ -1024,15 +760,7 @@ export const TOOLS = Object.freeze([
   Object.freeze({
     name: 'delegate_metrics',
     title: 'Read this MCP session\'s accounting',
-    description: 'Report bounded accounting for THIS MCP process only: how many times each tool was called, how '
-      + 'many wait answers were handed back and why, how much data they carried (UTF-8 bytes), how many PER-CALL '
-      + 'permission decisions were applied, and the wait that followed each decision with its own reason, '
-      + 'duration and size. '
-      + 'These are counts of the PROGRAM (this process and its internal observations), not of model activity: '
-      + 'the host model\u2019s own turns, token usage and cost are not observable from here and are returned as '
-      + '"not-integrated", never as 0. A read-only census of THIS connection with no task identity required; '
-      + 'it carries no tool arguments, no reasoning, no answer body, no credential and no task content, and it '
-      + 'cannot change anything. The counters live in memory and reset when this MCP process restarts.',
+    description: 'Read-only in-memory census of this MCP process (host model stats are "not-integrated").',
     annotations: Object.freeze({
       title: 'Read this MCP session\'s accounting',
       readOnlyHint: true,
@@ -3577,91 +3305,11 @@ export function createMcpServer(options) {
             // or `prompts` would invite calls that must then fail.
             capabilities: { tools: { listChanged: false } },
             serverInfo: SERVER_INFO,
-            instructions: 'Delegated coding on the DSH host. Submission is allowed only while the operator '
-              + 'has enabled the delegation switch in the authenticated DSH settings page. '
-              + 'For delegate_submit, workspacePath is the operator-authorized SOURCE repository or checkout '
-              + '(a Git checkout or an operator-authorized Git worktree are both legitimate), not a location a '
-              + 'task execution ran in; delegate_preflight is a separate read-only inspection of a path. '
-              + 'Every submission starts a new task conversation unless it passes continueFromTaskId naming the '
-              + 'earlier delegated task it is a follow-up to; that explicit id is the only way to continue an '
-              + 'existing task thread. A follow-up continues the parent\u2019s DSH Workspace and Session and reuses '
-              + 'the parent\u2019s recorded execution checkout and DSH Session internally, so it passes the parent\u2019s original '
-              + 'source path again and never substitutes an internal execution location for it. A parent that '
-              + 'is unknown, still running, removed or belongs to another source repository is refused '
-              + 'instead of starting a new conversation. For a new downstream subtask that starts a fresh DSH '
-              + 'Session directly on an earlier finished isolated worktree under the same source repository, '
-              + 'pass reuseWorktreeFromTaskId instead (never combined with continueFromTaskId). A worker that needs wider access for ONE tool call '
-              + 'pauses that call and reports it as `permission.pending` in delegate_result; while it waits the '
-              + 'task stays `running` with phase `awaiting-permission`. Answer one such request with '
-              + 'delegate_permission_decide (`allow-once` or `reject`). That decision '
-              + 'covers only that call, is never a standing grant, and never widens the sandbox or crosses task '
-              + 'boundaries. Each later escalation requires a new decision. When your channel supports it, pass '
-              + '`waitAfterDecision: true`: the decision and the following wait then happen in ONE call, and the '
-              + 'answer is the same compact shape delegate_wait returns plus `decisionReceipt`. Deciding and then '
-              + 'waiting is what resumes the task; a client without the flag decides first and then calls '
-              + 'delegate_wait on the same taskId. `decisionReceipt.applied: true` is claimed only when the harness '
-              + 'confirmed the same task, request and operation. `applied: null` with `confirmation: "unknown"` '
-              + 'means nothing was established — the call failed before an answer, or the answer contradicted or '
-              + 'lacked the evidence to confirm it (the refusal carries `error.details.decisionReceipt`) — so read '
-              + 'the task with delegate_result before sending the decision again, and never resend automatically. '
-              + 'When an APPLIED decision\'s follow-up wait fails or is cancelled, the call still succeeds with that '
-              + 'receipt, `reason: null` and a `waitError` block: only the waiting ended, the execution was not '
-              + 'stopped, and the decision must not be resent. To follow a task without polling, use '
-              + 'delegate_wait({ taskId }): one call blocks until the task needs you (permission, question, '
-              + 'attention, ready, failed, cancelled, interrupted) or until its own one-hour deadline, in which '
-              + 'case it answers reason '
-              + '`wait-limit` with `actionable: false` and you call it again with the same taskId instead of '
-              + 'reviewing or resubmitting anything. Omit waitSeconds for normal waiting: the default already '
-              + 'covers an hour, it cannot be raised above 3600, and a shorter value is only for a one-off '
-              + 'diagnostic you were explicitly asked for. The approximately 25-second observation cadence '
-              + 'inside delegate_wait is internal to this program, not a polling rate: while nothing has '
-              + 'changed, do not read intermediate code or diff, do not research or implement in parallel, and '
-              + 'do not narrate unchanged snapshots — wait, and review once on delivery. A wait ending, or your '
-              + 'own client tool timeout firing, does not prove the execution stopped or that it is alive: keep '
-              + 'the taskId and check one compact fact if you need to, and never duplicate, restart or cancel a '
-              + 'task merely because a wait or a client timeout ended. '
-              + 'Four different things must not be confused. (a) `wait-limit` is this call\'s OWN deadline: nothing '
-              + 'changed, wait again on the same taskId. (b) Your client handing the call back on its own tool/exec '
-              + 'time limit is an OUTER limit: the observation did not end and the worker did not stop, so continue '
-              + 'the SAME exec cell and ask for the longest yield the host supports (roughly 1200000 ms when a '
-              + 'yield/pragmas parameter exists, not a minute) instead of re-issuing every second. (c) `attention` '
-              + 'is either a run progress check (nothing new was delivered back to the host for the operator-configured '
-              + 'delivery interval in DSH settings — 40 minutes by default; internal worker activity, heartbeats, '
-              + 'permission/question waits and the local self-check do not reset it, and it does NOT imply the run is '
-              + 'stuck) or a `repeated-tool-failure` reminder while the task still runs. (d) There is NO default total '
-              + 'execution timeout: an execution timeout (`JOB_TIMEOUT`, reported as a terminal state) only applies when '
-              + 'an explicit cap is supplied via `overrides.timeoutSeconds` — it is not `wait-limit`, not `attention` '
-              + 'and not a client-side event. A real '
-              + 'failure is worth one de-duplicated reminder; an ordinary single failing test inside the worker is '
-              + 'the worker\'s job to fix and is not a host event. '
-              + '`interrupted` never means the execution stopped by itself: this call returns it at once '
-              + 'with `terminal: false` while the task is still pending or running (wait again on the same '
-              + 'taskId); only a task record that is itself interrupted (a restart history) is `terminal: true`. '
-              + 'A one-minute return is a caller choice, not a documented hard limit, and not every client offers '
-              + 'the same yield. This plugin cannot create a background waiter or wake the agent, so a client with '
-              + 'only a short yield and no automatic continuation costs one resumed turn per yield window; there is '
-              + 'no zero-wake guarantee across clients — state that plainly instead of inventing a wake-up. '
-              + 'An `attention` answer that carries a `failure` '
-              + 'block means the worker repeated the same failed operation several times while still running: '
-              + 'it is a question for the host, redelivered with the SAME eventId until you acknowledge it via '
-              + '`ackFailureEventId`, and nothing is cancelled or reconfigured for it. '
-              + 'If a host serialises tool calls so that this '
-              + 'connection is blocked by a long wait, the independently installed `dsh-delegate-control` '
-              + 'binary can report or cancel one task from a separate process; it cannot submit, configure or '
-              + 'change the switch. '
-              + '`delegate_metrics` is a read-only census of THIS MCP process: tool calls, wait returns and their '
-              + 'reasons, the UTF-8 bytes of the tool text it returned, and applied decisions. It counts the '
-              + 'PROGRAM, not the host model: the host\'s own turns, token usage and cost are reported as '
-              + '`not-integrated` because this process cannot observe them. '
-              + 'When a task reaches `ready`/`awaiting-host-review`, finish YOUR review and record it with '
-              + 'delegate_review ({ taskId, decision: "accepted" | "changes-requested", note, completionSummary?, applyToSource? }): '
-              + 'that call is the '
-              + 'only thing that records host acceptance, and until it is made the task stays unreviewed. '
-              + 'Completion is never acceptance on its own, and a review cannot approve permissions, change '
-              + 'settings or models, commit/push or create work; optional `applyToSource: true` (only with '
-              + '`accepted` on `worktree` isolation) safely syncs verified worktree changes back to `sourcePath` '
-              + 'after durable persistence with zero-destruction conflict checks. The first decision is final for '
-              + 'that task; to request a correction, send a follow-up with `continueFromTaskId`.',
+            instructions:
+              'DSH TaskBridge MCP. For delegate_submit, workspacePath must be an authorized source repository '
+              + '(untrusted/invalid paths are refused); delegate_preflight is a separate read-only check. '
+              + 'Each submit starts a new task conversation unless continueFromTaskId is set, which reuses the parent worktree and session. '
+              + 'Runs have NO default total execution timeout, surface worker question/permission stops, and report completionSummary on delivery.',
           });
         }
         case 'notifications/initialized':

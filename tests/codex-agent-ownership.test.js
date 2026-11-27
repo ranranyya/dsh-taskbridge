@@ -33,7 +33,7 @@ import {
 } from '../src/codex/agent-ownership.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const TEMPLATE = readFileSync(join(ROOT, 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME), 'utf8');
+const TEMPLATE = readFileSync(join(ROOT, 'integrations', 'targets', 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME), 'utf8');
 
 // Extracted from the actual 1.6.1 tarball. Test.5 and test.6 shipped the same
 // body; renderAgentFile stamps the respective package version at install time.
@@ -76,7 +76,7 @@ function productRelease({ root, label, body = null, version = '1.6.1', template 
     mkdirSync(dirname(target), { recursive: true });
     copyFileSync(join(ROOT, relative), target);
   }
-  const installDir = join(dir, 'codex', 'skills', SKILL_DIR_NAME);
+  const installDir = join(dir, 'integrations', 'targets', 'codex', 'skills', SKILL_DIR_NAME);
   mkdirSync(installDir, { recursive: true });
   const { reference, referencePath } = readCodexRuleFiles();
   const referenceText = reference + referenceSuffix;
@@ -105,7 +105,7 @@ function productRelease({ root, label, body = null, version = '1.6.1', template 
           useDirectoryClassifier: installer.useDirectoryClassifier,
           createCodexSeam: seam.createCodexSeam,
           // The release's template text, so a test can state what it writes.
-          readAgentTemplate: () => readFileSync(join(dir, 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME), 'utf8'),
+          readAgentTemplate: () => readFileSync(join(dir, 'integrations', 'targets', 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME), 'utf8'),
         };
       }
       return loaded;

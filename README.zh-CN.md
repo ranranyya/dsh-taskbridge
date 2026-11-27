@@ -14,6 +14,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/ranranyya/dsh-taskbridge/actions/workflows/ci.yml"><img src="https://github.com/ranranyya/dsh-taskbridge/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://www.npmjs.com/package/dsh-taskbridge"><img src="https://img.shields.io/npm/v/dsh-taskbridge?label=npm&color=CB3837" alt="npm version" /></a>
   <img src="https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows%20%7C%20macOS%20%7C%20Linux-0078D4" alt="Windows | macOS | Linux" />
   <img src="https://img.shields.io/badge/Node.js-%3E%3D24-5FA04E?logo=nodedotjs&logoColor=white" alt="Node.js >= 24" />
@@ -35,11 +36,11 @@
 
 在 **Codex** 或 **Antigravity** 中正常阅读仓库、设计接口契约并做最终审查，把耗费大量代码输出与反复跑单测排错的工程任务交给本机 **DeepSeek Harness（DSH）** 执行（Claude Code / Claude Desktop 计划于 `2.0` 上线）：
 
-- **实测省下大半主力配额，且 `7/7` 全满分不降质**：7 题双端黑盒基准实测中，中大型与重型重构任务让旗舰模型**有效 Token 净省 40%–52%、代码输出直降 55%–68%**（Antigravity 全套 `T1–T5` 含缓存总流量净省 **33.61%**）。
+- **实测省下可观主力配额，且 `7/7` 全满分不降质**：7 题双端黑盒基准实测中，`T1–T5` 合计强模型有效 Token **净省 `26.5%–39.4%`**（Antigravity 全套含缓存总流量净省 **`33.61%`**），重型三域重构单题 `T5` 有效省流达 **`47.6%–52.1%`、代码输出直降 `55%–68%`**；`1.9.4` 将 MCP 工具目录再压缩 `75%–87%` 后，Codex `T0A–T4` 六题满分复验（`6/6` 均分 `100`）连小型题 `T1` 也首次反超无插件基线（有效 `45,033`，净省 **`+14.66%`**）、`T3` 有效压降至 **`60,047`**（净省 **`+27.55%`**）。
 - **独立 Git `worktree` 真并行隔离 + 验收后一键零破坏写回**：默认在干净隔离工作树中并行开发（支持跨子包接力复用），**绝不污染当前分支或未提交草稿**；终局验收通过后自动完成冲突预检并安全写回主工作区（绝不自动 `git commit`）。
 - **静默长等免轮询 + 敏感操作逐次指纹审批**：单次调用最长静默等待 20–60 分钟、零轮询空转；DSH 原生界面全程实时可见，超出工作区写边界的命令按真实参数指纹逐次交由宿主审批。
 
-> **当前正式版 `1.9.3`**：新增 `worktree` 终局验收后零破坏冲突预检与安全自动写回（`applyToSource: true` / `sourceSync`），强化 Codex 首轮契约指引与单次测试审批边界；详见 [1.9.3 更新说明](docs/releases/1.9.3.zh.md) 与 [1.9.2 更新说明](docs/releases/1.9.2.zh.md)。
+> **当前正式版 `1.9.4`**：零破坏将 MCP 握手与工具目录上下文直降 **75%–87%**（`45.5K → 11.4K` 字符，冷启动首轮输入压至约 `18.1K` tokens），新增 Windows + Linux 双端公开 GitHub Actions CI，同步清理客户端零调用死组件与未公开发布测试哈希并补登 `1.9.3` 无感升级哈希；详见 [1.9.4 更新说明](docs/releases/1.9.4.zh.md) 与 [1.9.3 更新说明](docs/releases/1.9.3.zh.md)。
 
 <p align="center">
   <img src="./docs/assets/taskbridge-workflow.zh.png" width="100%" alt="DSH TaskBridge 四层架构：宿主适配层、共享派工内核、有界 MCP 协议与 DSH 执行引擎" />
@@ -70,13 +71,22 @@ dsh-taskbridge
 - **接入 Codex**：切到 **Codex 集成**，点击 **安装 / 更新 TaskBridge 技能**（写入原生技能 `skills/dsh-taskbridge/SKILL.md`、同目录规则附页与 `config.toml` MCP 条目，并自动清理未修改的旧 `agents/dsh-taskbridge.toml`），完成后重启或新开 Codex 会话，即可通过 `$dsh-taskbridge` 或明确说明“交给 DSH / TaskBridge”由当前会话直接单链派工与静默长等。
 - **接入 Antigravity**：切到 **Antigravity 集成**，点击 **安装 / 更新 Antigravity 插件**。插件会写入独立的 `~/.gemini/config/plugins/dsh-taskbridge/`（内含 `SKILL.md`、轻量后台子智能体和插件内 `mcp_config.json`，不碰全局配置），Antigravity 加载后即可通过 `@[plugin:dsh-taskbridge]` / `@dsh-taskbridge` 或明确指令派工。首次调用 `delegate_*` MCP 工具时若弹出外部工具确认框，建议勾选 **Always Allow**，避免打断静默等待与审批续等。
 
-### 4. 打开总开关，派发第一个任务
+### 4. 60 秒连通首检（确认已接通）
 
-打开设置页顶部的 **允许本机 MCP 调用 DSH 委派**（新安装默认关闭，关闭即拒收新任务并中止运行中任务）。接着在你的宿主端中给出需求，例如：
+打开设置页顶部的 **允许本机 MCP 调用 DSH 委派**（新安装默认关闭，关闭即拒收新任务并中止运行中任务）。随后在任意已有至少 1 次 commit 的 Git 仓库中重开宿主会话，先发一句只读自检：
+
+> 请使用 dsh-taskbridge 检查本机委派开关状态，并对当前仓库做一次只读预检，不要提交执行任务。
+
+- **预期秒级回执（约 5 秒）**：宿主依次调用 `delegate_status` 与 `delegate_preflight`，返回 `enabled: true`、你选好的 `provider` / `model` / `effort`，以及预检结果 `isolation: "worktree"`（`reason: "PREFLIGHT_CLEAN_REPOSITORY"`；若仓库有未提交改动则返回 `PREFLIGHT_DIRTY_NEEDS_DECISION`），全程零文件修改，说明链路已 100% 接通。
+- **60 秒极小试跑（可选）**：接着试派一个微任务：*“用 TaskBridge 让 DSH 给 `<某文件>` 补一条边界单测并跑通测试，先汇报结果等我确认再写回。”*
+  - **去哪看实时进度**：打开 DSH 左侧边栏的 **`TaskBridge`** 分组即可实时点进该隔离会话围观执行；或在插件配置页 **任务记录** 页签查看阶段、耗时、Token 与审查状态。
+  - **交付成功回执**：跑完后宿主收到 `reason: "ready"`（`state: "awaiting-host-review"`），核验隔离树测试通过后调用 `delegate_review({ decision: "accepted", applyToSource: true })` 即可零破坏写回主工作区。
+
+### 5. 派发真实多文件开发任务
+
+确认接通后，即可将多文件功能实现、补齐成套单测或跨模块重构交给 TaskBridge：
 
 > 用 TaskBridge 把当前仓库的分层超额计费模块和导出 CLI 交给 DSH 实现。你先核对现有目录与规范定好接口契约和边界，拆包或单包派给 DSH 完成编码与单测；交付后独立核验 diff 与测试结果并记录验收结论，若有缺陷就续接原任务修完。
-
-你可以在 DSH 左侧原生工作区实时围观执行过程，也可以在插件设置页 **任务记录** 中随时查看进展与完整验收记录。
 
 ---
 
@@ -212,7 +222,7 @@ dsh-taskbridge
 
 ## 更多文档
 
-- [1.9.3 更新说明](docs/releases/1.9.3.zh.md) · [1.9.2 更新说明](docs/releases/1.9.2.zh.md) · [1.9.1 更新说明](docs/releases/1.9.1.zh.md) · [1.9.0 更新说明](docs/releases/1.9.0.zh.md) · [Codex 集成契约](docs/codex-integration.md) · [Antigravity 集成契约](docs/antigravity-integration.md) · [Claude 接入规划](docs/claude-code.md)
+- [1.9.4 更新说明](docs/releases/1.9.4.zh.md) · [1.9.3 更新说明](docs/releases/1.9.3.zh.md) · [1.9.2 更新说明](docs/releases/1.9.2.zh.md) · [1.9.1 更新说明](docs/releases/1.9.1.zh.md) · [1.9.0 更新说明](docs/releases/1.9.0.zh.md) · [Codex 集成契约](docs/codex-integration.md) · [Antigravity 集成契约](docs/antigravity-integration.md) · [Claude 接入规划](docs/claude-code.md)
 - [静默等待说明](docs/silent-wait.md) · [工作区与隔离](docs/workspace-contract.md) · [会话放置与续接](docs/conversation-placement.md)
 - [运行时兼容性](docs/runtime-compatibility.md) · [插件发现与更新](docs/plugin-market.md) · [旧名称迁移](docs/taskbridge-upgrade.md)
 
@@ -258,7 +268,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
    ```bash
    npm pack
-   #    → dsh-taskbridge-1.9.3.tgz
+   #    → dsh-taskbridge-1.9.4.tgz
    ```
 
 2. 使用本地包时，通过 **添加插件**入口选择下载或生成的 `.tgz`（或本仓库目录）完成安装。
@@ -272,7 +282,7 @@ Desktop 侧的包操作只能交给应用完成——不要在 Desktop 的正式
 
 ```bash
 # 装进一个 profile（例：web）
-dsh plugin --profile web add ./dsh-taskbridge-1.9.3.tgz && dsh plugin --profile web why dsh-taskbridge
+dsh plugin --profile web add ./dsh-taskbridge-1.9.4.tgz && dsh plugin --profile web why dsh-taskbridge
 
 # 启动（首次启动会自动把插件 bundle 追加到 dsh.profile.bundles）
 dsh --profile web
@@ -285,7 +295,7 @@ dsh --profile web
 ### 说明与注意
 
 - **不要装进你正在用的正式 profile 做试验。** 建议先用一次性 profile：
-  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.9.3.tgz`，再把
+  `dsh plugin --profile dsh-delegate-try add ./dsh-taskbridge-1.9.4.tgz`，再把
   `DSH_HOME` 指向临时目录做隔离验证。该命令同样只用于 CLI profile。
 - 该包声明了 `@deepseek-ai/dsh-*` 的 peer，若你的包管理器默认自动安装 peer，
   安装过程会尝试解析这些版本。可显式关闭：`npm_config_auto_install_peers=false`
@@ -489,7 +499,7 @@ Codex 支持一键安装集成。**「Codex 集成」**分页提供一个明确�
   `skills/dsh-taskbridge/SKILL.md` 并调用 `delegate_submit` + 单链 `delegate_wait`（利用
   `tool_timeout_sec = 3660` 静默长等），避免主会话套一层 `spawn_agent` + 短超时 `wait_agent`
   反复空转轮询。
-- **触发规则写死在技能文件里**（见 `codex/skills/dsh-taskbridge/SKILL.md`）：只有在用户明确指派
+- **触发规则写死在技能文件里**（见 `integrations/targets/codex/skills/dsh-taskbridge/SKILL.md`）：只有在用户明确指派
   （例如写出 `$dsh-taskbridge`、或明确要求把该实现/验证任务交给 DSH / TaskBridge）时才派发；
   仅仅在无关问题里提到 DSH / DeepSeek / 本插件**不是**派发请求。派发前先调用
   `delegate_status` 检查开关，再调用 `delegate_preflight` 读取工作区事实：干净仓库按插件设置里
@@ -710,7 +720,7 @@ Codex 托管规则（1.1.0–1.8.x 为子智能体文件，1.9.0 起升级为原
 # 不要在 Desktop 的正式 profile 下执行下面的 CLI 命令。
 
 # CLI web profile 的升级：换成本地新包或（将来）新版本
-dsh plugin --profile web add ./dsh-taskbridge-1.9.3.tgz
+dsh plugin --profile web add ./dsh-taskbridge-1.9.4.tgz
 
 # 导出：界面里"导出非敏感配置"按钮，或用只读 API
 #   GET /api/dsh-delegate/settings

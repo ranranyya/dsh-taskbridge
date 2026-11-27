@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const SHIPPED = fileURLToPath(new URL('../../codex/skills/dsh-taskbridge/SKILL.md', import.meta.url));
+const SHIPPED = fileURLToPath(new URL('../../integrations/targets/codex/skills/dsh-taskbridge/SKILL.md', import.meta.url));
 
 export function readCodexRuleFiles(path = SHIPPED) {
   const entry = readFileSync(path, 'utf8');

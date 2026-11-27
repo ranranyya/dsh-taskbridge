@@ -43,5 +43,5 @@ TaskBridge **never modifies** `~/.gemini/config/mcp_config.json` or `~/.gemini/c
 
 ## 5. Layered rule maintenance (source repository)
 
-- Both `antigravity/skills/dsh-taskbridge/SKILL.md` and `antigravity/agents/dsh-taskbridge.md` (along with `codex/skills/dsh-taskbridge/SKILL.md`) are generated from the layered single-source definitions under `integrations/core/` (Layer 2 shared commander core: activation redlines, decompose-and-steer planning philosophy, dispatch state machine, pragmatic review) and `integrations/adapters/` (Layer 1 host-specific thin adapters).
+- Both `integrations/targets/antigravity/skills/dsh-taskbridge/SKILL.md` and `integrations/targets/antigravity/agents/dsh-taskbridge.md` (along with `integrations/targets/codex/skills/dsh-taskbridge/SKILL.md`) are generated from the layered single-source definitions under `integrations/core/` (Layer 2 shared commander core: activation redlines, decompose-and-steer planning philosophy, dispatch state machine, pragmatic review) and `integrations/adapters/` (Layer 1 host-specific thin adapters).
 - After editing layered sources, run `npm run build:integrations`; `npm run check:integrations` and `tests/integrations-layering.test.js` verify byte-for-byte sync.

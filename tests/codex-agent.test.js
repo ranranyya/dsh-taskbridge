@@ -168,7 +168,7 @@ test('the shipped dispatcher rules are what install actually writes', async () =
     const installed = await manageCodexAgent('install', { codexHome, env });
     const written = readFileSync(installed.path, 'utf8');
     const version = /^<!-- dsh-taskbridge-version: (.*) -->$/mu.exec(written)?.[1] ?? '';
-    const shipped = readFileSync(join(ROOT, 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
+    const shipped = readFileSync(join(ROOT, 'integrations', 'targets', 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
     assert.match(written, /continueFromTaskId/u, 'the installed file must carry the continuation rule');
     assert.match(written, /Direct single-chain wait — NO `spawn_agent` \/ `wait_agent` wrapper/u, 'the installed skill must forbid spawn_agent/wait_agent polling');
     assert.equal(
@@ -185,7 +185,7 @@ test('the shipped dispatcher rules are what install actually writes', async () =
 // ---------------------------------------------------------------------------
 
 test('the shipped companion drives delegate_wait and never polls delegate_result in a loop', () => {
-  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
+  const template = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'integrations', 'targets', 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
   // The wait tool is the loop; the old "poll delegate_result until terminal" rule is gone.
   assert.match(template, /delegate_wait/u);
   assert.doesNotMatch(template, /poll `delegate_result` for that\s+same task until terminal/u);

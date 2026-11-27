@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "DSH TaskBridge",
-    "description": "Let Codex and Antigravity focus on planning and review while DeepSeek Harness runs heavy coding and test loops in isolated Git worktrees: wait silently without polling, approve sensitive actions per call, and safely sync accepted changes back—saving 40%–52% flagship effective tokens on large tasks (Claude Code / Claude Desktop planned for 2.0).",
+    "description": "Let Codex and Antigravity focus on planning and review while DeepSeek Harness runs heavy coding and test loops in isolated Git worktrees: wait silently without polling, approve sensitive actions per call, and safely sync accepted changes back—saving 26%–52% flagship effective tokens on multi-file tasks (Claude Code / Claude Desktop planned for 2.0).",
     "detail": "docs/INTRODUCTION.md"
   }
 }

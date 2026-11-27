@@ -85,7 +85,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
  * @param {string} version - the version line the install writes.
  * @returns {string} the bytes an install of `version` must produce.
  */
-const SHIPPED_SKILL_TEMPLATE_PATH = join(ROOT, 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME);
+const SHIPPED_SKILL_TEMPLATE_PATH = join(ROOT, 'integrations', 'targets', 'codex', 'skills', SKILL_DIR_NAME, SKILL_FILENAME);
 function expectedInstalledText(template, version) {
   const lf = template.replace(/\r\n/gu, '\n');
   if (/^<!-- dsh-taskbridge-version: .* -->$/mu.test(lf)) {
@@ -110,7 +110,7 @@ for (const version of ['1.4.3-test.1', '1.4.3-test.2']) test(`local ${version} m
     assert.equal(isKnownPriorTemplate(`${text}\n# User edit\n`), false);
   }
 });
-const DELIVERABLE_VERSION = '1.9.3';
+const DELIVERABLE_VERSION = '1.9.4';
 
 test('the 1.5.0 template allow-list keeps the PUBLISHED bytes, not the edited working-tree text', () => {
   const released = Object.freeze([
@@ -153,7 +153,7 @@ for (const ending of ['LF', 'CRLF']) test(`the installed test.2 ${ending} compan
     assert.deepEqual(refreshed.changed, ['agent', 'legacyAgent']);
     assert.deepEqual(refreshed.refused, []);
     assert.equal(refreshed.status.agent.state, 'installed');
-    assert.match(readFileSync(fixture.skillPath, 'utf8'), /^<!-- dsh-taskbridge-version: 1\.9\.3 -->$/mu);
+    assert.match(readFileSync(fixture.skillPath, 'utf8'), /^<!-- dsh-taskbridge-version: 1\.9\.4 -->$/mu);
     assert.equal(existsSync(fixture.legacyAgentPath), false, 'untouched legacy agent must be retired');
     assert.equal(readFileSync(fixture.configPath, 'utf8'), config);
   } finally {
@@ -962,9 +962,9 @@ test('install writes the native skill file and the MCP entry, never agents/dsh-t
   }
 });
 
-test('a test3 native skill upgrades from either line ending and uninstalls with its reference', async () => {
-  const published = readFileSync(join(ROOT, 'tests', 'fixtures', 'skill-1.9.0-test3.md'), 'utf8');
-  assert.equal(digest(published), 'd381022187327e9aff453588239b1664f6b9b7fc2f895e11701d4148e1330b82');
+test('a published 1.9.2 native skill upgrades from either line ending and uninstalls with its reference', async () => {
+  const published = readFileSync(join(ROOT, 'tests', 'fixtures', 'skill-1.9.2.md'), 'utf8');
+  assert.equal(digest(published), '5ffe75f582a48ea393611811cc74f3f313074ed9390a4681b1fcb6e023a60376');
   for (const text of [published, published.replace(/\n/gu, '\r\n')]) {
     const fixture = codexHomeFixture();
     try {
@@ -4144,7 +4144,8 @@ test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () =
   // The published 1.5.0 identities are NOT removed by adding the test build.
   assert.equal(KNOWN_AGENT_TEMPLATES.some((entry) => entry.version === '1.5.0'
     && entry.sha256 === '4af78cd2afb3d739d2f73ad8c21893b7e6434d0d06508b19fe36e9ba8012667b'), true);
-  // The published 1.9.0 and 1.9.1 native skill digests (LF and CRLF) are registered for seamless upgrade.
+  // The published 1.9.0–1.9.3 native skill digests (LF and CRLF) are registered for seamless upgrade,
+  // and unpublished local test/preview builds are never added to KNOWN_SKILL_TEMPLATES.
   assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.0'
     && entry.sha256 === '203e686fe12ee4827ea9c5bab404997f641a8f45d45daa37efc776b7e9620d71'), true);
   assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.0'
@@ -4157,12 +4158,13 @@ test('the installed 1.5.1-test.1 bytes are a real, enumerated prior build', () =
     && entry.sha256 === '5ffe75f582a48ea393611811cc74f3f313074ed9390a4681b1fcb6e023a60376'), true);
   assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.2'
     && entry.sha256 === 'd7ce4f758d9db785dd395315ee635ac4931cf23085e3ec92ca22673ffedd0a79'), true);
-  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.3-test1'
-    && entry.sha256 === '68f669dd70517cfba2f517950c2ce7a873c2b751a5be4c6eb825adc43e441039'), true);
-  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.3-test2'
-    && entry.sha256 === '64ef15bd4c1cfc19e19cc2ba81bd5cd4e2cb1c98a586c7a6f6a1d72ad78818a6'), true);
+  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.3'
+    && entry.sha256 === '2b195109056f36b38b0797e196f71832b9f45ed211ecc5ec48339ed8a60104ac'), true);
+  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.3'
+    && entry.sha256 === '57f7ce378a40a9f0b9f32c8f3dc170fe0de788db46e41441e2ce3fbcdee92d00'), true);
+  assert.equal(KNOWN_SKILL_TEMPLATES.some((entry) => /-(?:test|pre|preview)/iu.test(entry.version)), false);
   // The public version matches this formal release; historical identity registration is separate.
-  assert.equal(DELIVERABLE_VERSION, '1.9.3');
+  assert.equal(DELIVERABLE_VERSION, '1.9.4');
 });
 
 test('an untouched 1.5.1-test.1 install (LF and CRLF) migrates to native skill, idempotently', async () => {

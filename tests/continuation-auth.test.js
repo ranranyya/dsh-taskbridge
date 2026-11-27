@@ -1609,7 +1609,9 @@ test('assertAdmissible: an owner is compared exactly and an unstated owner is ne
  */
 async function plainRepositoryRoot(name) {
   const repoRoot = fileURLToPath(new URL('..', import.meta.url));
-  const base = await mkdtemp(join(repoRoot, '.cache', 'acceptance-'));
+  const cacheDir = join(repoRoot, '.cache');
+  await mkdir(cacheDir, { recursive: true });
+  const base = await mkdtemp(join(cacheDir, 'acceptance-'));
   const dir = join(base, name);
   await mkdir(dir, { recursive: true });
   return {

@@ -42,7 +42,7 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
  * Pinned rather than derived: `MANIFEST.version` is one of the places checked below,
  * so asserting itself would pass for any value. `1.5.0` adds question handling and combined waits.
  */
-const DELIVERABLE_VERSION = '1.9.3';
+const DELIVERABLE_VERSION = '1.9.4';
 
 /**
  * The published build this release upgrades *from*.
@@ -51,7 +51,7 @@ const DELIVERABLE_VERSION = '1.9.3';
  * current version must be strictly newer than this baseline,
  * and the two are different versions by construction.
  */
-const PREVIOUS_VERSION = '1.9.2';
+const PREVIOUS_VERSION = '1.9.3';
 
 // Published prior builds are retained only where the migration/ownership contract
 // names them. Other operator-facing and shipped code must not carry stale versions.
@@ -355,13 +355,13 @@ test('the stdio MCP executable is declared as a bin and points at a real script'
   assert.match(controlSource, /export const CONTROL_TIMEOUT_MS = 10_000;/u,
     'the documented whole-command budget is ten seconds');
   assert.match(controlSource, /retry: false/u, 'the control call must opt out of the observation retry');
-  assert.ok(PACKED.includes('codex/skills/dsh-taskbridge/SKILL.md'), 'the native Codex skill template must be published');
+  assert.ok(PACKED.includes('integrations/targets/codex/skills/dsh-taskbridge/SKILL.md'), 'the native Codex skill template must be published');
   const { referencePath } = readCodexRuleFiles();
-  const packedReferences = PACKED.filter((path) => path.startsWith('codex/skills/dsh-taskbridge/rules-reference-'));
-  assert.deepEqual(packedReferences, [`codex/skills/dsh-taskbridge/${basename(referencePath)}`]);
+  const packedReferences = PACKED.filter((path) => path.startsWith('integrations/targets/codex/skills/dsh-taskbridge/rules-reference-'));
+  assert.deepEqual(packedReferences, [`integrations/targets/codex/skills/dsh-taskbridge/${basename(referencePath)}`]);
   const codexSkill = codexRuleText().replace(/\s+/gu, ' ');
   assert.match(codexSkill, /name:\s*dsh-taskbridge/u);
-  const codexSkillRaw = readFileSync(join(ROOT, 'codex/skills/dsh-taskbridge/SKILL.md'), 'utf8');
+  const codexSkillRaw = readFileSync(join(ROOT, 'integrations/targets/codex/skills/dsh-taskbridge/SKILL.md'), 'utf8');
   // The managed copy is stamped with the package version, so an upgrade can tell an
   // older file of ours (safe to refresh) from an operator's edit (never touched).
   assert.match(codexSkillRaw, new RegExp(`^<!-- dsh-taskbridge-version: ${MANIFEST.version.replace(/\./gu, '\\.')} -->$`, 'mu'));
@@ -578,7 +578,7 @@ test(`the release is ${DELIVERABLE_VERSION}, newer than ${PREVIOUS_VERSION}`, ()
   assert.equal(lock.version, DELIVERABLE_VERSION, 'package-lock.json#version must match package.json');
   assert.equal(lock.packages[''].version, DELIVERABLE_VERSION, 'the lockfile root entry must match package.json');
 
-  const template = readFileSync(join(ROOT, 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
+  const template = readFileSync(join(ROOT, 'integrations', 'targets', 'codex', 'skills', 'dsh-taskbridge', 'SKILL.md'), 'utf8');
   assert.match(template, new RegExp(`^<!-- dsh-taskbridge-version: ${escape(DELIVERABLE_VERSION)} -->$`, 'mu'));
 
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8');
@@ -686,7 +686,9 @@ test('the archive carries every install-critical file', () => {
     // stdio MCP adapter
     'bin/dsh-delegate-mcp.js',
     'bin/dsh-delegate-codex-agent.js',
-    'codex/skills/dsh-taskbridge/SKILL.md',
+    'integrations/targets/codex/skills/dsh-taskbridge/SKILL.md',
+    'integrations/targets/antigravity/skills/dsh-taskbridge/SKILL.md',
+    'integrations/targets/antigravity/agents/dsh-taskbridge.md',
     // bundle composition
     'cordis.patch.yml',
   ];
@@ -725,7 +727,7 @@ test('the archive publishes the operator-facing contracts, not internal notes', 
   assert.match(contract, /CODEX_HOME/u);
   assert.match(contract, /never touch|never overwrite|untouched/u);
   // Build/acceptance scaffolding is for maintainers, not consumers.
-  for (const excluded of ['AGENTS.md', 'SPEC.md', 'docs/ACCEPTANCE.md', 'scripts/build-client.mjs', 'package-lock.json']) {
+  for (const excluded of ['AGENTS.md', 'docs/SPEC.md', 'docs/ACCEPTANCE.md', 'scripts/build-client.mjs', 'package-lock.json']) {
     assert.ok(!PACKED.includes(excluded), `internal file must not be published: ${excluded}`);
   }
 });

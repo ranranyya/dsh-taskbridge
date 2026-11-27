@@ -827,15 +827,15 @@ test('worker-prompt, layered rules, and Antigravity test5 upgrade recognition al
   assert.match(codex, /Do NOT invent adversarial out-of-spec fuzz probes/u);
   assert.match(codex, /returns `submitted: true` with `waitError`/u);
 
-  // Exact 1.9.0-test6 Codex SKILL.md LF & CRLF digests are registered for seamless upgrade to 1.9.0.
+  // Exact published 1.9.3 Codex SKILL.md LF & CRLF digests are registered for seamless upgrade.
   for (const sha of [
-    'c2477b9233f4f9b4e36c59f8544f607249b2f96be0aeba0a013525e18c4eab38',
-    '238366a0ebaa543d6b09fd1a94d5507a22d5ba0d19fee32539c429d1ded2182c',
+    '2b195109056f36b38b0797e196f71832b9f45ed211ecc5ec48339ed8a60104ac',
+    '57f7ce378a40a9f0b9f32c8f3dc170fe0de788db46e41441e2ce3fbcdee92d00',
   ]) {
-    assert.ok(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.0-test6' && entry.sha256 === sha));
+    assert.ok(KNOWN_SKILL_TEMPLATES.some((entry) => entry.version === '1.9.3' && entry.sha256 === sha));
   }
 
-  // Antigravity installer recognizes untouched 1.9.0-test5 SKILL.md as outdated (not modified).
+  // Antigravity installer starts clean as not-installed in an empty home.
   const root = await makeTempDir();
   const restore = useDirectoryClassifier(async (paths) => {
     const kinds = new Map();
