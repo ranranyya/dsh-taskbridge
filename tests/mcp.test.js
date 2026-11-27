@@ -834,10 +834,13 @@ test('configuration defaults to live endpoint discovery and ignores legacy token
   });
   assert.equal(readConfig({ DSH_DELEGATE_TOKEN: 'x', DSH_DELEGATE_BASE_URL: 'http://localhost:4000/' }).baseUrl,
     'http://localhost:4000', 'a trailing slash must not produce a double slash in a route');
-  assert.equal(readConfig({ DSH_HOME: 'C:\\dsh-home' }).discoveryFile,
-    'C:\\dsh-home\\data\\dsh-delegate\\runtime-endpoint.json');
-  assert.equal(readConfig({ DSH_DELEGATE_DISCOVERY_FILE: 'C:\\custom\\endpoint.json' }).discoveryFile,
-    'C:\\custom\\endpoint.json');
+  const dshHome = process.platform === 'win32' ? 'C:\\dsh-home' : '/dsh-home';
+  const expectedDiscovery = process.platform === 'win32'
+    ? 'C:\\dsh-home\\data\\dsh-delegate\\runtime-endpoint.json'
+    : '/dsh-home/data/dsh-delegate/runtime-endpoint.json';
+  const customDiscovery = process.platform === 'win32' ? 'C:\\custom\\endpoint.json' : '/custom/endpoint.json';
+  assert.equal(readConfig({ DSH_HOME: dshHome }).discoveryFile, expectedDiscovery);
+  assert.equal(readConfig({ DSH_DELEGATE_DISCOVERY_FILE: customDiscovery }).discoveryFile, customDiscovery);
   assert.throws(() => readConfig({ DSH_DELEGATE_TOKEN: 'x', DSH_DELEGATE_BASE_URL: 'file:///etc' }), (error) => {
     assert.equal(error.code, 'MCP_CONFIG_INVALID');
     return true;

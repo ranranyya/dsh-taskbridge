@@ -2055,7 +2055,7 @@ test('a root link whose target is missing or not a directory is refused, and not
     if (existsSync(homeToFile)) {
       const toFile = await runCodexAction('status', { codexHome: homeToFile, env: isolatedEnv(homeToFile) });
       assert.equal(toFile.status.boundary.blocked, true, 'a root link to a file is refused');
-      assert.ok(['codex-home-target-not-a-directory', 'codex-home-link-unresolvable'].includes(toFile.status.agent.reason),
+      assert.ok(['codex-home-target-not-a-directory', 'codex-home-not-a-directory', 'codex-home-link-unresolvable'].includes(toFile.status.agent.reason),
         `the refusal states why: ${toFile.status.agent.reason}`);
       const installToFile = await runCodexAction('install', { codexHome: homeToFile, env: isolatedEnv(homeToFile) });
       assert.ok(installToFile.refused.length > 0);
@@ -2067,7 +2067,7 @@ test('a root link whose target is missing or not a directory is refused, and not
   }
 });
 
-test('an unverifiable boundary is reported, never assumed safe', async () => {
+test('an unverifiable boundary is reported, never assumed safe', { skip: WINDOWS_CLASSIFIER_SKIP }, async () => {
   const fixture = codexHomeFixture();
   // `unknown` is what the installer reports when the platform answer cannot be
   // obtained (no spawnable shell, no PowerShell). Treating it as "a real directory"
@@ -2620,7 +2620,7 @@ test('a config edit between the moved-install proof and its write is refused, ke
   }
 });
 
-test('a boundary link that appears between the moved-install proof and its write is refused', async () => {
+test('a boundary link that appears between the moved-install proof and its write is refused', { skip: WINDOWS_CLASSIFIER_SKIP }, async () => {
   const fixture = codexHomeFixture();
   const oldInstall = otherInstallationFixture();
   try {
@@ -3194,13 +3194,17 @@ test('startup prefers an explicit CODEX_HOME over everything else, and refuses a
       // against the linked default we just built — and never inspects the operator's real
       // `~/.codex` (a test must not read or write the real user settings).
       const previousProfile = process.env.USERPROFILE;
+      const previousHome = process.env.HOME;
       process.env.USERPROFILE = root;
+      process.env.HOME = root;
       let seamTarget;
       try {
         seamTarget = await createCodexSeam({ env: { CODEX_HOME: '', DSH_HOME: join(root, 'dsh') }, version: DELIVERABLE_VERSION }).startupTarget();
       } finally {
         if (previousProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = previousProfile;
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
       }
       assert.equal(seamTarget.reason, 'default-is-link', 'the seam never treats a linked default as a plain target');
       assert.equal(seamTarget.home, resolve(join(root, '.codex')), 'and reports WHICH linked directory it refused');

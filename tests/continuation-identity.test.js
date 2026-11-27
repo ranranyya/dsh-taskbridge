@@ -153,9 +153,9 @@ test('canonicalPath is one spelling for one directory, and refuses a masked valu
   // the harness treats as different.
   assert.equal(canonicalPath('E:\\deepseek workplace\\dsh-delegate\\'), canonicalPath('E:\\deepseek workplace\\dsh-delegate'));
   assert.equal(
-    canonicalPath('E:\\DEEPSEEK WORKPLACE\\DSH-DELEGATE'),
-    canonicalPath('E:\\deepseek workplace\\dsh-delegate'),
-    'Windows folds case at every level',
+    sameCanonicalPath('E:\\DEEPSEEK WORKPLACE\\DSH-DELEGATE', 'E:\\deepseek workplace\\dsh-delegate'),
+    process.platform === 'win32',
+    'Windows folds case at every level; POSIX preserves case',
   );
   // Two spellings the session layer ALSO treats as different stay different here.
   assert.notEqual(canonicalPath('E:/deepseek workplace/dsh-delegate'), canonicalPath('E:\\deepseek workplace\\dsh-delegate'));
@@ -175,8 +175,6 @@ test('the canonical key agrees with the session layer for every spelling', () =>
   const same = [
     ['E:\\repo', 'E:\\repo'],
     ['E:\\repo', 'E:\\repo\\'],
-    ['E:\\repo', 'e:\\repo'],
-    ['E:\\REPO', 'E:\\repo'],
     ['/x/Repo', '/x/Repo'],
   ];
   for (const [a, b] of same) {
@@ -186,6 +184,10 @@ test('the canonical key agrees with the session layer for every spelling', () =>
   // One platform-dependent expectation, derived from the rule rather than hard-coded:
   // POSIX keeps case (two really different directories), Windows folds it.
   const caseFolds = process.platform === 'win32';
+  for (const [a, b] of [['E:\\repo', 'e:\\repo'], ['E:\\REPO', 'E:\\repo']]) {
+    assert.equal(sameCanonicalPath(a, b), sameSessionPath(a, b), `${a} vs ${b}`);
+    assert.equal(sameCanonicalPath(a, b), caseFolds, `${a} vs ${b} follows platform case folding`);
+  }
   const different = [
     ['E:\\repo', 'E:\\repo2'],
     ['E:\\repo\\a', 'E:\\repo\\b'],

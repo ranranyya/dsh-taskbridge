@@ -91,16 +91,18 @@ test('the MCP client refuses a discovery record that names a non-loopback host',
 });
 
 test('the discovery path follows DSH_HOME and requires explicit overrides to be absolute', () => {
+  const dshHome = process.platform === 'win32' ? 'C:\\dsh-home' : '/dsh-home';
+  const expectedPath = join(dshHome, 'data', 'dsh-delegate', 'runtime-endpoint.json');
   assert.equal(
-    resolveEndpointDiscoveryPath({ DSH_HOME: 'C:\\dsh-home' }),
-    'C:\\dsh-home\\data\\dsh-delegate\\runtime-endpoint.json',
+    resolveEndpointDiscoveryPath({ DSH_HOME: dshHome }),
+    expectedPath,
   );
   assert.throws(
     () => resolveEndpointDiscoveryPath({ DSH_DELEGATE_DISCOVERY_FILE: 'relative.json' }),
     (error) => error.code === 'MCP_CONFIG_INVALID',
   );
   assert.equal(
-    resolveDefaultEndpointDiscoveryPath({ DSH_DELEGATE_DISCOVERY_FILE: 'ignored.json', DSH_HOME: 'C:\\dsh-home' }),
-    'C:\\dsh-home\\data\\dsh-delegate\\runtime-endpoint.json',
+    resolveDefaultEndpointDiscoveryPath({ DSH_DELEGATE_DISCOVERY_FILE: 'ignored.json', DSH_HOME: dshHome }),
+    expectedPath,
   );
 });
