@@ -6,6 +6,7 @@
 // shape the real service would reject. Route/effort metadata is returned in the
 // exact shape `LlmRuntime.normalizeModelInfo` produces.
 
+import { realpathSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -83,7 +84,8 @@ export async function policyServicesFor(options = {}) {
  * @returns {Promise<string>} absolute directory path.
  */
 export async function makeTempDir() {
-  return await mkdtemp(join(tmpdir(), 'dsh-delegate-test-'));
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-delegate-test-'));
+  return realpathSync.native(dir);
 }
 
 /**

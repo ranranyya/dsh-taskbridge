@@ -36,8 +36,13 @@ jobs:
       - name: Check host integration outputs
         run: npm run check:integrations
       - name: Check client bundle sync
+        env:
+          DSH_TASKBRIDGE_CLIENT_PLATFORM: win32
         run: npm run check:client
       - name: Run test suite
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: npm test
       - name: Dry-run npm pack
         run: npm run pack:dry

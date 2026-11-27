@@ -167,6 +167,12 @@ function runEsbuild(binary, args) {
  * @param {string} binary - esbuild executable.
  * @returns {string} complete `lib/client.js` text.
  */
+function targetClientPlatform() {
+  const override = process.env.DSH_TASKBRIDGE_CLIENT_PLATFORM;
+  if (override === 'win32' || override === 'posix') return override;
+  return process.platform === 'win32' ? 'win32' : 'posix';
+}
+
 function buildBundleText(binary) {
   mkdirSync(SCRATCH_ROOT, { recursive: true });
   const scratch = mkdtempSync(join(SCRATCH_ROOT, 'build-'));
@@ -193,7 +199,7 @@ function buildBundleText(binary) {
       // substitutes it. The identifier is a NAMESPACED MEMBER EXPRESSION on purpose: a bare
       // identifier would be shadowed by the module's own (minified) local binding, and the
       // substitution would silently miss — which is exactly the bug it exists to avoid.
-      `--define:globalThis.__DSH_TASKBRIDGE_CLIENT_PLATFORM__=${JSON.stringify(process.platform === 'win32' ? 'win32' : 'posix')}`,
+      `--define:globalThis.__DSH_TASKBRIDGE_CLIENT_PLATFORM__=${JSON.stringify(targetClientPlatform())}`,
       ...PLATFORM_EXTERNALS.map((spec) => `--external:${spec}`),
       `--outfile=${raw}`,
     ];
